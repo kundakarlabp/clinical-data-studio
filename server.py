@@ -1,0 +1,644 @@
+from __future__ import annotations
+
+import base64
+import csv
+import hashlib
+import hmac
+import json
+import mimetypes
+import os
+import secrets
+import sqlite3
+import time
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+
+ROOT = Path(__file__).resolve().parent
+STATIC = ROOT / "static"
+DATA = ROOT / "data"
+DB_PATH = DATA / "clinical_data_studio.sqlite3"
+HOST = "0.0.0.0"
+PORT = int(os.environ.get("CDS_PORT", "8765"))
+PBKDF2_ROUNDS = 260_000
+
+
+def now() -> int:
+    return int(time.time())
+
+
+def db() -> sqlite3.Connection:
+    DATA.mkdir(exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def encode_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ROUNDS)
+    return f"pbkdf2_sha256${PBKDF2_ROUNDS}${base64.b64encode(salt).decode()}${base64.b64encode(digest).decode()}"
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    try:
+        scheme, rounds, salt_b64, digest_b64 = encoded.split("$", 3)
+        if scheme != "pbkdf2_sha256":
+            return False
+        salt = base64.b64decode(salt_b64)
+        expected = base64.b64decode(digest_b64)
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(rounds))
+        return hmac.compare_digest(actual, expected)
+    except Exception:
+        return False
+
+
+def rows(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> list[dict]:
+    return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+
+def row(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> dict | None:
+    result = conn.execute(sql, params).fetchone()
+    return dict(result) if result else None
+
+
+def load_json(value: str | None, fallback):
+    if not value:
+        return fallback
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return fallback
+
+
+def audit(conn: sqlite3.Connection, user_id: int | None, action: str, entity_type: str, entity_id: int | None, before=None, after=None) -> None:
+    conn.execute(
+        """
+        INSERT INTO audit_log(user_id, action, entity_type, entity_id, before_json, after_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            action,
+            entity_type,
+            entity_id,
+            json.dumps(before, sort_keys=True) if before is not None else None,
+            json.dumps(after, sort_keys=True) if after is not None else None,
+            now(),
+        ),
+    )
+
+
+def migrate() -> None:
+    with db() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'admin',
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS sessions (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS studies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                protocol_id TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'draft',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS forms (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                code TEXT NOT NULL,
+                schema_json TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(study_id, code)
+            );
+
+            CREATE TABLE IF NOT EXISTS participants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+                study_uid TEXT NOT NULL,
+                initials TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'screening',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(study_id, study_uid)
+            );
+
+            CREATE TABLE IF NOT EXISTS entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+                participant_id INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+                form_id INTEGER NOT NULL REFERENCES forms(id) ON DELETE CASCADE,
+                event_name TEXT NOT NULL DEFAULT 'Baseline',
+                status TEXT NOT NULL DEFAULT 'draft',
+                data_json TEXT NOT NULL DEFAULT '{}',
+                created_by INTEGER REFERENCES users(id),
+                updated_by INTEGER REFERENCES users(id),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(participant_id, form_id, event_name)
+            );
+
+            CREATE TABLE IF NOT EXISTS queries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+                participant_id INTEGER REFERENCES participants(id) ON DELETE CASCADE,
+                form_id INTEGER REFERENCES forms(id) ON DELETE CASCADE,
+                field_code TEXT NOT NULL DEFAULT '',
+                message TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                created_by INTEGER REFERENCES users(id),
+                assigned_to INTEGER REFERENCES users(id),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER REFERENCES users(id),
+                action TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                entity_id INTEGER,
+                before_json TEXT,
+                after_json TEXT,
+                created_at INTEGER NOT NULL
+            );
+            """
+        )
+        if not row(conn, "SELECT id FROM users WHERE username = ?", ("admin",)):
+            user = {
+                "username": "admin",
+                "display_name": "Administrator",
+                "role": "admin",
+                "created_at": now(),
+            }
+            conn.execute(
+                "INSERT INTO users(username, password_hash, display_name, role, created_at) VALUES (?, ?, ?, ?, ?)",
+                ("admin", encode_password("admin123"), user["display_name"], user["role"], user["created_at"]),
+            )
+            audit(conn, None, "seed", "user", 1, None, user)
+        if not row(conn, "SELECT id FROM studies LIMIT 1"):
+            seed_study(conn)
+
+
+def seed_study(conn: sqlite3.Connection) -> None:
+    timestamp = now()
+    cur = conn.execute(
+        "INSERT INTO studies(name, protocol_id, description, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        ("Demo Clinical Registry", "DEMO-001", "Starter study with demographics and visit forms.", "active", timestamp, timestamp),
+    )
+    study_id = cur.lastrowid
+    forms = [
+        (
+            "Demographics",
+            "demographics",
+            [
+                {"code": "age", "label": "Age", "type": "number", "required": True, "min": 0, "max": 120},
+                {"code": "sex", "label": "Sex", "type": "select", "required": True, "options": ["Female", "Male", "Other"]},
+                {"code": "consent_date", "label": "Consent date", "type": "date", "required": True},
+                {"code": "diagnosis", "label": "Primary diagnosis", "type": "text", "required": True},
+            ],
+        ),
+        (
+            "Clinical Visit",
+            "clinical_visit",
+            [
+                {"code": "visit_date", "label": "Visit date", "type": "date", "required": True},
+                {"code": "weight", "label": "Weight kg", "type": "number", "min": 1, "max": 300},
+                {"code": "systolic_bp", "label": "Systolic BP", "type": "number", "min": 50, "max": 260},
+                {"code": "diastolic_bp", "label": "Diastolic BP", "type": "number", "min": 30, "max": 160},
+                {"code": "adverse_event", "label": "Any adverse event?", "type": "select", "required": True, "options": ["No", "Yes"]},
+                {"code": "ae_details", "label": "Adverse event details", "type": "textarea", "show_if": {"field": "adverse_event", "equals": "Yes"}},
+            ],
+        ),
+    ]
+    for name, code, fields in forms:
+        conn.execute(
+            "INSERT INTO forms(study_id, name, code, schema_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (study_id, name, code, json.dumps({"fields": fields}), timestamp, timestamp),
+        )
+    audit(conn, None, "seed", "study", study_id, None, {"study_id": study_id})
+
+
+class App(BaseHTTPRequestHandler):
+    server_version = "ClinicalDataStudio/0.1"
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path.startswith("/api/"):
+            self.handle_api("GET", parsed.path, parse_qs(parsed.query))
+        else:
+            self.serve_static(parsed.path)
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        self.handle_api("POST", parsed.path, parse_qs(parsed.query))
+
+    def do_PATCH(self) -> None:
+        parsed = urlparse(self.path)
+        self.handle_api("PATCH", parsed.path, parse_qs(parsed.query))
+
+    def do_DELETE(self) -> None:
+        parsed = urlparse(self.path)
+        self.handle_api("DELETE", parsed.path, parse_qs(parsed.query))
+
+    def log_message(self, fmt: str, *args) -> None:
+        print(f"{self.address_string()} - {fmt % args}")
+
+    def body(self) -> dict:
+        length = int(self.headers.get("content-length", "0"))
+        if length == 0:
+            return {}
+        raw = self.rfile.read(length).decode("utf-8")
+        return json.loads(raw or "{}")
+
+    def send_json(self, payload, status: int = 200) -> None:
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("content-type", "application/json; charset=utf-8")
+        self.send_header("content-length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def send_error_json(self, message: str, status: int = 400) -> None:
+        self.send_json({"error": message}, status)
+
+    def serve_static(self, path: str) -> None:
+        if path in ("", "/"):
+            path = "/index.html"
+        target = (STATIC / path.lstrip("/")).resolve()
+        if not str(target).startswith(str(STATIC.resolve())) or not target.exists() or not target.is_file():
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        content = target.read_bytes()
+        mime = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        self.send_response(200)
+        self.send_header("content-type", mime)
+        self.send_header("content-length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
+    def current_user(self, conn: sqlite3.Connection) -> dict | None:
+        header = self.headers.get("authorization", "")
+        if not header.startswith("Bearer "):
+            return None
+        token = header.removeprefix("Bearer ").strip()
+        user = row(
+            conn,
+            """
+            SELECT users.id, users.username, users.display_name, users.role
+            FROM sessions JOIN users ON users.id = sessions.user_id
+            WHERE sessions.token = ? AND sessions.expires_at > ? AND users.active = 1
+            """,
+            (token, now()),
+        )
+        return user
+
+    def require_user(self, conn: sqlite3.Connection) -> dict | None:
+        user = self.current_user(conn)
+        if not user:
+            self.send_error_json("Login required", 401)
+            return None
+        return user
+
+    def handle_api(self, method: str, path: str, query: dict[str, list[str]]) -> None:
+        try:
+            with db() as conn:
+                if path == "/api/login" and method == "POST":
+                    return self.login(conn)
+                if path == "/api/logout" and method == "POST":
+                    return self.logout(conn)
+
+                user = self.require_user(conn)
+                if not user:
+                    return
+
+                if path == "/api/me":
+                    return self.send_json({"user": user})
+                if path == "/api/studies" and method == "GET":
+                    return self.send_json({"studies": rows(conn, "SELECT * FROM studies ORDER BY updated_at DESC")})
+                if path == "/api/studies" and method == "POST":
+                    return self.create_study(conn, user)
+                if path.startswith("/api/studies/"):
+                    return self.study_routes(conn, user, method, path, query)
+                if path == "/api/audit" and method == "GET":
+                    return self.send_json({"audit": rows(conn, "SELECT audit_log.*, users.display_name FROM audit_log LEFT JOIN users ON users.id = audit_log.user_id ORDER BY audit_log.id DESC LIMIT 250")})
+                self.send_error_json("Unknown endpoint", 404)
+        except sqlite3.IntegrityError as exc:
+            self.send_error_json(f"Data conflict: {exc}", 409)
+        except json.JSONDecodeError:
+            self.send_error_json("Invalid JSON body", 400)
+        except Exception as exc:
+            self.send_error_json(f"Server error: {exc}", 500)
+
+    def login(self, conn: sqlite3.Connection) -> None:
+        payload = self.body()
+        username = str(payload.get("username", "")).strip()
+        password = str(payload.get("password", ""))
+        user = row(conn, "SELECT * FROM users WHERE username = ? AND active = 1", (username,))
+        if not user or not verify_password(password, user["password_hash"]):
+            self.send_error_json("Invalid username or password", 401)
+            return
+        token = secrets.token_urlsafe(32)
+        conn.execute("INSERT INTO sessions(token, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)", (token, user["id"], now() + 60 * 60 * 24 * 14, now()))
+        audit(conn, user["id"], "login", "session", None, None, {"username": username})
+        self.send_json({"token": token, "user": {"id": user["id"], "username": user["username"], "display_name": user["display_name"], "role": user["role"]}})
+
+    def logout(self, conn: sqlite3.Connection) -> None:
+        header = self.headers.get("authorization", "")
+        token = header.removeprefix("Bearer ").strip() if header.startswith("Bearer ") else ""
+        if token:
+            conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        self.send_json({"ok": True})
+
+    def create_study(self, conn: sqlite3.Connection, user: dict) -> None:
+        payload = self.body()
+        timestamp = now()
+        cur = conn.execute(
+            "INSERT INTO studies(name, protocol_id, description, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                str(payload.get("name", "")).strip() or "Untitled Study",
+                str(payload.get("protocol_id", "")).strip(),
+                str(payload.get("description", "")).strip(),
+                str(payload.get("status", "draft")),
+                timestamp,
+                timestamp,
+            ),
+        )
+        study = row(conn, "SELECT * FROM studies WHERE id = ?", (cur.lastrowid,))
+        audit(conn, user["id"], "create", "study", cur.lastrowid, None, study)
+        self.send_json({"study": study}, 201)
+
+    def study_routes(self, conn: sqlite3.Connection, user: dict, method: str, path: str, query: dict[str, list[str]]) -> None:
+        parts = path.strip("/").split("/")
+        if len(parts) < 3:
+            self.send_error_json("Study route missing id", 404)
+            return
+        study_id = int(parts[2])
+        if not row(conn, "SELECT id FROM studies WHERE id = ?", (study_id,)):
+            self.send_error_json("Study not found", 404)
+            return
+        resource = parts[3] if len(parts) > 3 else ""
+        if resource == "forms":
+            return self.forms(conn, user, method, study_id, parts)
+        if resource == "participants":
+            return self.participants(conn, user, method, study_id, parts)
+        if resource == "entries":
+            return self.entries(conn, user, method, study_id, parts, query)
+        if resource == "queries":
+            return self.queries(conn, user, method, study_id, parts)
+        if resource == "analysis" and method == "GET":
+            return self.analysis(conn, study_id)
+        if resource == "export" and method == "GET":
+            return self.export_csv(conn, study_id)
+        if resource == "audit" and method == "GET":
+            return self.send_json({"audit": rows(conn, "SELECT audit_log.*, users.display_name FROM audit_log LEFT JOIN users ON users.id = audit_log.user_id WHERE entity_id IN (SELECT id FROM participants WHERE study_id = ?) OR entity_type = 'study' ORDER BY audit_log.id DESC LIMIT 250", (study_id,))})
+        self.send_error_json("Unknown study route", 404)
+
+    def forms(self, conn, user, method, study_id, parts) -> None:
+        if method == "GET":
+            forms = rows(conn, "SELECT * FROM forms WHERE study_id = ? ORDER BY id", (study_id,))
+            for form in forms:
+                form["schema"] = load_json(form.pop("schema_json"), {"fields": []})
+            self.send_json({"forms": forms})
+            return
+        if method == "POST":
+            payload = self.body()
+            timestamp = now()
+            schema = payload.get("schema") or {"fields": []}
+            cur = conn.execute(
+                "INSERT INTO forms(study_id, name, code, schema_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (study_id, str(payload.get("name", "")).strip() or "Untitled Form", str(payload.get("code", "")).strip() or f"form_{timestamp}", json.dumps(schema), timestamp, timestamp),
+            )
+            after = row(conn, "SELECT * FROM forms WHERE id = ?", (cur.lastrowid,))
+            audit(conn, user["id"], "create", "form", cur.lastrowid, None, after)
+            self.send_json({"form": after}, 201)
+            return
+        if method == "PATCH" and len(parts) == 5:
+            form_id = int(parts[4])
+            before = row(conn, "SELECT * FROM forms WHERE id = ? AND study_id = ?", (form_id, study_id))
+            payload = self.body()
+            conn.execute(
+                "UPDATE forms SET name = ?, code = ?, schema_json = ?, version = version + 1, updated_at = ? WHERE id = ? AND study_id = ?",
+                (str(payload.get("name", before["name"])).strip(), str(payload.get("code", before["code"])).strip(), json.dumps(payload.get("schema", load_json(before["schema_json"], {}))), now(), form_id, study_id),
+            )
+            after = row(conn, "SELECT * FROM forms WHERE id = ?", (form_id,))
+            audit(conn, user["id"], "update", "form", form_id, before, after)
+            self.send_json({"form": after})
+            return
+        self.send_error_json("Unsupported forms operation", 405)
+
+    def participants(self, conn, user, method, study_id, parts) -> None:
+        if method == "GET":
+            participants = rows(conn, "SELECT * FROM participants WHERE study_id = ? ORDER BY id DESC", (study_id,))
+            for participant in participants:
+                participant["metadata"] = load_json(participant.pop("metadata_json"), {})
+            self.send_json({"participants": participants})
+            return
+        if method == "POST":
+            payload = self.body()
+            timestamp = now()
+            cur = conn.execute(
+                "INSERT INTO participants(study_id, study_uid, initials, status, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (study_id, str(payload.get("study_uid", "")).strip(), str(payload.get("initials", "")).strip().upper(), str(payload.get("status", "screening")), json.dumps(payload.get("metadata", {})), timestamp, timestamp),
+            )
+            after = row(conn, "SELECT * FROM participants WHERE id = ?", (cur.lastrowid,))
+            audit(conn, user["id"], "create", "participant", cur.lastrowid, None, after)
+            self.send_json({"participant": after}, 201)
+            return
+        if method == "PATCH" and len(parts) == 5:
+            participant_id = int(parts[4])
+            before = row(conn, "SELECT * FROM participants WHERE id = ? AND study_id = ?", (participant_id, study_id))
+            if not before:
+                self.send_error_json("Participant not found", 404)
+                return
+            payload = self.body()
+            conn.execute(
+                "UPDATE participants SET study_uid = ?, initials = ?, status = ?, metadata_json = ?, updated_at = ? WHERE id = ? AND study_id = ?",
+                (str(payload.get("study_uid", before["study_uid"])).strip(), str(payload.get("initials", before["initials"])).strip().upper(), str(payload.get("status", before["status"])), json.dumps(payload.get("metadata", load_json(before["metadata_json"], {}))), now(), participant_id, study_id),
+            )
+            after = row(conn, "SELECT * FROM participants WHERE id = ?", (participant_id,))
+            audit(conn, user["id"], "update", "participant", participant_id, before, after)
+            self.send_json({"participant": after})
+            return
+        self.send_error_json("Unsupported participant operation", 405)
+
+    def entries(self, conn, user, method, study_id, parts, query) -> None:
+        if method == "GET":
+            participant_id = int((query.get("participant_id") or ["0"])[0])
+            params: tuple = (study_id,)
+            sql = "SELECT entries.*, forms.name AS form_name, participants.study_uid FROM entries JOIN forms ON forms.id = entries.form_id JOIN participants ON participants.id = entries.participant_id WHERE entries.study_id = ?"
+            if participant_id:
+                sql += " AND participant_id = ?"
+                params = (study_id, participant_id)
+            entries = rows(conn, sql + " ORDER BY entries.updated_at DESC", params)
+            for entry in entries:
+                entry["data"] = load_json(entry.pop("data_json"), {})
+            self.send_json({"entries": entries})
+            return
+        if method == "POST":
+            payload = self.body()
+            timestamp = now()
+            participant_id = int(payload["participant_id"])
+            form_id = int(payload["form_id"])
+            event_name = str(payload.get("event_name", "Baseline")).strip() or "Baseline"
+            data = payload.get("data", {})
+            status = str(payload.get("status", "draft"))
+            existing = row(conn, "SELECT * FROM entries WHERE participant_id = ? AND form_id = ? AND event_name = ?", (participant_id, form_id, event_name))
+            if existing:
+                before = existing
+                conn.execute(
+                    "UPDATE entries SET data_json = ?, status = ?, updated_by = ?, updated_at = ? WHERE id = ?",
+                    (json.dumps(data), status, user["id"], timestamp, existing["id"]),
+                )
+                after = row(conn, "SELECT * FROM entries WHERE id = ?", (existing["id"],))
+                audit(conn, user["id"], "update", "entry", existing["id"], before, after)
+                self.send_json({"entry": after})
+                return
+            cur = conn.execute(
+                "INSERT INTO entries(study_id, participant_id, form_id, event_name, status, data_json, created_by, updated_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (study_id, participant_id, form_id, event_name, status, json.dumps(data), user["id"], user["id"], timestamp, timestamp),
+            )
+            after = row(conn, "SELECT * FROM entries WHERE id = ?", (cur.lastrowid,))
+            audit(conn, user["id"], "create", "entry", cur.lastrowid, None, after)
+            self.send_json({"entry": after}, 201)
+            return
+        self.send_error_json("Unsupported entries operation", 405)
+
+    def queries(self, conn, user, method, study_id, parts) -> None:
+        if method == "GET":
+            self.send_json({"queries": rows(conn, "SELECT queries.*, participants.study_uid, forms.name AS form_name FROM queries LEFT JOIN participants ON participants.id = queries.participant_id LEFT JOIN forms ON forms.id = queries.form_id WHERE queries.study_id = ? ORDER BY queries.status, queries.updated_at DESC", (study_id,))})
+            return
+        if method == "POST":
+            payload = self.body()
+            timestamp = now()
+            cur = conn.execute(
+                "INSERT INTO queries(study_id, participant_id, form_id, field_code, message, status, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (study_id, payload.get("participant_id"), payload.get("form_id"), str(payload.get("field_code", "")), str(payload.get("message", "")).strip(), "open", user["id"], timestamp, timestamp),
+            )
+            after = row(conn, "SELECT * FROM queries WHERE id = ?", (cur.lastrowid,))
+            audit(conn, user["id"], "create", "query", cur.lastrowid, None, after)
+            self.send_json({"query": after}, 201)
+            return
+        if method == "PATCH" and len(parts) == 5:
+            query_id = int(parts[4])
+            before = row(conn, "SELECT * FROM queries WHERE id = ? AND study_id = ?", (query_id, study_id))
+            payload = self.body()
+            conn.execute("UPDATE queries SET status = ?, updated_at = ? WHERE id = ? AND study_id = ?", (str(payload.get("status", before["status"])), now(), query_id, study_id))
+            after = row(conn, "SELECT * FROM queries WHERE id = ?", (query_id,))
+            audit(conn, user["id"], "update", "query", query_id, before, after)
+            self.send_json({"query": after})
+            return
+        self.send_error_json("Unsupported queries operation", 405)
+
+    def analysis(self, conn, study_id: int) -> None:
+        participants = rows(conn, "SELECT * FROM participants WHERE study_id = ?", (study_id,))
+        entries = rows(conn, "SELECT entries.*, forms.name AS form_name, forms.schema_json FROM entries JOIN forms ON forms.id = entries.form_id WHERE entries.study_id = ?", (study_id,))
+        fields: dict[str, dict] = {}
+        values: dict[str, list] = {}
+        completed = 0
+        for entry in entries:
+            if entry["status"] == "complete":
+                completed += 1
+            schema = load_json(entry["schema_json"], {"fields": []})
+            data = load_json(entry["data_json"], {})
+            for field in schema.get("fields", []):
+                code = field.get("code")
+                if not code:
+                    continue
+                label = f"{entry['form_name']}: {field.get('label', code)}"
+                fields[code] = {"label": label, "type": field.get("type", "text")}
+                value = data.get(code)
+                if value not in (None, ""):
+                    values.setdefault(code, []).append(value)
+        summaries = []
+        for code, meta in fields.items():
+            series = values.get(code, [])
+            numeric = []
+            for value in series:
+                try:
+                    numeric.append(float(value))
+                except (TypeError, ValueError):
+                    pass
+            summary = {"code": code, "label": meta["label"], "count": len(series), "missing": max(len(entries) - len(series), 0)}
+            if numeric and len(numeric) == len(series):
+                summary.update({"type": "numeric", "mean": round(sum(numeric) / len(numeric), 2), "min": min(numeric), "max": max(numeric)})
+            else:
+                counts: dict[str, int] = {}
+                for value in series:
+                    counts[str(value)] = counts.get(str(value), 0) + 1
+                summary.update({"type": "categorical", "counts": counts})
+            summaries.append(summary)
+        open_queries = row(conn, "SELECT COUNT(*) AS count FROM queries WHERE study_id = ? AND status = 'open'", (study_id,))["count"]
+        self.send_json({"participant_count": len(participants), "entry_count": len(entries), "completed_entry_count": completed, "open_query_count": open_queries, "field_summaries": summaries})
+
+    def export_csv(self, conn, study_id: int) -> None:
+        forms = rows(conn, "SELECT * FROM forms WHERE study_id = ? ORDER BY id", (study_id,))
+        field_codes = []
+        labels = {}
+        for form in forms:
+            for field in load_json(form["schema_json"], {"fields": []}).get("fields", []):
+                code = f"{form['code']}__{field.get('code')}"
+                field_codes.append(code)
+                labels[code] = field.get("label", code)
+        output = []
+        header = ["study_uid", "initials", "participant_status", "event_name", "form_name", "entry_status"] + field_codes
+        output.append(header)
+        entries = rows(conn, "SELECT entries.*, participants.study_uid, participants.initials, participants.status AS participant_status, forms.name AS form_name, forms.code AS form_code FROM entries JOIN participants ON participants.id = entries.participant_id JOIN forms ON forms.id = entries.form_id WHERE entries.study_id = ? ORDER BY participants.study_uid, forms.id", (study_id,))
+        for entry in entries:
+            data = load_json(entry["data_json"], {})
+            line = [entry["study_uid"], entry["initials"], entry["participant_status"], entry["event_name"], entry["form_name"], entry["status"]]
+            for code in field_codes:
+                prefix, field_code = code.split("__", 1)
+                line.append(data.get(field_code, "") if prefix == entry["form_code"] else "")
+            output.append(line)
+        text_lines = []
+        class Sink:
+            def write(self, value):
+                text_lines.append(value)
+        writer = csv.writer(Sink())
+        writer.writerows(output)
+        content = "".join(text_lines).encode("utf-8-sig")
+        self.send_response(200)
+        self.send_header("content-type", "text/csv; charset=utf-8")
+        self.send_header("content-disposition", "attachment; filename=clinical_data_export.csv")
+        self.send_header("content-length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
+
+def main() -> None:
+    migrate()
+    server = ThreadingHTTPServer((HOST, PORT), App)
+    print(f"Clinical Data Studio running at http://127.0.0.1:{PORT}")
+    print("Use this computer's Wi-Fi IP address from phones on the same network.")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

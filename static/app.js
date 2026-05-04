@@ -7,6 +7,7 @@ const state = {
   participants: [],
   entries: [],
   queries: [],
+  quality: [],
   audit: [],
   analysis: null,
   view: "dashboard",
@@ -67,11 +68,12 @@ async function loadAll() {
 
 async function loadStudy() {
   if (!state.studyId) return;
-  const [forms, participants, entries, queries, analysis, audit] = await Promise.all([
+  const [forms, participants, entries, queries, quality, analysis, audit] = await Promise.all([
     api(`/api/studies/${state.studyId}/forms`),
     api(`/api/studies/${state.studyId}/participants`),
     api(`/api/studies/${state.studyId}/entries`),
     api(`/api/studies/${state.studyId}/queries`),
+    api(`/api/studies/${state.studyId}/quality`),
     api(`/api/studies/${state.studyId}/analysis`),
     api("/api/audit"),
   ]);
@@ -79,6 +81,7 @@ async function loadStudy() {
   state.participants = participants.participants;
   state.entries = entries.entries;
   state.queries = queries.queries;
+  state.quality = quality.issues;
   state.analysis = analysis;
   state.audit = audit.audit;
 }
@@ -105,6 +108,7 @@ function render() {
           ${navButton("data", "Data Entry")}
           ${navButton("forms", "CRF Builder")}
           ${navButton("queries", "Review Queries")}
+          ${navButton("quality", "Data Quality")}
           ${navButton("analysis", "Analysis")}
           ${navButton("audit", "Audit Trail")}
           ${navButton("settings", "Study Setup")}
@@ -113,7 +117,7 @@ function render() {
       <section class="main">
         <header class="topbar">
           <div class="row">
-            <button class="icon mobile-menu" id="menu-toggle" title="Menu">☰</button>
+            <button class="icon mobile-menu" id="menu-toggle" title="Menu">Menu</button>
             <div>
               <strong>${escapeHtml(study?.name || "No study")}</strong>
               <div class="small">${escapeHtml(study?.protocol_id || "")}</div>
@@ -121,6 +125,7 @@ function render() {
           </div>
           <div class="split-actions">
             <a href="/api/studies/${state.studyId}/export" target="_blank"><button class="secondary">Export CSV</button></a>
+            <a href="/api/studies/${state.studyId}/codebook" target="_blank"><button class="secondary">Codebook</button></a>
             <button class="secondary" id="logout">Logout</button>
           </div>
         </header>
@@ -145,6 +150,7 @@ function route() {
   if (state.view === "data") return dataView();
   if (state.view === "forms") return formsView();
   if (state.view === "queries") return queriesView();
+  if (state.view === "quality") return qualityView();
   if (state.view === "analysis") return analysisView();
   if (state.view === "audit") return auditView();
   if (state.view === "settings") return settingsView();
@@ -160,6 +166,7 @@ function dashboardView() {
       ${metric("Participants", state.analysis?.participant_count || 0, "Enrolled or screening records")}
       ${metric("CRF Entries", total, `${completion}% complete`)}
       ${metric("Open Queries", state.analysis?.open_query_count || 0, "Needs review")}
+      ${metric("Quality Issues", state.quality?.length || 0, "Edit checks and missing CRFs")}
     </section>
     <section class="panel">
       <h2>Today</h2>
@@ -246,16 +253,19 @@ function dataView() {
 }
 
 function entryCard(participant, form) {
-  const existing = state.entries.find((entry) => entry.participant_id === participant.id && entry.form_id === form.id) || { data: {}, status: "draft", event_name: "Baseline" };
+  const existing = state.entries.find((entry) => entry.participant_id === participant.id && entry.form_id === form.id) || { data: {}, status: "draft", event_name: "Baseline", repeat_instance: 1 };
+  const locked = Boolean(existing.locked_at);
   return `
     <form class="card stack entry-form" data-form-id="${form.id}" data-participant-id="${participant.id}">
       <div class="row">
         <div>
           <h3>${escapeHtml(form.name)}</h3>
           <span class="pill ${existing.status === "complete" ? "ok" : "warn"}">${escapeHtml(existing.status)}</span>
+          ${locked ? `<span class="pill ok">locked</span>` : ""}
         </div>
         <label>Event<input name="event_name" value="${escapeHtml(existing.event_name || "Baseline")}" /></label>
       </div>
+      <label>Repeat instance<input name="repeat_instance" type="number" min="1" value="${escapeHtml(existing.repeat_instance || 1)}" ${form.schema.repeatable ? "" : "readonly"} /></label>
       ${form.schema.fields.map((field) => fieldInput(field, existing.data)).join("")}
       <label>Status
         <select name="status">
@@ -263,9 +273,12 @@ function entryCard(participant, form) {
           <option value="complete" ${existing.status === "complete" ? "selected" : ""}>complete</option>
         </select>
       </label>
+      ${locked ? `<label>Change reason required for locked CRF<input name="change_reason" placeholder="Reason for updating locked data" /></label>` : ""}
       <div class="split-actions">
         <button>Save CRF</button>
         <button type="button" class="secondary" data-query-form="${form.id}" data-query-participant="${participant.id}">Open Query</button>
+        ${existing.id && !locked ? `<button type="button" class="secondary" data-lock-entry="${existing.id}">Lock</button>` : ""}
+        ${existing.id && locked ? `<button type="button" class="warning" data-unlock-entry="${existing.id}">Unlock</button>` : ""}
       </div>
     </form>
   `;
@@ -280,6 +293,10 @@ function fieldInput(field, data) {
   }
   if (field.type === "select") {
     return `<label ${visibility}>${escapeHtml(field.label)}<select name="${escapeHtml(field.code)}" ${required}><option value=""></option>${(field.options || []).map((option) => `<option ${option === value ? "selected" : ""}>${escapeHtml(option)}</option>`).join("")}</select></label>`;
+  }
+  if (field.type === "checkbox") {
+    const selected = Array.isArray(value) ? value : [];
+    return `<fieldset ${visibility}><legend>${escapeHtml(field.label)}</legend>${(field.options || []).map((option) => `<label class="check"><input type="checkbox" name="${escapeHtml(field.code)}" value="${escapeHtml(option)}" ${selected.includes(option) ? "checked" : ""} />${escapeHtml(option)}</label>`).join("")}</fieldset>`;
   }
   const attrs = [`name="${escapeHtml(field.code)}"`, `value="${escapeHtml(value)}"`, required];
   if (field.type === "number") {
@@ -300,6 +317,12 @@ function formsView() {
         <div class="form-grid">
           <label>Form name<input name="name" required placeholder="Laboratory Results" /></label>
           <label>Code<input name="code" required placeholder="labs" /></label>
+          <label>Repeatable
+            <select name="repeatable">
+              <option value="false">No</option>
+              <option value="true">Yes</option>
+            </select>
+          </label>
         </div>
         <div id="fields" class="stack">
           ${fieldEditorRow()}
@@ -316,7 +339,7 @@ function formsView() {
         ${state.forms.map((form) => `
           <article class="card">
             <h3>${escapeHtml(form.name)}</h3>
-            <p>${escapeHtml(form.code)} · v${form.version} · ${form.schema.fields.length} fields</p>
+            <p>${escapeHtml(form.code)} - v${form.version} - ${form.schema.fields.length} fields${form.schema.repeatable ? " - repeatable" : ""}</p>
             <div class="stack">
               ${form.schema.fields.map((field) => `<span class="pill">${escapeHtml(field.label)} (${escapeHtml(field.type)})</span>`).join("")}
             </div>
@@ -338,12 +361,13 @@ function fieldEditorRow() {
           <option value="number">number</option>
           <option value="date">date</option>
           <option value="select">select</option>
+          <option value="checkbox">checkbox</option>
           <option value="textarea">textarea</option>
         </select>
       </label>
       <label>Required<select name="field_required"><option value="false">No</option><option value="true">Yes</option></select></label>
-      <button type="button" class="secondary icon" data-remove-field title="Remove">×</button>
-      <label class="full">Options for select fields<input name="field_options" placeholder="No, Yes" /></label>
+      <button type="button" class="secondary icon" data-remove-field title="Remove">X</button>
+      <label class="full">Options for select or checkbox fields<input name="field_options" placeholder="No, Yes" /></label>
       <label>Min<input name="field_min" type="number" step="any" /></label>
       <label>Max<input name="field_max" type="number" step="any" /></label>
     </div>
@@ -373,6 +397,33 @@ function queriesView() {
           </table>
         </div>
       ` : "<p>No queries.</p>"}
+    </section>
+  `;
+}
+
+function qualityView() {
+  return `
+    <section class="panel">
+      <h2>Data Quality</h2>
+      ${state.quality.length ? `
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Severity</th><th>Participant</th><th>Form</th><th>Event</th><th>Field</th><th>Issue</th></tr></thead>
+            <tbody>
+              ${state.quality.map((issue) => `
+                <tr>
+                  <td><span class="pill ${issue.severity === "error" ? "bad" : "warn"}">${escapeHtml(issue.severity)}</span></td>
+                  <td>${escapeHtml(issue.study_uid || "")}</td>
+                  <td>${escapeHtml(issue.form_name || "")}</td>
+                  <td>${escapeHtml(issue.event_name || "")} #${escapeHtml(issue.repeat_instance || 1)}</td>
+                  <td>${escapeHtml(issue.field_code || "")}</td>
+                  <td>${escapeHtml(issue.message)}</td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+      ` : "<p>No quality issues found.</p>"}
     </section>
   `;
 }
@@ -500,6 +551,8 @@ function bindRoute() {
   });
   document.querySelectorAll("[data-query-form]").forEach((button) => button.addEventListener("click", openQuery));
   document.querySelectorAll("[data-close-query]").forEach((button) => button.addEventListener("click", () => closeQuery(button.dataset.closeQuery)));
+  document.querySelectorAll("[data-lock-entry]").forEach((button) => button.addEventListener("click", () => lockEntry(button.dataset.lockEntry)));
+  document.querySelectorAll("[data-unlock-entry]").forEach((button) => button.addEventListener("click", () => unlockEntry(button.dataset.unlockEntry)));
 }
 
 function applyBranching(form) {
@@ -552,7 +605,7 @@ async function submitFormDefinition(event) {
       required: get("field_required") === "true",
     };
     const options = get("field_options");
-    if (field.type === "select" && options) field.options = options.split(",").map((item) => item.trim()).filter(Boolean);
+    if ((field.type === "select" || field.type === "checkbox") && options) field.options = options.split(",").map((item) => item.trim()).filter(Boolean);
     const min = get("field_min");
     const max = get("field_max");
     if (min !== "") field.min = Number(min);
@@ -562,7 +615,7 @@ async function submitFormDefinition(event) {
   try {
     await api(`/api/studies/${state.studyId}/forms`, {
       method: "POST",
-      body: JSON.stringify({ name: formData.get("name"), code: formData.get("code"), schema: { fields } }),
+      body: JSON.stringify({ name: formData.get("name"), code: formData.get("code"), schema: { fields, repeatable: formData.get("repeatable") === "true" } }),
     });
     await loadStudy();
     render();
@@ -580,7 +633,11 @@ async function submitEntry(event) {
   const formDef = state.forms.find((item) => item.id === Number(form.dataset.formId));
   formDef.schema.fields.forEach((field) => {
     if (!form.querySelector(`[name="${field.code}"]`)?.closest(".hidden")) {
-      data[field.code] = payload[field.code] || "";
+      if (field.type === "checkbox") {
+        data[field.code] = [...form.querySelectorAll(`[name="${field.code}"]:checked`)].map((item) => item.value);
+      } else {
+        data[field.code] = payload[field.code] || "";
+      }
     }
   });
   try {
@@ -590,10 +647,37 @@ async function submitEntry(event) {
         participant_id: Number(form.dataset.participantId),
         form_id: Number(form.dataset.formId),
         event_name: payload.event_name || "Baseline",
+        repeat_instance: Number(payload.repeat_instance || 1),
         status: payload.status || "draft",
+        change_reason: payload.change_reason || "",
         data,
       }),
     });
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function lockEntry(id) {
+  const reason = prompt("Lock reason") || "Reviewed and locked";
+  try {
+    await api(`/api/studies/${state.studyId}/entries/${id}`, { method: "PATCH", body: JSON.stringify({ action: "lock", reason }) });
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function unlockEntry(id) {
+  const reason = prompt("Unlock reason");
+  if (!reason) return;
+  try {
+    await api(`/api/studies/${state.studyId}/entries/${id}`, { method: "PATCH", body: JSON.stringify({ action: "unlock", reason }) });
     await loadStudy();
     render();
   } catch (error) {

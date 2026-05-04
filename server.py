@@ -75,6 +75,54 @@ def load_json(value: str | None, fallback):
         return fallback
 
 
+def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {dict(row)["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def add_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    if column not in table_columns(conn, table):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def migrate_entries_unique_key(conn: sqlite3.Connection) -> None:
+    schema = row(conn, "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'entries'")
+    if not schema or "UNIQUE(participant_id, form_id, event_name)" not in schema["sql"]:
+        return
+    conn.executescript(
+        """
+        ALTER TABLE entries RENAME TO entries_old;
+        CREATE TABLE entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+            participant_id INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+            form_id INTEGER NOT NULL REFERENCES forms(id) ON DELETE CASCADE,
+            event_name TEXT NOT NULL DEFAULT 'Baseline',
+            repeat_instance INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'draft',
+            data_json TEXT NOT NULL DEFAULT '{}',
+            created_by INTEGER REFERENCES users(id),
+            updated_by INTEGER REFERENCES users(id),
+            locked_at INTEGER,
+            locked_by INTEGER REFERENCES users(id),
+            lock_reason TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE(participant_id, form_id, event_name, repeat_instance)
+        );
+        INSERT INTO entries(
+            id, study_id, participant_id, form_id, event_name, repeat_instance, status,
+            data_json, created_by, updated_by, locked_at, locked_by, lock_reason, created_at, updated_at
+        )
+        SELECT
+            id, study_id, participant_id, form_id, event_name,
+            COALESCE(repeat_instance, 1), status, data_json, created_by, updated_by,
+            locked_at, locked_by, COALESCE(lock_reason, ''), created_at, updated_at
+        FROM entries_old;
+        DROP TABLE entries_old;
+        """
+    )
+
+
 def audit(conn: sqlite3.Connection, user_id: int | None, action: str, entity_type: str, entity_id: int | None, before=None, after=None) -> None:
     conn.execute(
         """
@@ -155,13 +203,17 @@ def migrate() -> None:
                 participant_id INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
                 form_id INTEGER NOT NULL REFERENCES forms(id) ON DELETE CASCADE,
                 event_name TEXT NOT NULL DEFAULT 'Baseline',
+                repeat_instance INTEGER NOT NULL DEFAULT 1,
                 status TEXT NOT NULL DEFAULT 'draft',
                 data_json TEXT NOT NULL DEFAULT '{}',
                 created_by INTEGER REFERENCES users(id),
                 updated_by INTEGER REFERENCES users(id),
+                locked_at INTEGER,
+                locked_by INTEGER REFERENCES users(id),
+                lock_reason TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
-                UNIQUE(participant_id, form_id, event_name)
+                UNIQUE(participant_id, form_id, event_name, repeat_instance)
             );
 
             CREATE TABLE IF NOT EXISTS queries (
@@ -190,6 +242,11 @@ def migrate() -> None:
             );
             """
         )
+        add_column(conn, "entries", "repeat_instance", "INTEGER NOT NULL DEFAULT 1")
+        add_column(conn, "entries", "locked_at", "INTEGER")
+        add_column(conn, "entries", "locked_by", "INTEGER REFERENCES users(id)")
+        add_column(conn, "entries", "lock_reason", "TEXT NOT NULL DEFAULT ''")
+        migrate_entries_unique_key(conn)
         if not row(conn, "SELECT id FROM users WHERE username = ?", ("admin",)):
             user = {
                 "username": "admin",
@@ -243,6 +300,98 @@ def seed_study(conn: sqlite3.Connection) -> None:
             (study_id, name, code, json.dumps({"fields": fields}), timestamp, timestamp),
         )
     audit(conn, None, "seed", "study", study_id, None, {"study_id": study_id})
+
+
+def normalize_code(value: str, fallback: str = "") -> str:
+    normalized = "".join(ch.lower() if ch.isalnum() else "_" for ch in value.strip())
+    normalized = "_".join(part for part in normalized.split("_") if part)
+    return normalized or fallback
+
+
+def normalize_schema(schema: dict) -> dict:
+    fields = []
+    seen = set()
+    for index, source in enumerate(schema.get("fields", []), start=1):
+        label = str(source.get("label", "")).strip() or f"Field {index}"
+        code = normalize_code(str(source.get("code", "")), f"field_{index}")
+        if code in seen:
+            raise ValueError(f"Duplicate field code: {code}")
+        seen.add(code)
+        field_type = str(source.get("type", "text")).strip() or "text"
+        if field_type not in {"text", "textarea", "number", "date", "select", "checkbox", "calc"}:
+            raise ValueError(f"Unsupported field type: {field_type}")
+        field = {
+            "code": code,
+            "label": label,
+            "type": field_type,
+            "required": bool(source.get("required", False)),
+        }
+        for key in ("min", "max"):
+            if source.get(key) not in (None, ""):
+                field[key] = float(source[key])
+        if field_type in {"select", "checkbox"}:
+            options = source.get("options") or []
+            if isinstance(options, str):
+                options = [item.strip() for item in options.split(",")]
+            field["options"] = [str(item).strip() for item in options if str(item).strip()]
+        if source.get("show_if"):
+            show_if = source["show_if"]
+            field["show_if"] = {"field": normalize_code(str(show_if.get("field", ""))), "equals": str(show_if.get("equals", ""))}
+        if source.get("calculation"):
+            field["calculation"] = str(source["calculation"])
+        fields.append(field)
+    if not fields:
+        raise ValueError("A CRF must contain at least one field")
+    return {"fields": fields, "repeatable": bool(schema.get("repeatable", False))}
+
+
+def validate_entry_data(schema: dict, data: dict) -> tuple[dict, list[dict]]:
+    cleaned = {}
+    issues = []
+    for field in schema.get("fields", []):
+        code = field["code"]
+        value = data.get(code)
+        visible = True
+        if field.get("show_if"):
+            condition = field["show_if"]
+            visible = str(data.get(condition["field"], "")) == str(condition["equals"])
+        if not visible:
+            continue
+        if isinstance(value, str):
+            value = value.strip()
+        if value in (None, "", []):
+            if field.get("required"):
+                issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} is required"})
+            cleaned[code] = "" if field["type"] != "checkbox" else []
+            continue
+        if field["type"] == "number":
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} must be numeric"})
+                cleaned[code] = value
+                continue
+            if "min" in field and number < field["min"]:
+                issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} is below minimum {field['min']}"})
+            if "max" in field and number > field["max"]:
+                issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} is above maximum {field['max']}"})
+            cleaned[code] = number
+            continue
+        if field["type"] == "select":
+            if field.get("options") and str(value) not in field["options"]:
+                issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} must be one of the coded options"})
+            cleaned[code] = str(value)
+            continue
+        if field["type"] == "checkbox":
+            selected = value if isinstance(value, list) else [value]
+            selected = [str(item) for item in selected if str(item)]
+            invalid = [item for item in selected if field.get("options") and item not in field["options"]]
+            if invalid:
+                issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} has invalid checkbox options"})
+            cleaned[code] = selected
+            continue
+        cleaned[code] = str(value)
+    return cleaned, issues
 
 
 class App(BaseHTTPRequestHandler):
@@ -412,10 +561,16 @@ class App(BaseHTTPRequestHandler):
             return self.entries(conn, user, method, study_id, parts, query)
         if resource == "queries":
             return self.queries(conn, user, method, study_id, parts)
+        if resource == "metadata" and method == "GET":
+            return self.metadata(conn, study_id)
+        if resource == "quality" and method == "GET":
+            return self.quality(conn, study_id)
         if resource == "analysis" and method == "GET":
             return self.analysis(conn, study_id)
         if resource == "export" and method == "GET":
             return self.export_csv(conn, study_id)
+        if resource == "codebook" and method == "GET":
+            return self.export_codebook(conn, study_id)
         if resource == "audit" and method == "GET":
             return self.send_json({"audit": rows(conn, "SELECT audit_log.*, users.display_name FROM audit_log LEFT JOIN users ON users.id = audit_log.user_id WHERE entity_id IN (SELECT id FROM participants WHERE study_id = ?) OR entity_type = 'study' ORDER BY audit_log.id DESC LIMIT 250", (study_id,))})
         self.send_error_json("Unknown study route", 404)
@@ -430,10 +585,10 @@ class App(BaseHTTPRequestHandler):
         if method == "POST":
             payload = self.body()
             timestamp = now()
-            schema = payload.get("schema") or {"fields": []}
+            schema = normalize_schema(payload.get("schema") or {"fields": []})
             cur = conn.execute(
                 "INSERT INTO forms(study_id, name, code, schema_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (study_id, str(payload.get("name", "")).strip() or "Untitled Form", str(payload.get("code", "")).strip() or f"form_{timestamp}", json.dumps(schema), timestamp, timestamp),
+                (study_id, str(payload.get("name", "")).strip() or "Untitled Form", normalize_code(str(payload.get("code", "")), f"form_{timestamp}"), json.dumps(schema), timestamp, timestamp),
             )
             after = row(conn, "SELECT * FROM forms WHERE id = ?", (cur.lastrowid,))
             audit(conn, user["id"], "create", "form", cur.lastrowid, None, after)
@@ -442,10 +597,14 @@ class App(BaseHTTPRequestHandler):
         if method == "PATCH" and len(parts) == 5:
             form_id = int(parts[4])
             before = row(conn, "SELECT * FROM forms WHERE id = ? AND study_id = ?", (form_id, study_id))
+            if not before:
+                self.send_error_json("Form not found", 404)
+                return
             payload = self.body()
+            schema = normalize_schema(payload.get("schema", load_json(before["schema_json"], {})))
             conn.execute(
                 "UPDATE forms SET name = ?, code = ?, schema_json = ?, version = version + 1, updated_at = ? WHERE id = ? AND study_id = ?",
-                (str(payload.get("name", before["name"])).strip(), str(payload.get("code", before["code"])).strip(), json.dumps(payload.get("schema", load_json(before["schema_json"], {}))), now(), form_id, study_id),
+                (str(payload.get("name", before["name"])).strip(), normalize_code(str(payload.get("code", before["code"])), before["code"]), json.dumps(schema), now(), form_id, study_id),
             )
             after = row(conn, "SELECT * FROM forms WHERE id = ?", (form_id,))
             audit(conn, user["id"], "update", "form", form_id, before, after)
@@ -492,7 +651,7 @@ class App(BaseHTTPRequestHandler):
         if method == "GET":
             participant_id = int((query.get("participant_id") or ["0"])[0])
             params: tuple = (study_id,)
-            sql = "SELECT entries.*, forms.name AS form_name, participants.study_uid FROM entries JOIN forms ON forms.id = entries.form_id JOIN participants ON participants.id = entries.participant_id WHERE entries.study_id = ?"
+            sql = "SELECT entries.*, forms.name AS form_name, forms.code AS form_code, participants.study_uid FROM entries JOIN forms ON forms.id = entries.form_id JOIN participants ON participants.id = entries.participant_id WHERE entries.study_id = ?"
             if participant_id:
                 sql += " AND participant_id = ?"
                 params = (study_id, participant_id)
@@ -507,26 +666,72 @@ class App(BaseHTTPRequestHandler):
             participant_id = int(payload["participant_id"])
             form_id = int(payload["form_id"])
             event_name = str(payload.get("event_name", "Baseline")).strip() or "Baseline"
+            repeat_instance = max(int(payload.get("repeat_instance", 1) or 1), 1)
             data = payload.get("data", {})
             status = str(payload.get("status", "draft"))
-            existing = row(conn, "SELECT * FROM entries WHERE participant_id = ? AND form_id = ? AND event_name = ?", (participant_id, form_id, event_name))
+            form = row(conn, "SELECT * FROM forms WHERE id = ? AND study_id = ?", (form_id, study_id))
+            participant = row(conn, "SELECT * FROM participants WHERE id = ? AND study_id = ?", (participant_id, study_id))
+            if not form or not participant:
+                self.send_error_json("Participant or form not found", 404)
+                return
+            schema = load_json(form["schema_json"], {"fields": []})
+            if repeat_instance > 1 and not schema.get("repeatable"):
+                self.send_error_json("This CRF is not configured as repeatable", 400)
+                return
+            cleaned, issues = validate_entry_data(schema, data)
+            if issues:
+                self.send_json({"errors": issues}, 422)
+                return
+            existing = row(conn, "SELECT * FROM entries WHERE participant_id = ? AND form_id = ? AND event_name = ? AND repeat_instance = ?", (participant_id, form_id, event_name, repeat_instance))
             if existing:
+                if existing.get("locked_at"):
+                    reason = str(payload.get("change_reason", "")).strip()
+                    if not reason:
+                        self.send_error_json("Change reason is required before editing a locked CRF", 423)
+                        return
                 before = existing
                 conn.execute(
-                    "UPDATE entries SET data_json = ?, status = ?, updated_by = ?, updated_at = ? WHERE id = ?",
-                    (json.dumps(data), status, user["id"], timestamp, existing["id"]),
+                    "UPDATE entries SET data_json = ?, status = ?, updated_by = ?, updated_at = ?, locked_at = NULL, locked_by = NULL, lock_reason = '' WHERE id = ?",
+                    (json.dumps(cleaned), status, user["id"], timestamp, existing["id"]),
                 )
                 after = row(conn, "SELECT * FROM entries WHERE id = ?", (existing["id"],))
-                audit(conn, user["id"], "update", "entry", existing["id"], before, after)
+                audit(conn, user["id"], "update", "entry", existing["id"], before, {"entry": after, "change_reason": payload.get("change_reason", "")})
                 self.send_json({"entry": after})
                 return
             cur = conn.execute(
-                "INSERT INTO entries(study_id, participant_id, form_id, event_name, status, data_json, created_by, updated_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (study_id, participant_id, form_id, event_name, status, json.dumps(data), user["id"], user["id"], timestamp, timestamp),
+                "INSERT INTO entries(study_id, participant_id, form_id, event_name, repeat_instance, status, data_json, created_by, updated_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (study_id, participant_id, form_id, event_name, repeat_instance, status, json.dumps(cleaned), user["id"], user["id"], timestamp, timestamp),
             )
             after = row(conn, "SELECT * FROM entries WHERE id = ?", (cur.lastrowid,))
             audit(conn, user["id"], "create", "entry", cur.lastrowid, None, after)
             self.send_json({"entry": after}, 201)
+            return
+        if method == "PATCH" and len(parts) == 5:
+            entry_id = int(parts[4])
+            before = row(conn, "SELECT * FROM entries WHERE id = ? AND study_id = ?", (entry_id, study_id))
+            if not before:
+                self.send_error_json("Entry not found", 404)
+                return
+            payload = self.body()
+            action = str(payload.get("action", "")).strip()
+            if action == "lock":
+                reason = str(payload.get("reason", "")).strip() or "Reviewed and locked"
+                conn.execute("UPDATE entries SET locked_at = ?, locked_by = ?, lock_reason = ?, status = 'complete', updated_by = ?, updated_at = ? WHERE id = ?", (now(), user["id"], reason, user["id"], now(), entry_id))
+                after = row(conn, "SELECT * FROM entries WHERE id = ?", (entry_id,))
+                audit(conn, user["id"], "lock", "entry", entry_id, before, after)
+                self.send_json({"entry": after})
+                return
+            if action == "unlock":
+                reason = str(payload.get("reason", "")).strip()
+                if not reason:
+                    self.send_error_json("Unlock reason is required", 400)
+                    return
+                conn.execute("UPDATE entries SET locked_at = NULL, locked_by = NULL, lock_reason = '', updated_by = ?, updated_at = ? WHERE id = ?", (user["id"], now(), entry_id))
+                after = row(conn, "SELECT * FROM entries WHERE id = ?", (entry_id,))
+                audit(conn, user["id"], "unlock", "entry", entry_id, before, {"entry": after, "reason": reason})
+                self.send_json({"entry": after})
+                return
+            self.send_error_json("Unsupported entry action", 405)
             return
         self.send_error_json("Unsupported entries operation", 405)
 
@@ -556,6 +761,90 @@ class App(BaseHTTPRequestHandler):
             return
         self.send_error_json("Unsupported queries operation", 405)
 
+    def metadata(self, conn, study_id: int) -> None:
+        study = row(conn, "SELECT * FROM studies WHERE id = ?", (study_id,))
+        forms = rows(conn, "SELECT * FROM forms WHERE study_id = ? ORDER BY id", (study_id,))
+        instruments = []
+        data_dictionary = []
+        for form in forms:
+            schema = load_json(form["schema_json"], {"fields": []})
+            instruments.append(
+                {
+                    "instrument_name": form["code"],
+                    "instrument_label": form["name"],
+                    "version": form["version"],
+                    "repeatable": bool(schema.get("repeatable")),
+                }
+            )
+            for order, field in enumerate(schema.get("fields", []), start=1):
+                data_dictionary.append(
+                    {
+                        "instrument_name": form["code"],
+                        "field_order": order,
+                        "field_name": field["code"],
+                        "field_label": field["label"],
+                        "field_type": field["type"],
+                        "required": bool(field.get("required")),
+                        "choices": field.get("options", []),
+                        "validation_min": field.get("min", ""),
+                        "validation_max": field.get("max", ""),
+                        "branching_logic": field.get("show_if", ""),
+                        "calculation": field.get("calculation", ""),
+                    }
+                )
+        self.send_json({"project": study, "instruments": instruments, "data_dictionary": data_dictionary})
+
+    def quality(self, conn, study_id: int) -> None:
+        forms = rows(conn, "SELECT * FROM forms WHERE study_id = ? ORDER BY id", (study_id,))
+        entries = rows(
+            conn,
+            """
+            SELECT entries.*, forms.name AS form_name, forms.schema_json, participants.study_uid
+            FROM entries
+            JOIN forms ON forms.id = entries.form_id
+            JOIN participants ON participants.id = entries.participant_id
+            WHERE entries.study_id = ?
+            ORDER BY participants.study_uid, forms.id
+            """,
+            (study_id,),
+        )
+        issues = []
+        for entry in entries:
+            schema = load_json(entry["schema_json"], {"fields": []})
+            data = load_json(entry["data_json"], {})
+            _, entry_issues = validate_entry_data(schema, data)
+            for issue in entry_issues:
+                issues.append(
+                    {
+                        "participant_id": entry["participant_id"],
+                        "study_uid": entry["study_uid"],
+                        "form_id": entry["form_id"],
+                        "form_name": entry["form_name"],
+                        "event_name": entry["event_name"],
+                        "repeat_instance": entry["repeat_instance"],
+                        **issue,
+                    }
+                )
+        participants = rows(conn, "SELECT id, study_uid FROM participants WHERE study_id = ?", (study_id,))
+        existing_pairs = {(entry["participant_id"], entry["form_id"]) for entry in entries}
+        for participant in participants:
+            for form in forms:
+                if (participant["id"], form["id"]) not in existing_pairs:
+                    issues.append(
+                        {
+                            "participant_id": participant["id"],
+                            "study_uid": participant["study_uid"],
+                            "form_id": form["id"],
+                            "form_name": form["name"],
+                            "event_name": "Baseline",
+                            "repeat_instance": 1,
+                            "field_code": "",
+                            "severity": "warning",
+                            "message": "Expected baseline CRF has not been started",
+                        }
+                    )
+        self.send_json({"issues": issues})
+
     def analysis(self, conn, study_id: int) -> None:
         participants = rows(conn, "SELECT * FROM participants WHERE study_id = ?", (study_id,))
         entries = rows(conn, "SELECT entries.*, forms.name AS form_name, forms.schema_json FROM entries JOIN forms ON forms.id = entries.form_id WHERE entries.study_id = ?", (study_id,))
@@ -571,11 +860,12 @@ class App(BaseHTTPRequestHandler):
                 code = field.get("code")
                 if not code:
                     continue
+                scoped_code = f"{entry['form_id']}__{code}"
                 label = f"{entry['form_name']}: {field.get('label', code)}"
-                fields[code] = {"label": label, "type": field.get("type", "text")}
+                fields[scoped_code] = {"label": label, "type": field.get("type", "text")}
                 value = data.get(code)
                 if value not in (None, ""):
-                    values.setdefault(code, []).append(value)
+                    values.setdefault(scoped_code, []).append(value)
         summaries = []
         for code, meta in fields.items():
             series = values.get(code, [])
@@ -607,12 +897,12 @@ class App(BaseHTTPRequestHandler):
                 field_codes.append(code)
                 labels[code] = field.get("label", code)
         output = []
-        header = ["study_uid", "initials", "participant_status", "event_name", "form_name", "entry_status"] + field_codes
+        header = ["study_uid", "initials", "participant_status", "event_name", "repeat_instance", "form_name", "entry_status", "locked"] + field_codes
         output.append(header)
         entries = rows(conn, "SELECT entries.*, participants.study_uid, participants.initials, participants.status AS participant_status, forms.name AS form_name, forms.code AS form_code FROM entries JOIN participants ON participants.id = entries.participant_id JOIN forms ON forms.id = entries.form_id WHERE entries.study_id = ? ORDER BY participants.study_uid, forms.id", (study_id,))
         for entry in entries:
             data = load_json(entry["data_json"], {})
-            line = [entry["study_uid"], entry["initials"], entry["participant_status"], entry["event_name"], entry["form_name"], entry["status"]]
+            line = [entry["study_uid"], entry["initials"], entry["participant_status"], entry["event_name"], entry["repeat_instance"], entry["form_name"], entry["status"], "yes" if entry["locked_at"] else "no"]
             for code in field_codes:
                 prefix, field_code = code.split("__", 1)
                 line.append(data.get(field_code, "") if prefix == entry["form_code"] else "")
@@ -627,6 +917,49 @@ class App(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("content-type", "text/csv; charset=utf-8")
         self.send_header("content-disposition", "attachment; filename=clinical_data_export.csv")
+        self.send_header("content-length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
+    def export_codebook(self, conn, study_id: int) -> None:
+        forms = rows(conn, "SELECT * FROM forms WHERE study_id = ? ORDER BY id", (study_id,))
+        output = [["instrument_name", "instrument_label", "field_order", "field_name", "field_label", "field_type", "required", "choices", "validation_min", "validation_max", "branching_logic", "calculation", "repeatable"]]
+        for form in forms:
+            schema = load_json(form["schema_json"], {"fields": []})
+            for order, field in enumerate(schema.get("fields", []), start=1):
+                choices = " | ".join(field.get("options", []))
+                branching = ""
+                if field.get("show_if"):
+                    branching = f"[{field['show_if']['field']}] = '{field['show_if']['equals']}'"
+                output.append(
+                    [
+                        form["code"],
+                        form["name"],
+                        order,
+                        field["code"],
+                        field["label"],
+                        field["type"],
+                        "yes" if field.get("required") else "no",
+                        choices,
+                        field.get("min", ""),
+                        field.get("max", ""),
+                        branching,
+                        field.get("calculation", ""),
+                        "yes" if schema.get("repeatable") else "no",
+                    ]
+                )
+        text_lines = []
+
+        class Sink:
+            def write(self, value):
+                text_lines.append(value)
+
+        writer = csv.writer(Sink())
+        writer.writerows(output)
+        content = "".join(text_lines).encode("utf-8-sig")
+        self.send_response(200)
+        self.send_header("content-type", "text/csv; charset=utf-8")
+        self.send_header("content-disposition", "attachment; filename=clinical_data_codebook.csv")
         self.send_header("content-length", str(len(content)))
         self.end_headers()
         self.wfile.write(content)

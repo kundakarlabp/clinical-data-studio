@@ -46,14 +46,18 @@ Implemented foundation:
 - Data queries and data quality dashboard
 - Audit trail for create/update/lock/unlock actions
 - CSV data export and codebook export
+- Data dictionary CSV import
+- Version history for edited CRFs
+- Calculated fields
+- Field-level verification/freeze
+- Query response history
+- Saved reports and filtered report export
+- Local backup, download, and restore
+- Local CRF draft assistant from pasted text
 
 Next planned build steps:
 
-- User management and project-level role permissions
-- Data access groups for multi-site studies
-- Full longitudinal arms/events/form-event mapping
-- Import data dictionary from CSV
-- Record-level and field-level freeze/verify states
-- Report builder with saved filters
-- Backup/restore and encrypted archive export
-- AI-assisted CRF/codebook drafting and de-identified analysis summaries
+- Browser/mobile regression tests
+- Optional encrypted archive export
+- Advanced AI-assisted codebook and de-identified analysis summaries
+- Desktop shortcut/installer packaging

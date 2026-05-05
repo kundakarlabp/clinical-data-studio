@@ -21,6 +21,7 @@ const state = {
   view: "dashboard",
   selectedParticipantId: 0,
   selectedEventId: Number(localStorage.getItem("cds_event_id") || 0),
+  editingFormId: 0,
   menuOpen: false,
   error: "",
 };
@@ -154,6 +155,7 @@ function render() {
           ${navButton("participants", "Participants")}
           ${navButton("data", "Data Entry")}
           ${navButton("forms", "CRF Builder")}
+          ${can("manage_forms") ? navButton("dictionary", "Dictionary") : ""}
           ${can("manage_study") ? navButton("events", "Events") : ""}
           ${navButton("queries", "Review Queries")}
           ${navButton("quality", "Data Quality")}
@@ -181,6 +183,7 @@ function render() {
           </div>
         </header>
         <div class="content">
+          ${state.user?.must_change_password ? `<div class="notice error">Default password is still active. Change it in Study Setup before real use.</div>` : ""}
           ${state.error ? `<div class="notice error">${escapeHtml(state.error)}</div>` : ""}
           ${route()}
         </div>
@@ -200,6 +203,7 @@ function route() {
   if (state.view === "participants") return participantsView();
   if (state.view === "data") return dataView();
   if (state.view === "forms") return formsView();
+  if (state.view === "dictionary") return dictionaryView();
   if (state.view === "events") return eventsView();
   if (state.view === "queries") return queriesView();
   if (state.view === "quality") return qualityView();
@@ -342,11 +346,22 @@ function entryCard(participant, form, selectedEvent) {
         </select>
       </label>
       ${locked ? `<label>Change reason required for locked CRF<input name="change_reason" placeholder="Reason for updating locked data" /></label>` : ""}
+      ${existing.id && can("review_data") ? `
+        <div class="form-grid">
+          <label>Field review
+            <select name="review_field_code">
+              ${form.schema.fields.map((field) => `<option value="${field.code}">${escapeHtml(field.label)}</option>`).join("")}
+            </select>
+          </label>
+          <label>Reason<input name="field_state_reason" placeholder="Review note" /></label>
+        </div>
+      ` : ""}
       <div class="split-actions">
         <button>Save CRF</button>
         <button type="button" class="secondary" data-query-form="${form.id}" data-query-participant="${participant.id}">Open Query</button>
         ${existing.id && !locked ? `<button type="button" class="secondary" data-lock-entry="${existing.id}">Lock</button>` : ""}
         ${existing.id && locked ? `<button type="button" class="warning" data-unlock-entry="${existing.id}">Unlock</button>` : ""}
+        ${existing.id && can("review_data") ? `<button type="button" class="secondary" data-verify-field="${existing.id}">Verify Field</button><button type="button" class="secondary" data-freeze-field="${existing.id}">Freeze Field</button>` : ""}
       </div>
     </form>
   `;
@@ -366,6 +381,9 @@ function fieldInput(field, data) {
     const selected = Array.isArray(value) ? value : [];
     return `<fieldset ${visibility}><legend>${escapeHtml(field.label)}</legend>${(field.options || []).map((option) => `<label class="check"><input type="checkbox" name="${escapeHtml(field.code)}" value="${escapeHtml(option)}" ${selected.includes(option) ? "checked" : ""} />${escapeHtml(option)}</label>`).join("")}</fieldset>`;
   }
+  if (field.type === "calc") {
+    return `<label ${visibility}>${escapeHtml(field.label)}<input name="${escapeHtml(field.code)}" value="${escapeHtml(value)}" readonly placeholder="${escapeHtml(field.calculation || "Calculated on save")}" /></label>`;
+  }
   const attrs = [`name="${escapeHtml(field.code)}"`, `value="${escapeHtml(value)}"`, required];
   if (field.type === "number") {
     attrs.push('type="number"', field.min !== undefined ? `min="${field.min}"` : "", field.max !== undefined ? `max="${field.max}"` : "", "step='any'");
@@ -378,17 +396,18 @@ function fieldInput(field, data) {
 }
 
 function formsView() {
+  const editing = state.forms.find((form) => form.id === state.editingFormId);
   return `
     <section class="panel">
-      <h2>CRF Builder</h2>
+      <h2>${editing ? "Edit CRF" : "CRF Builder"}</h2>
       <form id="form-builder" class="stack">
         <div class="form-grid">
-          <label>Form name<input name="name" required placeholder="Laboratory Results" /></label>
-          <label>Code<input name="code" required placeholder="labs" /></label>
+          <label>Form name<input name="name" required placeholder="Laboratory Results" value="${escapeHtml(editing?.name || "")}" /></label>
+          <label>Code<input name="code" required placeholder="labs" value="${escapeHtml(editing?.code || "")}" /></label>
           <label>Repeatable
             <select name="repeatable">
-              <option value="false">No</option>
-              <option value="true">Yes</option>
+              <option value="false" ${editing?.schema?.repeatable ? "" : "selected"}>No</option>
+              <option value="true" ${editing?.schema?.repeatable ? "selected" : ""}>Yes</option>
             </select>
           </label>
           <fieldset class="full">
@@ -397,11 +416,12 @@ function formsView() {
           </fieldset>
         </div>
         <div id="fields" class="stack">
-          ${fieldEditorRow()}
+          ${(editing?.schema?.fields?.length ? editing.schema.fields : [null]).map((field) => fieldEditorRow(field)).join("")}
         </div>
         <div class="split-actions">
           <button type="button" class="secondary" id="add-field">Add Field</button>
-          <button>Create CRF</button>
+          <button>${editing ? "Save Versioned Edit" : "Create CRF"}</button>
+          ${editing ? `<button type="button" class="secondary" id="cancel-form-edit">Cancel Edit</button>` : ""}
         </div>
       </form>
     </section>
@@ -415,9 +435,34 @@ function formsView() {
             <div class="stack">
               ${form.schema.fields.map((field) => `<span class="pill">${escapeHtml(field.label)} (${escapeHtml(field.type)})</span>`).join("")}
             </div>
+            <div class="split-actions">
+              <button class="secondary" data-edit-form="${form.id}">Edit</button>
+              <button class="secondary" data-form-versions="${form.id}">Versions</button>
+            </div>
           </article>
         `).join("")}
       </div>
+    </section>
+  `;
+}
+
+function dictionaryView() {
+  return `
+    <section class="panel">
+      <h2>Data Dictionary Import</h2>
+      <p>Paste a CSV exported from Codebook or matching its headers. Existing instruments with the same code are updated with a saved previous version.</p>
+      <form id="dictionary-form" class="stack">
+        <label>Dictionary CSV<textarea name="csv" required placeholder="instrument_name,instrument_label,events,field_order,field_name,field_label,field_type,required,choices,validation_min,validation_max,branching_logic,calculation,repeatable"></textarea></label>
+        <button>Import Dictionary</button>
+      </form>
+    </section>
+    <section class="panel">
+      <h2>AI-Assisted CRF Draft</h2>
+      <p>This local helper turns pasted CRF item text into draft fields. It does not send data outside this app.</p>
+      <form id="assist-crf-form" class="stack">
+        <label>CRF text<textarea name="text" required placeholder="Age&#10;Visit date&#10;Any adverse event?"></textarea></label>
+        <button>Draft Schema</button>
+      </form>
     </section>
   `;
 }
@@ -475,26 +520,24 @@ function eventsView() {
   `;
 }
 
-function fieldEditorRow() {
+function fieldEditorRow(field = null) {
   return `
     <div class="field-editor">
-      <label>Label<input name="field_label" required placeholder="Systolic BP" /></label>
-      <label>Code<input name="field_code" required placeholder="systolic_bp" /></label>
+      <label>Label<input name="field_label" required placeholder="Systolic BP" value="${escapeHtml(field?.label || "")}" /></label>
+      <label>Code<input name="field_code" required placeholder="systolic_bp" value="${escapeHtml(field?.code || "")}" /></label>
       <label>Type
         <select name="field_type">
-          <option value="text">text</option>
-          <option value="number">number</option>
-          <option value="date">date</option>
-          <option value="select">select</option>
-          <option value="checkbox">checkbox</option>
-          <option value="textarea">textarea</option>
+          ${["text", "number", "date", "select", "checkbox", "textarea", "calc"].map((type) => `<option value="${type}" ${field?.type === type ? "selected" : ""}>${type}</option>`).join("")}
         </select>
       </label>
-      <label>Required<select name="field_required"><option value="false">No</option><option value="true">Yes</option></select></label>
+      <label>Required<select name="field_required"><option value="false" ${field?.required ? "" : "selected"}>No</option><option value="true" ${field?.required ? "selected" : ""}>Yes</option></select></label>
       <button type="button" class="secondary icon" data-remove-field title="Remove">X</button>
-      <label class="full">Options for select or checkbox fields<input name="field_options" placeholder="No, Yes" /></label>
-      <label>Min<input name="field_min" type="number" step="any" /></label>
-      <label>Max<input name="field_max" type="number" step="any" /></label>
+      <label class="full">Options for select or checkbox fields<input name="field_options" placeholder="No, Yes" value="${escapeHtml((field?.options || []).join(", "))}" /></label>
+      <label>Min<input name="field_min" type="number" step="any" value="${escapeHtml(field?.min ?? "")}" /></label>
+      <label>Max<input name="field_max" type="number" step="any" value="${escapeHtml(field?.max ?? "")}" /></label>
+      <label class="full">Calculation<input name="field_calculation" placeholder="age + 10" value="${escapeHtml(field?.calculation || "")}" /></label>
+      <label>Show if field<input name="field_show_if_field" placeholder="adverse_event" value="${escapeHtml(field?.show_if?.field || "")}" /></label>
+      <label>Equals<input name="field_show_if_equals" placeholder="Yes" value="${escapeHtml(field?.show_if?.equals || "")}" /></label>
     </div>
   `;
 }
@@ -515,7 +558,11 @@ function queriesView() {
                   <td>${escapeHtml(query.form_name || "")}</td>
                   <td>${escapeHtml(query.field_code || "")}</td>
                   <td>${escapeHtml(query.message)}</td>
-                  <td>${query.status === "open" ? `<button class="secondary" data-close-query="${query.id}">Close</button>` : ""}</td>
+                  <td>
+                    <span class="small">${(query.responses || []).length} response(s)</span>
+                    <button class="secondary" data-respond-query="${query.id}">Respond</button>
+                    ${query.status === "open" ? `<button class="secondary" data-close-query="${query.id}">Close</button>` : ""}
+                  </td>
                 </tr>
               `).join("")}
             </tbody>
@@ -672,7 +719,10 @@ function backupsView() {
                   <td>${escapeHtml(backup.name)}</td>
                   <td>${Math.round(backup.size / 1024)} KB</td>
                   <td>${fmtTime(backup.created_at)}</td>
-                  <td><a href="/api/studies/${state.studyId}/backups/${encodeURIComponent(backup.name)}" target="_blank"><button class="secondary">Download</button></a></td>
+                  <td>
+                    <a href="/api/studies/${state.studyId}/backups/${encodeURIComponent(backup.name)}" target="_blank"><button class="secondary">Download</button></a>
+                    <button class="warning" data-restore-backup="${escapeHtml(backup.name)}">Restore</button>
+                  </td>
                 </tr>
               `).join("")}
             </tbody>
@@ -845,9 +895,16 @@ function bindRoute() {
   document.querySelector("#form-event-form")?.addEventListener("submit", submitFormEvent);
   document.querySelector("#report-form")?.addEventListener("submit", submitReport);
   document.querySelector("#backup-create")?.addEventListener("click", createBackup);
+  document.querySelectorAll("[data-restore-backup]").forEach((button) => button.addEventListener("click", () => restoreBackup(button.dataset.restoreBackup)));
   document.querySelector("#form-builder")?.addEventListener("submit", submitFormDefinition);
+  document.querySelector("#dictionary-form")?.addEventListener("submit", submitDictionary);
+  document.querySelector("#assist-crf-form")?.addEventListener("submit", submitAssistCrf);
   document.querySelector("#add-field")?.addEventListener("click", () => {
     document.querySelector("#fields").insertAdjacentHTML("beforeend", fieldEditorRow());
+  });
+  document.querySelector("#cancel-form-edit")?.addEventListener("click", () => {
+    state.editingFormId = 0;
+    render();
   });
   document.querySelectorAll("[data-remove-field]").forEach((button) => button.addEventListener("click", () => button.closest(".field-editor").remove()));
   document.querySelectorAll("[data-enter]").forEach((button) => {
@@ -873,8 +930,16 @@ function bindRoute() {
   });
   document.querySelectorAll("[data-query-form]").forEach((button) => button.addEventListener("click", openQuery));
   document.querySelectorAll("[data-close-query]").forEach((button) => button.addEventListener("click", () => closeQuery(button.dataset.closeQuery)));
+  document.querySelectorAll("[data-respond-query]").forEach((button) => button.addEventListener("click", () => respondQuery(button.dataset.respondQuery)));
   document.querySelectorAll("[data-lock-entry]").forEach((button) => button.addEventListener("click", () => lockEntry(button.dataset.lockEntry)));
   document.querySelectorAll("[data-unlock-entry]").forEach((button) => button.addEventListener("click", () => unlockEntry(button.dataset.unlockEntry)));
+  document.querySelectorAll("[data-verify-field]").forEach((button) => button.addEventListener("click", () => setFieldState(button, "verify_field")));
+  document.querySelectorAll("[data-freeze-field]").forEach((button) => button.addEventListener("click", () => setFieldState(button, "freeze_field")));
+  document.querySelectorAll("[data-edit-form]").forEach((button) => button.addEventListener("click", () => {
+    state.editingFormId = Number(button.dataset.editForm);
+    render();
+  }));
+  document.querySelectorAll("[data-form-versions]").forEach((button) => button.addEventListener("click", () => showFormVersions(button.dataset.formVersions)));
 }
 
 function applyBranching(form) {
@@ -1061,16 +1126,77 @@ async function submitFormDefinition(event) {
     const max = get("field_max");
     if (min !== "") field.min = Number(min);
     if (max !== "") field.max = Number(max);
+    const calculation = get("field_calculation");
+    if (calculation) field.calculation = calculation;
+    const showIfField = get("field_show_if_field");
+    const showIfEquals = get("field_show_if_equals");
+    if (showIfField && showIfEquals) field.show_if = { field: showIfField, equals: showIfEquals };
     return field;
   });
   try {
     const eventIds = [...event.target.querySelectorAll(`[name="event_ids"]:checked`)].map((item) => Number(item.value));
-    await api(`/api/studies/${state.studyId}/forms`, {
-      method: "POST",
+    const path = state.editingFormId ? `/api/studies/${state.studyId}/forms/${state.editingFormId}` : `/api/studies/${state.studyId}/forms`;
+    await api(path, {
+      method: state.editingFormId ? "PATCH" : "POST",
       body: JSON.stringify({ name: formData.get("name"), code: formData.get("code"), event_ids: eventIds, schema: { fields, repeatable: formData.get("repeatable") === "true" } }),
     });
+    state.editingFormId = 0;
     await loadStudy();
     render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function restoreBackup(name) {
+  if (!confirm(`Restore backup ${name}? Current database will be replaced by this backup.`)) return;
+  try {
+    await api(`/api/studies/${state.studyId}/backups/${encodeURIComponent(name)}/restore`, { method: "POST", body: "{}" });
+    await loadAll();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function submitDictionary(event) {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(event.target));
+  try {
+    const result = await api(`/api/studies/${state.studyId}/dictionary`, {
+      method: "POST",
+      body: JSON.stringify({ csv: data.csv }),
+    });
+    state.error = `Imported ${result.imported.length} instrument(s).`;
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function submitAssistCrf(event) {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(event.target));
+  try {
+    const result = await api("/api/assist/crf", {
+      method: "POST",
+      body: JSON.stringify({ text: data.text }),
+    });
+    alert(JSON.stringify(result.schema, null, 2));
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function showFormVersions(formId) {
+  try {
+    const result = await api(`/api/studies/${state.studyId}/forms/${formId}/versions`);
+    const lines = result.versions.map((item) => `v${item.version} saved ${fmtTime(item.saved_at)}`).join("\\n");
+    alert(lines || "No prior versions saved.");
   } catch (error) {
     state.error = error.message;
     render();
@@ -1139,6 +1265,24 @@ async function unlockEntry(id) {
   }
 }
 
+async function setFieldState(button, action) {
+  const form = button.closest("form");
+  const fieldCode = form?.elements.review_field_code?.value;
+  const reason = form?.elements.field_state_reason?.value || "";
+  if (!fieldCode) return;
+  try {
+    await api(`/api/studies/${state.studyId}/entries/${button.dataset.verifyField || button.dataset.freezeField}`, {
+      method: "PATCH",
+      body: JSON.stringify({ action, field_code: fieldCode, reason }),
+    });
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
 async function openQuery(event) {
   const message = prompt("Query message");
   if (!message) return;
@@ -1150,6 +1294,22 @@ async function openQuery(event) {
         form_id: Number(event.target.dataset.queryForm),
         message,
       }),
+    });
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function respondQuery(id) {
+  const message = prompt("Query response");
+  if (!message) return;
+  try {
+    await api(`/api/studies/${state.studyId}/queries/${id}/responses`, {
+      method: "POST",
+      body: JSON.stringify({ message }),
     });
     await loadStudy();
     render();

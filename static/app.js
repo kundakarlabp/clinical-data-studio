@@ -1,6 +1,7 @@
 const state = {
   token: localStorage.getItem("cds_token") || "",
   user: null,
+  setupRequired: false,
   studies: [],
   memberships: [],
   studyId: Number(localStorage.getItem("cds_study_id") || 0),
@@ -60,6 +61,9 @@ function activeStudy() {
 }
 
 async function loadAll() {
+  const setup = await api("/api/setup").catch(() => ({ required: false }));
+  state.setupRequired = Boolean(setup.required);
+  if (state.setupRequired) return renderSetup();
   if (!state.token) return renderLogin();
   try {
     const me = await api("/api/me");
@@ -364,7 +368,7 @@ function entryCard(participant, form, selectedEvent) {
         <button type="button" class="secondary" data-query-form="${form.id}" data-query-participant="${participant.id}">Open Query</button>
         ${existing.id && !locked ? `<button type="button" class="secondary" data-lock-entry="${existing.id}">Lock</button>` : ""}
         ${existing.id && locked ? `<button type="button" class="warning" data-unlock-entry="${existing.id}">Unlock</button>` : ""}
-        ${existing.id && can("review_data") ? `<button type="button" class="secondary" data-verify-field="${existing.id}">Verify Field</button><button type="button" class="secondary" data-freeze-field="${existing.id}">Freeze Field</button>` : ""}
+        ${existing.id && can("review_data") ? `<button type="button" class="secondary" data-entry-history="${existing.id}">History</button><button type="button" class="secondary" data-verify-field="${existing.id}">Verify Field</button><button type="button" class="secondary" data-freeze-field="${existing.id}">Freeze Field</button>` : ""}
       </div>
     </form>
   `;
@@ -457,6 +461,14 @@ function dictionaryView() {
       <form id="dictionary-form" class="stack">
         <label>Dictionary CSV<textarea name="csv" required placeholder="instrument_name,instrument_label,events,field_order,field_name,field_label,field_type,required,choices,validation_min,validation_max,branching_logic,calculation,repeatable"></textarea></label>
         <button>Import Dictionary</button>
+      </form>
+    </section>
+    <section class="panel">
+      <h2>Record CSV Import</h2>
+      <p>Paste exported or similarly structured data with study_uid, form_code or form_name, event_code, repeat_instance, and field columns.</p>
+      <form id="record-import-form" class="stack">
+        <label>Record CSV<textarea name="csv" required placeholder="study_uid,initials,participant_status,event_code,form_code,entry_status,repeat_instance,demographics__age"></textarea></label>
+        <button>Import Records</button>
       </form>
     </section>
     <section class="panel">
@@ -916,6 +928,7 @@ function bindRoute() {
   document.querySelectorAll("[data-restore-backup]").forEach((button) => button.addEventListener("click", () => restoreBackup(button.dataset.restoreBackup, button.dataset.encrypted === "true")));
   document.querySelector("#form-builder")?.addEventListener("submit", submitFormDefinition);
   document.querySelector("#dictionary-form")?.addEventListener("submit", submitDictionary);
+  document.querySelector("#record-import-form")?.addEventListener("submit", submitRecordImport);
   document.querySelector("#assist-crf-form")?.addEventListener("submit", submitAssistCrf);
   document.querySelector("#add-field")?.addEventListener("click", () => {
     document.querySelector("#fields").insertAdjacentHTML("beforeend", fieldEditorRow());
@@ -951,6 +964,7 @@ function bindRoute() {
   document.querySelectorAll("[data-respond-query]").forEach((button) => button.addEventListener("click", () => respondQuery(button.dataset.respondQuery)));
   document.querySelectorAll("[data-lock-entry]").forEach((button) => button.addEventListener("click", () => lockEntry(button.dataset.lockEntry)));
   document.querySelectorAll("[data-unlock-entry]").forEach((button) => button.addEventListener("click", () => unlockEntry(button.dataset.unlockEntry)));
+  document.querySelectorAll("[data-entry-history]").forEach((button) => button.addEventListener("click", () => showEntryHistory(button.dataset.entryHistory)));
   document.querySelectorAll("[data-verify-field]").forEach((button) => button.addEventListener("click", () => setFieldState(button, "verify_field")));
   document.querySelectorAll("[data-freeze-field]").forEach((button) => button.addEventListener("click", () => setFieldState(button, "freeze_field")));
   document.querySelectorAll("[data-edit-form]").forEach((button) => button.addEventListener("click", () => {
@@ -1211,6 +1225,25 @@ async function submitDictionary(event) {
   }
 }
 
+async function submitRecordImport(event) {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(event.target));
+  try {
+    const result = await api(`/api/studies/${state.studyId}/records/import`, {
+      method: "POST",
+      body: JSON.stringify({ csv: data.csv }),
+    });
+    const imported = result.imported || {};
+    const errorText = imported.errors?.length ? ` ${imported.errors.length} row(s) need review.` : "";
+    state.error = `Imported ${imported.entries_created || 0} new and ${imported.entries_updated || 0} updated CRF entrie(s).${errorText}`;
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
 async function submitAssistCrf(event) {
   event.preventDefault();
   const data = Object.fromEntries(new FormData(event.target));
@@ -1220,6 +1253,18 @@ async function submitAssistCrf(event) {
       body: JSON.stringify({ text: data.text }),
     });
     alert(JSON.stringify(result.schema, null, 2));
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function showEntryHistory(entryId) {
+  try {
+    const result = await api(`/api/studies/${state.studyId}/entries/${entryId}/history`);
+    const history = (result.history || []).map((item) => `${fmtTime(item.created_at)} ${item.display_name || "System"} ${item.action}`).join("\\n");
+    const states = (result.field_states || []).map((item) => `${fmtTime(item.created_at)} ${item.field_code}: ${item.state} ${item.reason || ""}`).join("\\n");
+    alert([history || "No entry history found.", states ? `\\nField states:\\n${states}` : ""].join("\\n"));
   } catch (error) {
     state.error = error.message;
     render();
@@ -1393,6 +1438,38 @@ function renderLogin() {
     } catch (error) {
       state.error = error.message;
       renderLogin();
+    }
+  });
+}
+
+function renderSetup() {
+  app.innerHTML = `
+    <section class="login">
+      <form id="setup-form" class="login-card stack">
+        <div>
+          <h1>First Run Setup</h1>
+          <p>Create the permanent administrator account before entering research data.</p>
+        </div>
+        ${state.error ? `<div class="notice error">${escapeHtml(state.error)}</div>` : ""}
+        <label>Admin username<input name="username" value="admin" autocomplete="username" required /></label>
+        <label>Display name<input name="display_name" value="Administrator" required /></label>
+        <label>New password<input name="password" type="password" minlength="12" autocomplete="new-password" required /></label>
+        <label>Confirm password<input name="confirm_password" type="password" minlength="12" autocomplete="new-password" required /></label>
+        <button>Secure App</button>
+      </form>
+    </section>
+  `;
+  document.querySelector("#setup-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = Object.fromEntries(new FormData(event.target));
+    try {
+      await api("/api/setup", { method: "POST", body: JSON.stringify(data) });
+      state.setupRequired = false;
+      state.error = "Setup complete. Log in with the new administrator password.";
+      renderLogin();
+    } catch (error) {
+      state.error = error.message;
+      renderSetup();
     }
   });
 }

@@ -161,6 +161,11 @@ def write_sqlite_backup(conn: sqlite3.Connection, target: Path) -> None:
         destination.close()
 
 
+def setup_required(conn: sqlite3.Connection) -> bool:
+    default_admin = row(conn, "SELECT password_hash FROM users WHERE username = 'admin' AND active = 1")
+    return bool(default_admin and verify_password("admin123", default_admin["password_hash"]))
+
+
 def rows(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> list[dict]:
     return [dict(row) for row in conn.execute(sql, params).fetchall()]
 
@@ -258,6 +263,8 @@ def migrate() -> None:
                 role TEXT NOT NULL DEFAULT 'admin',
                 active INTEGER NOT NULL DEFAULT 1,
                 must_change_password INTEGER NOT NULL DEFAULT 0,
+                failed_login_count INTEGER NOT NULL DEFAULT 0,
+                locked_until INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL
             );
 
@@ -446,6 +453,8 @@ def migrate() -> None:
         add_column(conn, "entries", "event_id", "INTEGER REFERENCES study_events(id) ON DELETE SET NULL")
         add_column(conn, "participants", "data_group_id", "INTEGER REFERENCES data_groups(id) ON DELETE SET NULL")
         add_column(conn, "users", "must_change_password", "INTEGER NOT NULL DEFAULT 0")
+        add_column(conn, "users", "failed_login_count", "INTEGER NOT NULL DEFAULT 0")
+        add_column(conn, "users", "locked_until", "INTEGER NOT NULL DEFAULT 0")
         migrate_entries_unique_key(conn)
         if not row(conn, "SELECT id FROM users WHERE username = ?", ("admin",)):
             user = {
@@ -801,6 +810,10 @@ class App(BaseHTTPRequestHandler):
                     return self.login(conn)
                 if path == "/api/logout" and method == "POST":
                     return self.logout(conn)
+                if path == "/api/setup" and method == "GET":
+                    return self.send_json({"required": setup_required(conn)})
+                if path == "/api/setup" and method == "POST":
+                    return self.first_run_setup(conn)
                 if path == "/api/health" and method == "GET":
                     return self.send_json({"ok": True, "app": "Clinical Data Studio", "database": DB_PATH.exists()})
 
@@ -854,14 +867,53 @@ class App(BaseHTTPRequestHandler):
         username = str(payload.get("username", "")).strip()
         password = str(payload.get("password", ""))
         user = row(conn, "SELECT * FROM users WHERE username = ? AND active = 1", (username,))
+        if user and user.get("locked_until", 0) and user["locked_until"] > now():
+            self.send_error_json("Account is temporarily locked after repeated failed logins", 423)
+            return
         if not user or not verify_password(password, user["password_hash"]):
+            if user:
+                failed = int(user.get("failed_login_count") or 0) + 1
+                locked_until = now() + 15 * 60 if failed >= 5 else 0
+                conn.execute("UPDATE users SET failed_login_count = ?, locked_until = ? WHERE id = ?", (failed, locked_until, user["id"]))
+                audit(conn, user["id"], "failed_login", "user", user["id"], None, {"failed_login_count": failed, "locked": bool(locked_until)})
+                conn.commit()
             self.send_error_json("Invalid username or password", 401)
             return
         token = secrets.token_urlsafe(32)
+        conn.execute("UPDATE users SET failed_login_count = 0, locked_until = 0 WHERE id = ?", (user["id"],))
         conn.execute("INSERT INTO sessions(token, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)", (token, user["id"], now() + 60 * 60 * 24 * 14, now()))
         audit(conn, user["id"], "login", "session", None, None, {"username": username})
         conn.commit()
         self.send_json({"token": token, "user": {"id": user["id"], "username": user["username"], "display_name": user["display_name"], "role": user["role"], "must_change_password": user.get("must_change_password", 0)}})
+
+    def first_run_setup(self, conn: sqlite3.Connection) -> None:
+        if not setup_required(conn):
+            self.send_error_json("First-run setup is already complete", 409)
+            return
+        payload = self.body()
+        username = normalize_code(str(payload.get("username", "admin")).strip()).replace("_", ".") or "admin"
+        display_name = str(payload.get("display_name", "Administrator")).strip() or "Administrator"
+        password = str(payload.get("password", ""))
+        confirm = str(payload.get("confirm_password", ""))
+        if len(password) < 12:
+            self.send_error_json("Admin password must be at least 12 characters", 400)
+            return
+        if password != confirm:
+            self.send_error_json("Password confirmation does not match", 400)
+            return
+        before = row(conn, "SELECT id, username, display_name, role, active, must_change_password FROM users WHERE username = 'admin'")
+        conn.execute(
+            """
+            UPDATE users
+            SET username = ?, display_name = ?, password_hash = ?, must_change_password = 0,
+                failed_login_count = 0, locked_until = 0
+            WHERE username = 'admin'
+            """,
+            (username, display_name, encode_password(password)),
+        )
+        after = row(conn, "SELECT id, username, display_name, role, active, must_change_password FROM users WHERE username = ?", (username,))
+        audit(conn, after["id"] if after else None, "first_run_setup", "user", after["id"] if after else None, before, after)
+        self.send_json({"ok": True})
 
     def logout(self, conn: sqlite3.Connection) -> None:
         header = self.headers.get("authorization", "")
@@ -1007,6 +1059,14 @@ class App(BaseHTTPRequestHandler):
                 self.send_error_json("Form management permission required", 403)
                 return
             return self.dictionary(conn, user, method, study_id)
+        if resource == "records" and len(parts) == 5 and parts[4] == "import":
+            if method != "POST":
+                self.send_error_json("Unsupported records operation", 405)
+                return
+            if not membership_has(membership, "enter_data"):
+                self.send_error_json("Data entry permission required", 403)
+                return
+            return self.import_records(conn, user, study_id, membership)
         if resource == "events":
             if method != "GET" and not membership_has(membership, "manage_study"):
                 self.send_error_json("Study management permission required", 403)
@@ -1287,6 +1347,90 @@ class App(BaseHTTPRequestHandler):
         audit(conn, user["id"], "import", "dictionary", study_id, None, {"forms": imported})
         self.send_json({"imported": imported})
 
+    def import_records(self, conn, user, study_id: int, membership) -> None:
+        payload = self.body()
+        csv_text = str(payload.get("csv", "")).strip()
+        if not csv_text:
+            self.send_error_json("Record CSV content is required", 400)
+            return
+        reader = csv.DictReader(StringIO(csv_text))
+        if not reader.fieldnames or "study_uid" not in reader.fieldnames:
+            self.send_error_json("Record CSV must include study_uid", 400)
+            return
+        forms = rows(conn, "SELECT * FROM forms WHERE study_id = ?", (study_id,))
+        forms_by_code = {item["code"]: item for item in forms}
+        forms_by_name = {item["name"]: item for item in forms}
+        events_by_code = {item["code"]: item for item in rows(conn, "SELECT * FROM study_events WHERE study_id = ?", (study_id,))}
+        imported = {"participants_created": 0, "entries_created": 0, "entries_updated": 0, "errors": []}
+        timestamp = now()
+        for row_index, raw in enumerate(reader, start=2):
+            study_uid = str(raw.get("study_uid", "")).strip()
+            if not study_uid:
+                imported["errors"].append({"row": row_index, "message": "study_uid is required"})
+                continue
+            participant = row(conn, "SELECT * FROM participants WHERE study_id = ? AND study_uid = ?", (study_id, study_uid))
+            if not participant:
+                data_group_id = membership.get("data_group_id")
+                cur = conn.execute(
+                    "INSERT INTO participants(study_id, data_group_id, study_uid, initials, status, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, '{}', ?, ?)",
+                    (study_id, data_group_id, study_uid, str(raw.get("initials", "")).strip().upper(), str(raw.get("participant_status", "enrolled") or "enrolled"), timestamp, timestamp),
+                )
+                participant = row(conn, "SELECT * FROM participants WHERE id = ?", (cur.lastrowid,))
+                audit(conn, user["id"], "create", "participant", cur.lastrowid, None, participant)
+                imported["participants_created"] += 1
+            if membership.get("data_group_id") and participant.get("data_group_id") != membership["data_group_id"]:
+                imported["errors"].append({"row": row_index, "message": "Participant is outside your data access group"})
+                continue
+            form = forms_by_code.get(str(raw.get("form_code", "")).strip()) or forms_by_code.get(str(raw.get("instrument_name", "")).strip()) or forms_by_name.get(str(raw.get("form_name", "")).strip())
+            if not form:
+                for key, value in raw.items():
+                    if "__" in key and value not in (None, ""):
+                        form = forms_by_code.get(key.split("__", 1)[0])
+                        if form:
+                            break
+            if not form:
+                imported["errors"].append({"row": row_index, "message": "Could not identify CRF/form"})
+                continue
+            schema = load_json(form["schema_json"], {"fields": []})
+            data = {}
+            for field in schema.get("fields", []):
+                field_code = field.get("code", "")
+                scoped = f"{form['code']}__{field_code}"
+                if scoped in raw:
+                    data[field_code] = raw.get(scoped, "")
+                elif field_code in raw:
+                    data[field_code] = raw.get(field_code, "")
+            cleaned, issues = validate_entry_data(schema, data)
+            if issues:
+                imported["errors"].append({"row": row_index, "message": "Validation failed", "issues": issues})
+                continue
+            event_code = normalize_code(str(raw.get("event_code") or raw.get("event_name") or "baseline"))
+            event = events_by_code.get(event_code) or events_by_code.get("baseline")
+            event_id = event["id"] if event else None
+            event_name = event["code"] if event else "Baseline"
+            repeat_instance = max(int(raw.get("repeat_instance") or 1), 1)
+            status = str(raw.get("entry_status") or raw.get("status") or "draft")
+            existing = row(conn, "SELECT * FROM entries WHERE participant_id = ? AND form_id = ? AND event_name = ? AND repeat_instance = ?", (participant["id"], form["id"], event_name, repeat_instance))
+            if existing:
+                if existing.get("locked_at"):
+                    imported["errors"].append({"row": row_index, "message": "Existing CRF is locked"})
+                    continue
+                conn.execute("UPDATE entries SET event_id = ?, data_json = ?, status = ?, updated_by = ?, updated_at = ? WHERE id = ?", (event_id, json.dumps(cleaned), status, user["id"], timestamp, existing["id"]))
+                after = row(conn, "SELECT * FROM entries WHERE id = ?", (existing["id"],))
+                audit(conn, user["id"], "import_update", "entry", existing["id"], existing, after)
+                imported["entries_updated"] += 1
+            else:
+                cur = conn.execute(
+                    "INSERT INTO entries(study_id, participant_id, form_id, event_id, event_name, repeat_instance, status, data_json, created_by, updated_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (study_id, participant["id"], form["id"], event_id, event_name, repeat_instance, status, json.dumps(cleaned), user["id"], user["id"], timestamp, timestamp),
+                )
+                after = row(conn, "SELECT * FROM entries WHERE id = ?", (cur.lastrowid,))
+                audit(conn, user["id"], "import_create", "entry", cur.lastrowid, None, after)
+                imported["entries_created"] += 1
+        audit(conn, user["id"], "import", "records", study_id, None, imported)
+        status = 207 if imported["errors"] else 201
+        self.send_json({"imported": imported}, status)
+
     def participants(self, conn, user, method, study_id, parts, membership) -> None:
         if method == "GET":
             if membership.get("data_group_id"):
@@ -1333,6 +1477,33 @@ class App(BaseHTTPRequestHandler):
         self.send_error_json("Unsupported participant operation", 405)
 
     def entries(self, conn, user, method, study_id, parts, query, membership) -> None:
+        if method == "GET" and len(parts) == 6 and parts[5] == "history":
+            entry_id = int(parts[4])
+            entry = row(conn, "SELECT * FROM entries WHERE id = ? AND study_id = ?", (entry_id, study_id))
+            if not entry:
+                self.send_error_json("Entry not found", 404)
+                return
+            participant = row(conn, "SELECT * FROM participants WHERE id = ?", (entry["participant_id"],))
+            if membership.get("data_group_id") and participant and participant.get("data_group_id") != membership["data_group_id"]:
+                self.send_error_json("Entry is outside your data access group", 403)
+                return
+            history = rows(
+                conn,
+                """
+                SELECT audit_log.*, users.display_name
+                FROM audit_log
+                LEFT JOIN users ON users.id = audit_log.user_id
+                WHERE audit_log.entity_type = 'entry' AND audit_log.entity_id = ?
+                ORDER BY audit_log.created_at DESC, audit_log.id DESC
+                """,
+                (entry_id,),
+            )
+            for item in history:
+                item["before"] = load_json(item.pop("before_json"), None)
+                item["after"] = load_json(item.pop("after_json"), None)
+            states = rows(conn, "SELECT field_states.*, users.display_name FROM field_states LEFT JOIN users ON users.id = field_states.user_id WHERE entry_id = ? ORDER BY created_at DESC", (entry_id,))
+            self.send_json({"history": history, "field_states": states})
+            return
         if method == "GET":
             participant_id = int((query.get("participant_id") or ["0"])[0])
             params: tuple = (study_id,)

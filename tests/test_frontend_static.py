@@ -20,6 +20,9 @@ class FrontendStaticTests(unittest.TestCase):
         self.assertIn("/assist/summary", app_js)
         self.assertIn("encrypted-backup-form", app_js)
         self.assertIn("Create Encrypted Archive", app_js)
+        self.assertIn("First Run Setup", app_js)
+        self.assertIn("/records/import", app_js)
+        self.assertIn("/history", app_js)
 
 
 if __name__ == "__main__":

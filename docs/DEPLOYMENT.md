@@ -10,6 +10,8 @@ Run on the research laptop or desktop:
 
 Open `http://127.0.0.1:8765` on the host computer. Phones and tablets must be on the same Wi-Fi and can use one of the LAN URLs printed by the script.
 
+On first launch, complete the administrator setup screen and store the password in your study operations records.
+
 ## Firewall
 
 If another device cannot open the app, allow Python through Windows Defender Firewall for private networks, or open TCP port `8765` only on the trusted local network.

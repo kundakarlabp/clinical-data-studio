@@ -86,6 +86,51 @@ class ApiSmokeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             server.decrypted_archive_bytes(archive, "WrongLocalPassphrase123")
 
+    def test_first_run_setup_and_login_lockout(self):
+        self.assertTrue(self.request_json("/api/setup")["required"])
+        result = self.request_json(
+            "/api/setup",
+            "POST",
+            {
+                "username": "research.admin",
+                "display_name": "Research Admin",
+                "password": "VeryStrongAdmin123",
+                "confirm_password": "VeryStrongAdmin123",
+            },
+        )
+        self.assertTrue(result["ok"])
+        self.assertFalse(self.request_json("/api/setup")["required"])
+        with self.assertRaises(HTTPError) as old_default:
+            self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})
+        old_default.exception.close()
+        login = self.request_json("/api/login", "POST", {"username": "research.admin", "password": "VeryStrongAdmin123"})
+        self.assertEqual(login["user"]["username"], "research.admin")
+
+        for _ in range(5):
+            with self.assertRaises(HTTPError) as failed_login:
+                self.request_json("/api/login", "POST", {"username": "research.admin", "password": "wrong"})
+            failed_login.exception.close()
+        with self.assertRaises(HTTPError) as context:
+            self.request_json("/api/login", "POST", {"username": "research.admin", "password": "VeryStrongAdmin123"})
+        self.assertEqual(context.exception.code, 423)
+        context.exception.close()
+
+    def test_record_import_and_entry_history(self):
+        token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]
+        study_id = self.request_json("/api/studies", token=token)["studies"][0]["id"]
+        csv_text = "\n".join(
+            [
+                "study_uid,initials,participant_status,event_code,form_code,entry_status,repeat_instance,demographics__age,demographics__sex,demographics__consent_date,demographics__diagnosis",
+                "P900,ZZ,enrolled,baseline,demographics,complete,1,45,Female,2026-05-01,Registry",
+            ]
+        )
+        result = self.request_json(f"/api/studies/{study_id}/records/import", "POST", {"csv": csv_text}, token)["imported"]
+        self.assertEqual(result["entries_created"], 1)
+        entries = self.request_json(f"/api/studies/{study_id}/entries", token=token)["entries"]
+        entry = next(item for item in entries if item["study_uid"] == "P900")
+        history = self.request_json(f"/api/studies/{study_id}/entries/{entry['id']}/history", token=token)
+        self.assertTrue(history["history"])
+
 
 if __name__ == "__main__":
     unittest.main()

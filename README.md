@@ -22,13 +22,7 @@ Open the shown URL on this computer. To use from a phone, connect the phone to t
 http://<this-computer-ip>:8765
 ```
 
-Default login:
-
-```text
-admin / admin123
-```
-
-Change this before real research use.
+On first run, the app opens a setup screen for creating the permanent administrator password. Complete this before entering real research data.
 
 ## Scope
 
@@ -55,8 +49,12 @@ Implemented foundation:
 - Local backup, download, and restore
 - Optional passphrase-protected encrypted archive export
 - Health endpoint and local LAN start helper
+- First-run administrator password setup
+- Login lockout after repeated failed attempts
 - Local CRF draft assistant from pasted text
 - Local analysis/review assistant summary
+- Record CSV import into participant CRFs
+- Entry history and field-state review visibility
 - API and mobile shell regression tests
 
 Next planned build steps:
@@ -64,3 +62,4 @@ Next planned build steps:
 - Desktop shortcut/installer packaging
 - Optional audited database-at-rest encryption layer
 - Broader browser automation across common Android/iOS viewport sizes
+- Survey/public form mode and e-consent flow

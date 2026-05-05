@@ -2,7 +2,11 @@ const state = {
   token: localStorage.getItem("cds_token") || "",
   user: null,
   studies: [],
+  memberships: [],
   studyId: Number(localStorage.getItem("cds_study_id") || 0),
+  users: [],
+  groups: [],
+  studyMembers: [],
   forms: [],
   participants: [],
   entries: [],
@@ -53,6 +57,7 @@ async function loadAll() {
   try {
     const me = await api("/api/me");
     state.user = me.user;
+    state.memberships = me.memberships || [];
     const studies = await api("/api/studies");
     state.studies = studies.studies;
     if (!state.studyId && state.studies[0]) state.studyId = state.studies[0].id;
@@ -68,14 +73,19 @@ async function loadAll() {
 
 async function loadStudy() {
   if (!state.studyId) return;
-  const [forms, participants, entries, queries, quality, analysis, audit] = await Promise.all([
+  const manageUsers = can("manage_users");
+  const viewAnalysis = can("view_analysis") || can("review_data");
+  const [forms, participants, entries, queries, quality, analysis, audit, groups, studyMembers, users] = await Promise.all([
     api(`/api/studies/${state.studyId}/forms`),
     api(`/api/studies/${state.studyId}/participants`),
     api(`/api/studies/${state.studyId}/entries`),
     api(`/api/studies/${state.studyId}/queries`),
     api(`/api/studies/${state.studyId}/quality`),
-    api(`/api/studies/${state.studyId}/analysis`),
-    api("/api/audit"),
+    viewAnalysis ? api(`/api/studies/${state.studyId}/analysis`) : Promise.resolve({ participant_count: 0, entry_count: 0, completed_entry_count: 0, open_query_count: 0, field_summaries: [] }),
+    can("review_data") ? api(`/api/studies/${state.studyId}/audit`) : Promise.resolve({ audit: [] }),
+    api(`/api/studies/${state.studyId}/groups`),
+    manageUsers ? api(`/api/studies/${state.studyId}/memberships`) : Promise.resolve({ memberships: [] }),
+    state.user?.role === "admin" ? api("/api/users") : Promise.resolve({ users: [] }),
   ]);
   state.forms = forms.forms;
   state.participants = participants.participants;
@@ -84,6 +94,27 @@ async function loadStudy() {
   state.quality = quality.issues;
   state.analysis = analysis;
   state.audit = audit.audit;
+  state.groups = groups.groups;
+  state.studyMembers = studyMembers.memberships;
+  state.users = users.users;
+}
+
+function currentMembership() {
+  if (state.user?.role === "admin") return { role: "owner", data_group_id: null };
+  return state.memberships.find((item) => item.study_id === state.studyId) || null;
+}
+
+function can(permission) {
+  const role = currentMembership()?.role || "";
+  const permissions = {
+    admin: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis"],
+    owner: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis"],
+    data_entry: ["enter_data"],
+    reviewer: ["review_data", "view_analysis"],
+    analyst: ["export_data", "view_analysis"],
+    read_only: ["view_analysis"],
+  };
+  return (permissions[role] || []).includes(permission);
 }
 
 function render() {
@@ -111,6 +142,7 @@ function render() {
           ${navButton("quality", "Data Quality")}
           ${navButton("analysis", "Analysis")}
           ${navButton("audit", "Audit Trail")}
+          ${can("manage_users") ? navButton("access", "Access") : ""}
           ${navButton("settings", "Study Setup")}
         </nav>
       </aside>
@@ -153,6 +185,7 @@ function route() {
   if (state.view === "quality") return qualityView();
   if (state.view === "analysis") return analysisView();
   if (state.view === "audit") return auditView();
+  if (state.view === "access") return accessView();
   if (state.view === "settings") return settingsView();
   return dashboardView();
 }
@@ -195,6 +228,7 @@ function participantsView() {
       <form id="participant-form" class="form-grid">
         <label>Study ID<input name="study_uid" required placeholder="P001" /></label>
         <label>Initials<input name="initials" maxlength="6" placeholder="AB" /></label>
+        ${state.groups.length ? `<label>Data access group<select name="data_group_id"><option value="">Unassigned</option>${state.groups.map((group) => `<option value="${group.id}">${escapeHtml(group.name)}</option>`).join("")}</select></label>` : ""}
         <label>Status
           <select name="status">
             <option>screening</option>
@@ -480,6 +514,81 @@ function auditView() {
   `;
 }
 
+function accessView() {
+  const roleOptions = ["owner", "data_entry", "reviewer", "analyst", "read_only"];
+  return `
+    <section class="grid two">
+      <section class="panel">
+        <h2>Create User</h2>
+        ${state.user?.role === "admin" ? `
+          <form id="user-form" class="stack">
+            <label>Username<input name="username" required placeholder="coordinator1" /></label>
+            <label>Display name<input name="display_name" required placeholder="Coordinator One" /></label>
+            <label>Temporary password<input name="password" type="password" minlength="8" required /></label>
+            <label>Global role
+              <select name="role">
+                ${roleOptions.map((role) => `<option value="${role}">${role}</option>`).join("")}
+              </select>
+            </label>
+            <button>Create User</button>
+          </form>
+        ` : "<p>Only the global admin can create new users.</p>"}
+      </section>
+      <section class="panel">
+        <h2>Data Access Groups</h2>
+        <form id="group-form" class="stack">
+          <label>Group name<input name="name" required placeholder="Site A" /></label>
+          <label>Code<input name="code" placeholder="site_a" /></label>
+          <button>Create Group</button>
+        </form>
+      </section>
+    </section>
+    <section class="panel">
+      <h2>Project Access</h2>
+      <form id="membership-form" class="form-grid">
+        <label>User
+          <select name="user_id" required>
+            ${state.users.map((user) => `<option value="${user.id}">${escapeHtml(user.username)} - ${escapeHtml(user.display_name)}</option>`).join("")}
+          </select>
+        </label>
+        <label>Project role
+          <select name="role">
+            ${roleOptions.map((role) => `<option value="${role}">${role}</option>`).join("")}
+          </select>
+        </label>
+        <label>Data access group
+          <select name="data_group_id">
+            <option value="">All groups</option>
+            ${state.groups.map((group) => `<option value="${group.id}">${escapeHtml(group.name)}</option>`).join("")}
+          </select>
+        </label>
+        <label>Active
+          <select name="active">
+            <option value="true">Yes</option>
+            <option value="false">No</option>
+          </select>
+        </label>
+        <div class="full"><button>Save Access</button></div>
+      </form>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>User</th><th>Role</th><th>Group</th><th>Active</th></tr></thead>
+          <tbody>
+            ${state.studyMembers.map((item) => `
+              <tr>
+                <td>${escapeHtml(item.username)}<br><span class="small">${escapeHtml(item.display_name)}</span></td>
+                <td><span class="pill">${escapeHtml(item.role)}</span></td>
+                <td>${escapeHtml(item.data_group_name || "All groups")}</td>
+                <td>${item.active ? "Yes" : "No"}</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
 function settingsView() {
   return `
     <section class="panel">
@@ -494,6 +603,14 @@ function settingsView() {
     <section class="panel">
       <h2>Important Use Notes</h2>
       <p>This app is local-first and suitable for small research workflows. For regulated trials, validate the system, document SOPs, review audit trails, and maintain controlled backups.</p>
+    </section>
+    <section class="panel">
+      <h2>Change Password</h2>
+      <form id="password-form" class="form-grid">
+        <label>Current password<input name="current_password" type="password" required /></label>
+        <label>New password<input name="new_password" type="password" minlength="8" required /></label>
+        <div class="full"><button>Update Password</button></div>
+      </form>
     </section>
   `;
 }
@@ -528,6 +645,10 @@ function bindShell() {
 function bindRoute() {
   document.querySelector("#participant-form")?.addEventListener("submit", submitParticipant);
   document.querySelector("#study-form")?.addEventListener("submit", submitStudy);
+  document.querySelector("#password-form")?.addEventListener("submit", submitPassword);
+  document.querySelector("#user-form")?.addEventListener("submit", submitUser);
+  document.querySelector("#group-form")?.addEventListener("submit", submitGroup);
+  document.querySelector("#membership-form")?.addEventListener("submit", submitMembership);
   document.querySelector("#form-builder")?.addEventListener("submit", submitFormDefinition);
   document.querySelector("#add-field")?.addEventListener("click", () => {
     document.querySelector("#fields").insertAdjacentHTML("beforeend", fieldEditorRow());
@@ -586,6 +707,68 @@ async function submitStudy(event) {
     const result = await api("/api/studies", { method: "POST", body: JSON.stringify(data) });
     state.studyId = result.study.id;
     await loadAll();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function submitPassword(event) {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(event.target));
+  try {
+    await api("/api/password", { method: "POST", body: JSON.stringify(data) });
+    state.error = "Password updated.";
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function submitUser(event) {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(event.target));
+  try {
+    await api("/api/users", { method: "POST", body: JSON.stringify(data) });
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function submitGroup(event) {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(event.target));
+  try {
+    await api(`/api/studies/${state.studyId}/groups`, { method: "POST", body: JSON.stringify(data) });
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function submitMembership(event) {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(event.target));
+  try {
+    await api(`/api/studies/${state.studyId}/memberships`, {
+      method: "POST",
+      body: JSON.stringify({
+        user_id: Number(data.user_id),
+        role: data.role,
+        data_group_id: data.data_group_id ? Number(data.data_group_id) : null,
+        active: data.active === "true",
+      }),
+    });
+    const me = await api("/api/me");
+    state.memberships = me.memberships || [];
+    await loadStudy();
+    render();
   } catch (error) {
     state.error = error.message;
     render();

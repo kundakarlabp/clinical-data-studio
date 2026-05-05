@@ -24,6 +24,31 @@ HOST = "0.0.0.0"
 PORT = int(os.environ.get("CDS_PORT", "8765"))
 PBKDF2_ROUNDS = 260_000
 
+ROLE_PERMISSIONS = {
+    "admin": {
+        "manage_users",
+        "manage_study",
+        "manage_forms",
+        "enter_data",
+        "review_data",
+        "export_data",
+        "view_analysis",
+    },
+    "owner": {
+        "manage_users",
+        "manage_study",
+        "manage_forms",
+        "enter_data",
+        "review_data",
+        "export_data",
+        "view_analysis",
+    },
+    "data_entry": {"enter_data"},
+    "reviewer": {"review_data", "view_analysis"},
+    "analyst": {"export_data", "view_analysis"},
+    "read_only": {"view_analysis"},
+}
+
 
 def now() -> int:
     return int(time.time())
@@ -155,6 +180,28 @@ def migrate() -> None:
                 created_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS data_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                code TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(study_id, code)
+            );
+
+            CREATE TABLE IF NOT EXISTS study_memberships (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                role TEXT NOT NULL DEFAULT 'data_entry',
+                data_group_id INTEGER REFERENCES data_groups(id) ON DELETE SET NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(study_id, user_id)
+            );
+
             CREATE TABLE IF NOT EXISTS sessions (
                 token TEXT PRIMARY KEY,
                 user_id INTEGER NOT NULL REFERENCES users(id),
@@ -188,6 +235,7 @@ def migrate() -> None:
             CREATE TABLE IF NOT EXISTS participants (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+                data_group_id INTEGER REFERENCES data_groups(id) ON DELETE SET NULL,
                 study_uid TEXT NOT NULL,
                 initials TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'screening',
@@ -246,6 +294,7 @@ def migrate() -> None:
         add_column(conn, "entries", "locked_at", "INTEGER")
         add_column(conn, "entries", "locked_by", "INTEGER REFERENCES users(id)")
         add_column(conn, "entries", "lock_reason", "TEXT NOT NULL DEFAULT ''")
+        add_column(conn, "participants", "data_group_id", "INTEGER REFERENCES data_groups(id) ON DELETE SET NULL")
         migrate_entries_unique_key(conn)
         if not row(conn, "SELECT id FROM users WHERE username = ?", ("admin",)):
             user = {
@@ -261,6 +310,7 @@ def migrate() -> None:
             audit(conn, None, "seed", "user", 1, None, user)
         if not row(conn, "SELECT id FROM studies LIMIT 1"):
             seed_study(conn)
+        seed_admin_memberships(conn)
 
 
 def seed_study(conn: sqlite3.Connection) -> None:
@@ -300,6 +350,22 @@ def seed_study(conn: sqlite3.Connection) -> None:
             (study_id, name, code, json.dumps({"fields": fields}), timestamp, timestamp),
         )
     audit(conn, None, "seed", "study", study_id, None, {"study_id": study_id})
+
+
+def seed_admin_memberships(conn: sqlite3.Connection) -> None:
+    admin_users = rows(conn, "SELECT id FROM users WHERE role = 'admin' AND active = 1")
+    studies = rows(conn, "SELECT id FROM studies")
+    timestamp = now()
+    for study in studies:
+        for user in admin_users:
+            if not row(conn, "SELECT id FROM study_memberships WHERE study_id = ? AND user_id = ?", (study["id"], user["id"])):
+                conn.execute(
+                    """
+                    INSERT INTO study_memberships(study_id, user_id, role, active, created_at, updated_at)
+                    VALUES (?, ?, 'owner', 1, ?, ?)
+                    """,
+                    (study["id"], user["id"], timestamp, timestamp),
+                )
 
 
 def normalize_code(value: str, fallback: str = "") -> str:
@@ -394,6 +460,41 @@ def validate_entry_data(schema: dict, data: dict) -> tuple[dict, list[dict]]:
     return cleaned, issues
 
 
+def user_membership(conn: sqlite3.Connection, user: dict, study_id: int) -> dict | None:
+    if user.get("role") == "admin":
+        membership = row(
+            conn,
+            """
+            SELECT study_memberships.*, data_groups.name AS data_group_name, data_groups.code AS data_group_code
+            FROM study_memberships
+            LEFT JOIN data_groups ON data_groups.id = study_memberships.data_group_id
+            WHERE study_memberships.study_id = ? AND study_memberships.user_id = ? AND study_memberships.active = 1
+            """,
+            (study_id, user["id"]),
+        )
+        if membership:
+            return membership
+        return {"study_id": study_id, "user_id": user["id"], "role": "owner", "data_group_id": None, "data_group_name": None, "data_group_code": None, "active": 1}
+    return row(
+        conn,
+        """
+        SELECT study_memberships.*, data_groups.name AS data_group_name, data_groups.code AS data_group_code
+        FROM study_memberships
+        LEFT JOIN data_groups ON data_groups.id = study_memberships.data_group_id
+        WHERE study_memberships.study_id = ? AND study_memberships.user_id = ? AND study_memberships.active = 1
+        """,
+        (study_id, user["id"]),
+    )
+
+
+def role_has(role: str, permission: str) -> bool:
+    return permission in ROLE_PERMISSIONS.get(role, set())
+
+
+def membership_has(membership: dict | None, permission: str) -> bool:
+    return bool(membership and role_has(membership["role"], permission))
+
+
 class App(BaseHTTPRequestHandler):
     server_version = "ClinicalDataStudio/0.1"
 
@@ -460,7 +561,7 @@ class App(BaseHTTPRequestHandler):
         user = row(
             conn,
             """
-            SELECT users.id, users.username, users.display_name, users.role
+            SELECT users.id, users.username, users.display_name, users.role, users.active
             FROM sessions JOIN users ON users.id = sessions.user_id
             WHERE sessions.token = ? AND sessions.expires_at > ? AND users.active = 1
             """,
@@ -488,14 +589,33 @@ class App(BaseHTTPRequestHandler):
                     return
 
                 if path == "/api/me":
-                    return self.send_json({"user": user})
+                    memberships = rows(
+                        conn,
+                        """
+                        SELECT study_memberships.*, studies.name AS study_name, data_groups.name AS data_group_name
+                        FROM study_memberships
+                        JOIN studies ON studies.id = study_memberships.study_id
+                        LEFT JOIN data_groups ON data_groups.id = study_memberships.data_group_id
+                        WHERE study_memberships.user_id = ? AND study_memberships.active = 1
+                        ORDER BY studies.name
+                        """,
+                        (user["id"],),
+                    )
+                    return self.send_json({"user": user, "memberships": memberships})
+                if path == "/api/password" and method == "POST":
+                    return self.change_password(conn, user)
                 if path == "/api/studies" and method == "GET":
-                    return self.send_json({"studies": rows(conn, "SELECT * FROM studies ORDER BY updated_at DESC")})
+                    return self.send_json({"studies": self.visible_studies(conn, user)})
                 if path == "/api/studies" and method == "POST":
                     return self.create_study(conn, user)
+                if path == "/api/users":
+                    return self.users(conn, user, method)
                 if path.startswith("/api/studies/"):
                     return self.study_routes(conn, user, method, path, query)
                 if path == "/api/audit" and method == "GET":
+                    if user.get("role") != "admin":
+                        self.send_error_json("Admin permission required", 403)
+                        return
                     return self.send_json({"audit": rows(conn, "SELECT audit_log.*, users.display_name FROM audit_log LEFT JOIN users ON users.id = audit_log.user_id ORDER BY audit_log.id DESC LIMIT 250")})
                 self.send_error_json("Unknown endpoint", 404)
         except sqlite3.IntegrityError as exc:
@@ -525,6 +645,67 @@ class App(BaseHTTPRequestHandler):
             conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
         self.send_json({"ok": True})
 
+    def visible_studies(self, conn: sqlite3.Connection, user: dict) -> list[dict]:
+        if user.get("role") == "admin":
+            return rows(conn, "SELECT * FROM studies ORDER BY updated_at DESC")
+        return rows(
+            conn,
+            """
+            SELECT studies.*
+            FROM studies
+            JOIN study_memberships ON study_memberships.study_id = studies.id
+            WHERE study_memberships.user_id = ? AND study_memberships.active = 1
+            ORDER BY studies.updated_at DESC
+            """,
+            (user["id"],),
+        )
+
+    def users(self, conn: sqlite3.Connection, user: dict, method: str) -> None:
+        if user.get("role") != "admin":
+            self.send_error_json("Admin permission required", 403)
+            return
+        if method == "GET":
+            users = rows(conn, "SELECT id, username, display_name, role, active, created_at FROM users ORDER BY username")
+            self.send_json({"users": users})
+            return
+        if method == "POST":
+            payload = self.body()
+            username = normalize_code(str(payload.get("username", ""))).replace("_", ".")
+            display_name = str(payload.get("display_name", "")).strip() or username
+            password = str(payload.get("password", "")).strip()
+            role_name = str(payload.get("role", "data_entry")).strip()
+            if not username or len(password) < 8:
+                self.send_error_json("Username and password with at least 8 characters are required", 400)
+                return
+            if role_name not in ROLE_PERMISSIONS:
+                self.send_error_json("Unsupported role", 400)
+                return
+            timestamp = now()
+            cur = conn.execute(
+                "INSERT INTO users(username, password_hash, display_name, role, active, created_at) VALUES (?, ?, ?, ?, 1, ?)",
+                (username, encode_password(password), display_name, role_name, timestamp),
+            )
+            after = row(conn, "SELECT id, username, display_name, role, active, created_at FROM users WHERE id = ?", (cur.lastrowid,))
+            audit(conn, user["id"], "create", "user", cur.lastrowid, None, after)
+            self.send_json({"user": after}, 201)
+            return
+        self.send_error_json("Unsupported user operation", 405)
+
+    def change_password(self, conn: sqlite3.Connection, user: dict) -> None:
+        payload = self.body()
+        current_password = str(payload.get("current_password", ""))
+        new_password = str(payload.get("new_password", ""))
+        stored = row(conn, "SELECT password_hash FROM users WHERE id = ?", (user["id"],))
+        if not stored or not verify_password(current_password, stored["password_hash"]):
+            self.send_error_json("Current password is incorrect", 403)
+            return
+        if len(new_password) < 8:
+            self.send_error_json("New password must be at least 8 characters", 400)
+            return
+        conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (encode_password(new_password), user["id"]))
+        audit(conn, user["id"], "change_password", "user", user["id"], None, {"user_id": user["id"]})
+        self.send_json({"ok": True})
+
     def create_study(self, conn: sqlite3.Connection, user: dict) -> None:
         payload = self.body()
         timestamp = now()
@@ -540,6 +721,13 @@ class App(BaseHTTPRequestHandler):
             ),
         )
         study = row(conn, "SELECT * FROM studies WHERE id = ?", (cur.lastrowid,))
+        conn.execute(
+            """
+            INSERT INTO study_memberships(study_id, user_id, role, active, created_at, updated_at)
+            VALUES (?, ?, 'owner', 1, ?, ?)
+            """,
+            (cur.lastrowid, user["id"], timestamp, timestamp),
+        )
         audit(conn, user["id"], "create", "study", cur.lastrowid, None, study)
         self.send_json({"study": study}, 201)
 
@@ -552,26 +740,69 @@ class App(BaseHTTPRequestHandler):
         if not row(conn, "SELECT id FROM studies WHERE id = ?", (study_id,)):
             self.send_error_json("Study not found", 404)
             return
+        membership = user_membership(conn, user, study_id)
+        if not membership:
+            self.send_error_json("Study access denied", 403)
+            return
         resource = parts[3] if len(parts) > 3 else ""
         if resource == "forms":
+            if method != "GET" and not membership_has(membership, "manage_forms"):
+                self.send_error_json("Form management permission required", 403)
+                return
             return self.forms(conn, user, method, study_id, parts)
         if resource == "participants":
-            return self.participants(conn, user, method, study_id, parts)
+            if method != "GET" and not membership_has(membership, "enter_data"):
+                self.send_error_json("Data entry permission required", 403)
+                return
+            return self.participants(conn, user, method, study_id, parts, membership)
         if resource == "entries":
-            return self.entries(conn, user, method, study_id, parts, query)
+            if method == "GET":
+                return self.entries(conn, user, method, study_id, parts, query, membership)
+            if method == "POST" and not membership_has(membership, "enter_data"):
+                self.send_error_json("Data entry permission required", 403)
+                return
+            if method == "PATCH" and not membership_has(membership, "review_data"):
+                self.send_error_json("Review permission required", 403)
+                return
+            return self.entries(conn, user, method, study_id, parts, query, membership)
         if resource == "queries":
-            return self.queries(conn, user, method, study_id, parts)
+            if method != "GET" and not membership_has(membership, "review_data"):
+                self.send_error_json("Review permission required", 403)
+                return
+            return self.queries(conn, user, method, study_id, parts, membership)
+        if resource == "groups":
+            if method != "GET" and not membership_has(membership, "manage_users"):
+                self.send_error_json("User management permission required", 403)
+                return
+            return self.data_groups(conn, user, method, study_id, parts)
+        if resource == "memberships":
+            if not membership_has(membership, "manage_users"):
+                self.send_error_json("User management permission required", 403)
+                return
+            return self.memberships(conn, user, method, study_id, parts)
         if resource == "metadata" and method == "GET":
             return self.metadata(conn, study_id)
         if resource == "quality" and method == "GET":
-            return self.quality(conn, study_id)
+            return self.quality(conn, study_id, membership)
         if resource == "analysis" and method == "GET":
-            return self.analysis(conn, study_id)
+            if not membership_has(membership, "view_analysis") and not membership_has(membership, "review_data"):
+                self.send_error_json("Analysis permission required", 403)
+                return
+            return self.analysis(conn, study_id, membership)
         if resource == "export" and method == "GET":
-            return self.export_csv(conn, study_id)
+            if not membership_has(membership, "export_data"):
+                self.send_error_json("Export permission required", 403)
+                return
+            return self.export_csv(conn, study_id, membership)
         if resource == "codebook" and method == "GET":
+            if not membership_has(membership, "export_data"):
+                self.send_error_json("Export permission required", 403)
+                return
             return self.export_codebook(conn, study_id)
         if resource == "audit" and method == "GET":
+            if not membership_has(membership, "review_data"):
+                self.send_error_json("Review permission required", 403)
+                return
             return self.send_json({"audit": rows(conn, "SELECT audit_log.*, users.display_name FROM audit_log LEFT JOIN users ON users.id = audit_log.user_id WHERE entity_id IN (SELECT id FROM participants WHERE study_id = ?) OR entity_type = 'study' ORDER BY audit_log.id DESC LIMIT 250", (study_id,))})
         self.send_error_json("Unknown study route", 404)
 
@@ -612,9 +843,12 @@ class App(BaseHTTPRequestHandler):
             return
         self.send_error_json("Unsupported forms operation", 405)
 
-    def participants(self, conn, user, method, study_id, parts) -> None:
+    def participants(self, conn, user, method, study_id, parts, membership) -> None:
         if method == "GET":
-            participants = rows(conn, "SELECT * FROM participants WHERE study_id = ? ORDER BY id DESC", (study_id,))
+            if membership.get("data_group_id"):
+                participants = rows(conn, "SELECT * FROM participants WHERE study_id = ? AND data_group_id = ? ORDER BY id DESC", (study_id, membership["data_group_id"]))
+            else:
+                participants = rows(conn, "SELECT * FROM participants WHERE study_id = ? ORDER BY id DESC", (study_id,))
             for participant in participants:
                 participant["metadata"] = load_json(participant.pop("metadata_json"), {})
             self.send_json({"participants": participants})
@@ -622,9 +856,10 @@ class App(BaseHTTPRequestHandler):
         if method == "POST":
             payload = self.body()
             timestamp = now()
+            data_group_id = payload.get("data_group_id") or membership.get("data_group_id")
             cur = conn.execute(
-                "INSERT INTO participants(study_id, study_uid, initials, status, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (study_id, str(payload.get("study_uid", "")).strip(), str(payload.get("initials", "")).strip().upper(), str(payload.get("status", "screening")), json.dumps(payload.get("metadata", {})), timestamp, timestamp),
+                "INSERT INTO participants(study_id, data_group_id, study_uid, initials, status, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (study_id, data_group_id, str(payload.get("study_uid", "")).strip(), str(payload.get("initials", "")).strip().upper(), str(payload.get("status", "screening")), json.dumps(payload.get("metadata", {})), timestamp, timestamp),
             )
             after = row(conn, "SELECT * FROM participants WHERE id = ?", (cur.lastrowid,))
             audit(conn, user["id"], "create", "participant", cur.lastrowid, None, after)
@@ -636,10 +871,16 @@ class App(BaseHTTPRequestHandler):
             if not before:
                 self.send_error_json("Participant not found", 404)
                 return
+            if membership.get("data_group_id") and before.get("data_group_id") != membership["data_group_id"]:
+                self.send_error_json("Participant is outside your data access group", 403)
+                return
             payload = self.body()
+            data_group_id = payload.get("data_group_id", before.get("data_group_id"))
+            if membership.get("data_group_id"):
+                data_group_id = membership["data_group_id"]
             conn.execute(
-                "UPDATE participants SET study_uid = ?, initials = ?, status = ?, metadata_json = ?, updated_at = ? WHERE id = ? AND study_id = ?",
-                (str(payload.get("study_uid", before["study_uid"])).strip(), str(payload.get("initials", before["initials"])).strip().upper(), str(payload.get("status", before["status"])), json.dumps(payload.get("metadata", load_json(before["metadata_json"], {}))), now(), participant_id, study_id),
+                "UPDATE participants SET data_group_id = ?, study_uid = ?, initials = ?, status = ?, metadata_json = ?, updated_at = ? WHERE id = ? AND study_id = ?",
+                (data_group_id, str(payload.get("study_uid", before["study_uid"])).strip(), str(payload.get("initials", before["initials"])).strip().upper(), str(payload.get("status", before["status"])), json.dumps(payload.get("metadata", load_json(before["metadata_json"], {}))), now(), participant_id, study_id),
             )
             after = row(conn, "SELECT * FROM participants WHERE id = ?", (participant_id,))
             audit(conn, user["id"], "update", "participant", participant_id, before, after)
@@ -647,14 +888,17 @@ class App(BaseHTTPRequestHandler):
             return
         self.send_error_json("Unsupported participant operation", 405)
 
-    def entries(self, conn, user, method, study_id, parts, query) -> None:
+    def entries(self, conn, user, method, study_id, parts, query, membership) -> None:
         if method == "GET":
             participant_id = int((query.get("participant_id") or ["0"])[0])
             params: tuple = (study_id,)
             sql = "SELECT entries.*, forms.name AS form_name, forms.code AS form_code, participants.study_uid FROM entries JOIN forms ON forms.id = entries.form_id JOIN participants ON participants.id = entries.participant_id WHERE entries.study_id = ?"
+            if membership.get("data_group_id"):
+                sql += " AND participants.data_group_id = ?"
+                params = (study_id, membership["data_group_id"])
             if participant_id:
                 sql += " AND participant_id = ?"
-                params = (study_id, participant_id)
+                params = (*params, participant_id)
             entries = rows(conn, sql + " ORDER BY entries.updated_at DESC", params)
             for entry in entries:
                 entry["data"] = load_json(entry.pop("data_json"), {})
@@ -673,6 +917,9 @@ class App(BaseHTTPRequestHandler):
             participant = row(conn, "SELECT * FROM participants WHERE id = ? AND study_id = ?", (participant_id, study_id))
             if not form or not participant:
                 self.send_error_json("Participant or form not found", 404)
+                return
+            if membership.get("data_group_id") and participant.get("data_group_id") != membership["data_group_id"]:
+                self.send_error_json("Participant is outside your data access group", 403)
                 return
             schema = load_json(form["schema_json"], {"fields": []})
             if repeat_instance > 1 and not schema.get("repeatable"):
@@ -712,6 +959,10 @@ class App(BaseHTTPRequestHandler):
             if not before:
                 self.send_error_json("Entry not found", 404)
                 return
+            participant = row(conn, "SELECT * FROM participants WHERE id = ?", (before["participant_id"],))
+            if membership.get("data_group_id") and participant and participant.get("data_group_id") != membership["data_group_id"]:
+                self.send_error_json("Entry is outside your data access group", 403)
+                return
             payload = self.body()
             action = str(payload.get("action", "")).strip()
             if action == "lock":
@@ -735,16 +986,37 @@ class App(BaseHTTPRequestHandler):
             return
         self.send_error_json("Unsupported entries operation", 405)
 
-    def queries(self, conn, user, method, study_id, parts) -> None:
+    def queries(self, conn, user, method, study_id, parts, membership) -> None:
         if method == "GET":
-            self.send_json({"queries": rows(conn, "SELECT queries.*, participants.study_uid, forms.name AS form_name FROM queries LEFT JOIN participants ON participants.id = queries.participant_id LEFT JOIN forms ON forms.id = queries.form_id WHERE queries.study_id = ? ORDER BY queries.status, queries.updated_at DESC", (study_id,))})
+            if membership.get("data_group_id"):
+                data = rows(
+                    conn,
+                    """
+                    SELECT queries.*, participants.study_uid, forms.name AS form_name
+                    FROM queries
+                    LEFT JOIN participants ON participants.id = queries.participant_id
+                    LEFT JOIN forms ON forms.id = queries.form_id
+                    WHERE queries.study_id = ? AND (participants.data_group_id = ? OR queries.participant_id IS NULL)
+                    ORDER BY queries.status, queries.updated_at DESC
+                    """,
+                    (study_id, membership["data_group_id"]),
+                )
+            else:
+                data = rows(conn, "SELECT queries.*, participants.study_uid, forms.name AS form_name FROM queries LEFT JOIN participants ON participants.id = queries.participant_id LEFT JOIN forms ON forms.id = queries.form_id WHERE queries.study_id = ? ORDER BY queries.status, queries.updated_at DESC", (study_id,))
+            self.send_json({"queries": data})
             return
         if method == "POST":
             payload = self.body()
             timestamp = now()
+            participant_id = payload.get("participant_id")
+            if participant_id and membership.get("data_group_id"):
+                participant = row(conn, "SELECT data_group_id FROM participants WHERE id = ? AND study_id = ?", (participant_id, study_id))
+                if not participant or participant.get("data_group_id") != membership["data_group_id"]:
+                    self.send_error_json("Participant is outside your data access group", 403)
+                    return
             cur = conn.execute(
                 "INSERT INTO queries(study_id, participant_id, form_id, field_code, message, status, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (study_id, payload.get("participant_id"), payload.get("form_id"), str(payload.get("field_code", "")), str(payload.get("message", "")).strip(), "open", user["id"], timestamp, timestamp),
+                (study_id, participant_id, payload.get("form_id"), str(payload.get("field_code", "")), str(payload.get("message", "")).strip(), "open", user["id"], timestamp, timestamp),
             )
             after = row(conn, "SELECT * FROM queries WHERE id = ?", (cur.lastrowid,))
             audit(conn, user["id"], "create", "query", cur.lastrowid, None, after)
@@ -760,6 +1032,81 @@ class App(BaseHTTPRequestHandler):
             self.send_json({"query": after})
             return
         self.send_error_json("Unsupported queries operation", 405)
+
+    def data_groups(self, conn, user, method, study_id, parts) -> None:
+        if method == "GET":
+            self.send_json({"groups": rows(conn, "SELECT * FROM data_groups WHERE study_id = ? ORDER BY name", (study_id,))})
+            return
+        if method == "POST":
+            payload = self.body()
+            timestamp = now()
+            name = str(payload.get("name", "")).strip()
+            code = normalize_code(str(payload.get("code", "")), normalize_code(name))
+            if not name or not code:
+                self.send_error_json("Group name is required", 400)
+                return
+            cur = conn.execute(
+                "INSERT INTO data_groups(study_id, name, code, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (study_id, name, code, timestamp, timestamp),
+            )
+            after = row(conn, "SELECT * FROM data_groups WHERE id = ?", (cur.lastrowid,))
+            audit(conn, user["id"], "create", "data_group", cur.lastrowid, None, after)
+            self.send_json({"group": after}, 201)
+            return
+        self.send_error_json("Unsupported group operation", 405)
+
+    def memberships(self, conn, user, method, study_id, parts) -> None:
+        if method == "GET":
+            memberships = rows(
+                conn,
+                """
+                SELECT study_memberships.*, users.username, users.display_name, data_groups.name AS data_group_name
+                FROM study_memberships
+                JOIN users ON users.id = study_memberships.user_id
+                LEFT JOIN data_groups ON data_groups.id = study_memberships.data_group_id
+                WHERE study_memberships.study_id = ?
+                ORDER BY users.username
+                """,
+                (study_id,),
+            )
+            self.send_json({"memberships": memberships})
+            return
+        if method == "POST":
+            payload = self.body()
+            timestamp = now()
+            user_id = int(payload.get("user_id"))
+            role_name = str(payload.get("role", "data_entry")).strip()
+            data_group_id = payload.get("data_group_id") or None
+            active = 1 if payload.get("active", True) else 0
+            if role_name not in ROLE_PERMISSIONS:
+                self.send_error_json("Unsupported role", 400)
+                return
+            if data_group_id and not row(conn, "SELECT id FROM data_groups WHERE id = ? AND study_id = ?", (data_group_id, study_id)):
+                self.send_error_json("Data access group not found", 404)
+                return
+            existing = row(conn, "SELECT * FROM study_memberships WHERE study_id = ? AND user_id = ?", (study_id, user_id))
+            if existing:
+                before = existing
+                conn.execute(
+                    "UPDATE study_memberships SET role = ?, data_group_id = ?, active = ?, updated_at = ? WHERE id = ?",
+                    (role_name, data_group_id, active, timestamp, existing["id"]),
+                )
+                after = row(conn, "SELECT * FROM study_memberships WHERE id = ?", (existing["id"],))
+                audit(conn, user["id"], "update", "membership", existing["id"], before, after)
+                self.send_json({"membership": after})
+                return
+            cur = conn.execute(
+                """
+                INSERT INTO study_memberships(study_id, user_id, role, data_group_id, active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (study_id, user_id, role_name, data_group_id, active, timestamp, timestamp),
+            )
+            after = row(conn, "SELECT * FROM study_memberships WHERE id = ?", (cur.lastrowid,))
+            audit(conn, user["id"], "create", "membership", cur.lastrowid, None, after)
+            self.send_json({"membership": after}, 201)
+            return
+        self.send_error_json("Unsupported membership operation", 405)
 
     def metadata(self, conn, study_id: int) -> None:
         study = row(conn, "SELECT * FROM studies WHERE id = ?", (study_id,))
@@ -794,19 +1141,25 @@ class App(BaseHTTPRequestHandler):
                 )
         self.send_json({"project": study, "instruments": instruments, "data_dictionary": data_dictionary})
 
-    def quality(self, conn, study_id: int) -> None:
+    def quality(self, conn, study_id: int, membership) -> None:
         forms = rows(conn, "SELECT * FROM forms WHERE study_id = ? ORDER BY id", (study_id,))
+        group_filter = ""
+        params: tuple = (study_id,)
+        if membership.get("data_group_id"):
+            group_filter = " AND participants.data_group_id = ?"
+            params = (study_id, membership["data_group_id"])
         entries = rows(
             conn,
-            """
+            f"""
             SELECT entries.*, forms.name AS form_name, forms.schema_json, participants.study_uid
             FROM entries
             JOIN forms ON forms.id = entries.form_id
             JOIN participants ON participants.id = entries.participant_id
             WHERE entries.study_id = ?
+            {group_filter}
             ORDER BY participants.study_uid, forms.id
             """,
-            (study_id,),
+            params,
         )
         issues = []
         for entry in entries:
@@ -825,7 +1178,10 @@ class App(BaseHTTPRequestHandler):
                         **issue,
                     }
                 )
-        participants = rows(conn, "SELECT id, study_uid FROM participants WHERE study_id = ?", (study_id,))
+        if membership.get("data_group_id"):
+            participants = rows(conn, "SELECT id, study_uid FROM participants WHERE study_id = ? AND data_group_id = ?", (study_id, membership["data_group_id"]))
+        else:
+            participants = rows(conn, "SELECT id, study_uid FROM participants WHERE study_id = ?", (study_id,))
         existing_pairs = {(entry["participant_id"], entry["form_id"]) for entry in entries}
         for participant in participants:
             for form in forms:
@@ -845,9 +1201,13 @@ class App(BaseHTTPRequestHandler):
                     )
         self.send_json({"issues": issues})
 
-    def analysis(self, conn, study_id: int) -> None:
-        participants = rows(conn, "SELECT * FROM participants WHERE study_id = ?", (study_id,))
-        entries = rows(conn, "SELECT entries.*, forms.name AS form_name, forms.schema_json FROM entries JOIN forms ON forms.id = entries.form_id WHERE entries.study_id = ?", (study_id,))
+    def analysis(self, conn, study_id: int, membership) -> None:
+        if membership.get("data_group_id"):
+            participants = rows(conn, "SELECT * FROM participants WHERE study_id = ? AND data_group_id = ?", (study_id, membership["data_group_id"]))
+            entries = rows(conn, "SELECT entries.*, forms.name AS form_name, forms.schema_json FROM entries JOIN forms ON forms.id = entries.form_id JOIN participants ON participants.id = entries.participant_id WHERE entries.study_id = ? AND participants.data_group_id = ?", (study_id, membership["data_group_id"]))
+        else:
+            participants = rows(conn, "SELECT * FROM participants WHERE study_id = ?", (study_id,))
+            entries = rows(conn, "SELECT entries.*, forms.name AS form_name, forms.schema_json FROM entries JOIN forms ON forms.id = entries.form_id WHERE entries.study_id = ?", (study_id,))
         fields: dict[str, dict] = {}
         values: dict[str, list] = {}
         completed = 0
@@ -887,7 +1247,7 @@ class App(BaseHTTPRequestHandler):
         open_queries = row(conn, "SELECT COUNT(*) AS count FROM queries WHERE study_id = ? AND status = 'open'", (study_id,))["count"]
         self.send_json({"participant_count": len(participants), "entry_count": len(entries), "completed_entry_count": completed, "open_query_count": open_queries, "field_summaries": summaries})
 
-    def export_csv(self, conn, study_id: int) -> None:
+    def export_csv(self, conn, study_id: int, membership) -> None:
         forms = rows(conn, "SELECT * FROM forms WHERE study_id = ? ORDER BY id", (study_id,))
         field_codes = []
         labels = {}
@@ -899,7 +1259,10 @@ class App(BaseHTTPRequestHandler):
         output = []
         header = ["study_uid", "initials", "participant_status", "event_name", "repeat_instance", "form_name", "entry_status", "locked"] + field_codes
         output.append(header)
-        entries = rows(conn, "SELECT entries.*, participants.study_uid, participants.initials, participants.status AS participant_status, forms.name AS form_name, forms.code AS form_code FROM entries JOIN participants ON participants.id = entries.participant_id JOIN forms ON forms.id = entries.form_id WHERE entries.study_id = ? ORDER BY participants.study_uid, forms.id", (study_id,))
+        if membership.get("data_group_id"):
+            entries = rows(conn, "SELECT entries.*, participants.study_uid, participants.initials, participants.status AS participant_status, forms.name AS form_name, forms.code AS form_code FROM entries JOIN participants ON participants.id = entries.participant_id JOIN forms ON forms.id = entries.form_id WHERE entries.study_id = ? AND participants.data_group_id = ? ORDER BY participants.study_uid, forms.id", (study_id, membership["data_group_id"]))
+        else:
+            entries = rows(conn, "SELECT entries.*, participants.study_uid, participants.initials, participants.status AS participant_status, forms.name AS form_name, forms.code AS form_code FROM entries JOIN participants ON participants.id = entries.participant_id JOIN forms ON forms.id = entries.form_id WHERE entries.study_id = ? ORDER BY participants.study_uid, forms.id", (study_id,))
         for entry in entries:
             data = load_json(entry["data_json"], {})
             line = [entry["study_uid"], entry["initials"], entry["participant_status"], entry["event_name"], entry["repeat_instance"], entry["form_name"], entry["status"], "yes" if entry["locked_at"] else "no"]

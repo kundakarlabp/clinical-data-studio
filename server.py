@@ -121,6 +121,7 @@ def migrate_entries_unique_key(conn: sqlite3.Connection) -> None:
             study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
             participant_id INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
             form_id INTEGER NOT NULL REFERENCES forms(id) ON DELETE CASCADE,
+            event_id INTEGER REFERENCES study_events(id) ON DELETE SET NULL,
             event_name TEXT NOT NULL DEFAULT 'Baseline',
             repeat_instance INTEGER NOT NULL DEFAULT 1,
             status TEXT NOT NULL DEFAULT 'draft',
@@ -135,11 +136,11 @@ def migrate_entries_unique_key(conn: sqlite3.Connection) -> None:
             UNIQUE(participant_id, form_id, event_name, repeat_instance)
         );
         INSERT INTO entries(
-            id, study_id, participant_id, form_id, event_name, repeat_instance, status,
+            id, study_id, participant_id, form_id, event_id, event_name, repeat_instance, status,
             data_json, created_by, updated_by, locked_at, locked_by, lock_reason, created_at, updated_at
         )
         SELECT
-            id, study_id, participant_id, form_id, event_name,
+            id, study_id, participant_id, form_id, event_id, event_name,
             COALESCE(repeat_instance, 1), status, data_json, created_by, updated_by,
             locked_at, locked_by, COALESCE(lock_reason, ''), created_at, updated_at
         FROM entries_old;
@@ -232,6 +233,31 @@ def migrate() -> None:
                 UNIQUE(study_id, code)
             );
 
+            CREATE TABLE IF NOT EXISTS study_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                code TEXT NOT NULL,
+                arm_name TEXT NOT NULL DEFAULT 'Default',
+                day_offset INTEGER NOT NULL DEFAULT 0,
+                display_order INTEGER NOT NULL DEFAULT 1,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(study_id, code)
+            );
+
+            CREATE TABLE IF NOT EXISTS form_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+                event_id INTEGER NOT NULL REFERENCES study_events(id) ON DELETE CASCADE,
+                form_id INTEGER NOT NULL REFERENCES forms(id) ON DELETE CASCADE,
+                required INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(event_id, form_id)
+            );
+
             CREATE TABLE IF NOT EXISTS participants (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
@@ -250,6 +276,7 @@ def migrate() -> None:
                 study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
                 participant_id INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
                 form_id INTEGER NOT NULL REFERENCES forms(id) ON DELETE CASCADE,
+                event_id INTEGER REFERENCES study_events(id) ON DELETE SET NULL,
                 event_name TEXT NOT NULL DEFAULT 'Baseline',
                 repeat_instance INTEGER NOT NULL DEFAULT 1,
                 status TEXT NOT NULL DEFAULT 'draft',
@@ -294,6 +321,7 @@ def migrate() -> None:
         add_column(conn, "entries", "locked_at", "INTEGER")
         add_column(conn, "entries", "locked_by", "INTEGER REFERENCES users(id)")
         add_column(conn, "entries", "lock_reason", "TEXT NOT NULL DEFAULT ''")
+        add_column(conn, "entries", "event_id", "INTEGER REFERENCES study_events(id) ON DELETE SET NULL")
         add_column(conn, "participants", "data_group_id", "INTEGER REFERENCES data_groups(id) ON DELETE SET NULL")
         migrate_entries_unique_key(conn)
         if not row(conn, "SELECT id FROM users WHERE username = ?", ("admin",)):
@@ -311,6 +339,7 @@ def migrate() -> None:
         if not row(conn, "SELECT id FROM studies LIMIT 1"):
             seed_study(conn)
         seed_admin_memberships(conn)
+        seed_baseline_events(conn)
 
 
 def seed_study(conn: sqlite3.Connection) -> None:
@@ -366,6 +395,33 @@ def seed_admin_memberships(conn: sqlite3.Connection) -> None:
                     """,
                     (study["id"], user["id"], timestamp, timestamp),
                 )
+
+
+def seed_baseline_events(conn: sqlite3.Connection) -> None:
+    timestamp = now()
+    for study in rows(conn, "SELECT id FROM studies"):
+        event = row(conn, "SELECT id FROM study_events WHERE study_id = ? AND code = 'baseline'", (study["id"],))
+        if not event:
+            cur = conn.execute(
+                """
+                INSERT INTO study_events(study_id, name, code, arm_name, day_offset, display_order, active, created_at, updated_at)
+                VALUES (?, 'Baseline', 'baseline', 'Default', 0, 1, 1, ?, ?)
+                """,
+                (study["id"], timestamp, timestamp),
+            )
+            event_id = cur.lastrowid
+        else:
+            event_id = event["id"]
+        for form in rows(conn, "SELECT id FROM forms WHERE study_id = ?", (study["id"],)):
+            if not row(conn, "SELECT id FROM form_events WHERE event_id = ? AND form_id = ?", (event_id, form["id"])):
+                conn.execute(
+                    """
+                    INSERT INTO form_events(study_id, event_id, form_id, required, created_at, updated_at)
+                    VALUES (?, ?, ?, 1, ?, ?)
+                    """,
+                    (study["id"], event_id, form["id"], timestamp, timestamp),
+                )
+        conn.execute("UPDATE entries SET event_id = ? WHERE study_id = ? AND event_id IS NULL AND event_name = 'Baseline'", (event_id, study["id"]))
 
 
 def normalize_code(value: str, fallback: str = "") -> str:
@@ -750,6 +806,16 @@ class App(BaseHTTPRequestHandler):
                 self.send_error_json("Form management permission required", 403)
                 return
             return self.forms(conn, user, method, study_id, parts)
+        if resource == "events":
+            if method != "GET" and not membership_has(membership, "manage_study"):
+                self.send_error_json("Study management permission required", 403)
+                return
+            return self.events(conn, user, method, study_id, parts)
+        if resource == "form-events":
+            if method != "GET" and not membership_has(membership, "manage_forms"):
+                self.send_error_json("Form management permission required", 403)
+                return
+            return self.form_events(conn, user, method, study_id, parts)
         if resource == "participants":
             if method != "GET" and not membership_has(membership, "enter_data"):
                 self.send_error_json("Data entry permission required", 403)
@@ -821,6 +887,19 @@ class App(BaseHTTPRequestHandler):
                 "INSERT INTO forms(study_id, name, code, schema_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (study_id, str(payload.get("name", "")).strip() or "Untitled Form", normalize_code(str(payload.get("code", "")), f"form_{timestamp}"), json.dumps(schema), timestamp, timestamp),
             )
+            event_ids = payload.get("event_ids") or []
+            if not event_ids:
+                baseline = row(conn, "SELECT id FROM study_events WHERE study_id = ? AND code = 'baseline'", (study_id,))
+                event_ids = [baseline["id"]] if baseline else []
+            for event_id in event_ids:
+                if row(conn, "SELECT id FROM study_events WHERE id = ? AND study_id = ?", (event_id, study_id)):
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO form_events(study_id, event_id, form_id, required, created_at, updated_at)
+                        VALUES (?, ?, ?, 1, ?, ?)
+                        """,
+                        (study_id, event_id, cur.lastrowid, timestamp, timestamp),
+                    )
             after = row(conn, "SELECT * FROM forms WHERE id = ?", (cur.lastrowid,))
             audit(conn, user["id"], "create", "form", cur.lastrowid, None, after)
             self.send_json({"form": after}, 201)
@@ -842,6 +921,62 @@ class App(BaseHTTPRequestHandler):
             self.send_json({"form": after})
             return
         self.send_error_json("Unsupported forms operation", 405)
+
+    def events(self, conn, user, method, study_id, parts) -> None:
+        if method == "GET":
+            self.send_json({"events": rows(conn, "SELECT * FROM study_events WHERE study_id = ? ORDER BY display_order, id", (study_id,))})
+            return
+        if method == "POST":
+            payload = self.body()
+            timestamp = now()
+            name = str(payload.get("name", "")).strip()
+            code = normalize_code(str(payload.get("code", "")), normalize_code(name))
+            if not name or not code:
+                self.send_error_json("Event name is required", 400)
+                return
+            display_order = int(payload.get("display_order") or row(conn, "SELECT COALESCE(MAX(display_order), 0) + 1 AS next_order FROM study_events WHERE study_id = ?", (study_id,))["next_order"])
+            cur = conn.execute(
+                """
+                INSERT INTO study_events(study_id, name, code, arm_name, day_offset, display_order, active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+                """,
+                (study_id, name, code, str(payload.get("arm_name", "Default")).strip() or "Default", int(payload.get("day_offset") or 0), display_order, timestamp, timestamp),
+            )
+            after = row(conn, "SELECT * FROM study_events WHERE id = ?", (cur.lastrowid,))
+            audit(conn, user["id"], "create", "event", cur.lastrowid, None, after)
+            self.send_json({"event": after}, 201)
+            return
+        self.send_error_json("Unsupported events operation", 405)
+
+    def form_events(self, conn, user, method, study_id, parts) -> None:
+        if method == "GET":
+            self.send_json({"form_events": rows(conn, "SELECT form_events.*, study_events.name AS event_name, forms.name AS form_name FROM form_events JOIN study_events ON study_events.id = form_events.event_id JOIN forms ON forms.id = form_events.form_id WHERE form_events.study_id = ? ORDER BY study_events.display_order, forms.id", (study_id,))})
+            return
+        if method == "POST":
+            payload = self.body()
+            timestamp = now()
+            event_id = int(payload.get("event_id"))
+            form_id = int(payload.get("form_id"))
+            required = 1 if payload.get("required", True) else 0
+            if not row(conn, "SELECT id FROM study_events WHERE id = ? AND study_id = ?", (event_id, study_id)) or not row(conn, "SELECT id FROM forms WHERE id = ? AND study_id = ?", (form_id, study_id)):
+                self.send_error_json("Event or form not found", 404)
+                return
+            existing = row(conn, "SELECT id FROM form_events WHERE event_id = ? AND form_id = ?", (event_id, form_id))
+            if existing:
+                conn.execute("UPDATE form_events SET required = ?, updated_at = ? WHERE id = ?", (required, timestamp, existing["id"]))
+                after = row(conn, "SELECT * FROM form_events WHERE id = ?", (existing["id"],))
+                audit(conn, user["id"], "update", "form_event", existing["id"], None, after)
+                self.send_json({"form_event": after})
+                return
+            cur = conn.execute(
+                "INSERT INTO form_events(study_id, event_id, form_id, required, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (study_id, event_id, form_id, required, timestamp, timestamp),
+            )
+            after = row(conn, "SELECT * FROM form_events WHERE id = ?", (cur.lastrowid,))
+            audit(conn, user["id"], "create", "form_event", cur.lastrowid, None, after)
+            self.send_json({"form_event": after}, 201)
+            return
+        self.send_error_json("Unsupported form-event operation", 405)
 
     def participants(self, conn, user, method, study_id, parts, membership) -> None:
         if method == "GET":
@@ -892,7 +1027,7 @@ class App(BaseHTTPRequestHandler):
         if method == "GET":
             participant_id = int((query.get("participant_id") or ["0"])[0])
             params: tuple = (study_id,)
-            sql = "SELECT entries.*, forms.name AS form_name, forms.code AS form_code, participants.study_uid FROM entries JOIN forms ON forms.id = entries.form_id JOIN participants ON participants.id = entries.participant_id WHERE entries.study_id = ?"
+            sql = "SELECT entries.*, forms.name AS form_name, forms.code AS form_code, participants.study_uid, study_events.name AS mapped_event_name, study_events.code AS event_code FROM entries JOIN forms ON forms.id = entries.form_id JOIN participants ON participants.id = entries.participant_id LEFT JOIN study_events ON study_events.id = entries.event_id WHERE entries.study_id = ?"
             if membership.get("data_group_id"):
                 sql += " AND participants.data_group_id = ?"
                 params = (study_id, membership["data_group_id"])
@@ -909,7 +1044,19 @@ class App(BaseHTTPRequestHandler):
             timestamp = now()
             participant_id = int(payload["participant_id"])
             form_id = int(payload["form_id"])
-            event_name = str(payload.get("event_name", "Baseline")).strip() or "Baseline"
+            event_id = payload.get("event_id")
+            event = None
+            if event_id:
+                event = row(conn, "SELECT * FROM study_events WHERE id = ? AND study_id = ?", (int(event_id), study_id))
+                if not event:
+                    self.send_error_json("Event not found", 404)
+                    return
+                event_id = event["id"]
+            event_name = str(payload.get("event_name", "")).strip()
+            if event:
+                event_name = event["code"]
+            if not event_name:
+                event_name = "Baseline"
             repeat_instance = max(int(payload.get("repeat_instance", 1) or 1), 1)
             data = payload.get("data", {})
             status = str(payload.get("status", "draft"))
@@ -917,6 +1064,9 @@ class App(BaseHTTPRequestHandler):
             participant = row(conn, "SELECT * FROM participants WHERE id = ? AND study_id = ?", (participant_id, study_id))
             if not form or not participant:
                 self.send_error_json("Participant or form not found", 404)
+                return
+            if event_id and not row(conn, "SELECT id FROM form_events WHERE study_id = ? AND event_id = ? AND form_id = ?", (study_id, event_id, form_id)):
+                self.send_error_json("This CRF is not assigned to the selected event", 400)
                 return
             if membership.get("data_group_id") and participant.get("data_group_id") != membership["data_group_id"]:
                 self.send_error_json("Participant is outside your data access group", 403)
@@ -938,16 +1088,16 @@ class App(BaseHTTPRequestHandler):
                         return
                 before = existing
                 conn.execute(
-                    "UPDATE entries SET data_json = ?, status = ?, updated_by = ?, updated_at = ?, locked_at = NULL, locked_by = NULL, lock_reason = '' WHERE id = ?",
-                    (json.dumps(cleaned), status, user["id"], timestamp, existing["id"]),
+                    "UPDATE entries SET event_id = ?, data_json = ?, status = ?, updated_by = ?, updated_at = ?, locked_at = NULL, locked_by = NULL, lock_reason = '' WHERE id = ?",
+                    (event_id, json.dumps(cleaned), status, user["id"], timestamp, existing["id"]),
                 )
                 after = row(conn, "SELECT * FROM entries WHERE id = ?", (existing["id"],))
                 audit(conn, user["id"], "update", "entry", existing["id"], before, {"entry": after, "change_reason": payload.get("change_reason", "")})
                 self.send_json({"entry": after})
                 return
             cur = conn.execute(
-                "INSERT INTO entries(study_id, participant_id, form_id, event_name, repeat_instance, status, data_json, created_by, updated_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (study_id, participant_id, form_id, event_name, repeat_instance, status, json.dumps(cleaned), user["id"], user["id"], timestamp, timestamp),
+                "INSERT INTO entries(study_id, participant_id, form_id, event_id, event_name, repeat_instance, status, data_json, created_by, updated_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (study_id, participant_id, form_id, event_id, event_name, repeat_instance, status, json.dumps(cleaned), user["id"], user["id"], timestamp, timestamp),
             )
             after = row(conn, "SELECT * FROM entries WHERE id = ?", (cur.lastrowid,))
             audit(conn, user["id"], "create", "entry", cur.lastrowid, None, after)
@@ -1111,6 +1261,7 @@ class App(BaseHTTPRequestHandler):
     def metadata(self, conn, study_id: int) -> None:
         study = row(conn, "SELECT * FROM studies WHERE id = ?", (study_id,))
         forms = rows(conn, "SELECT * FROM forms WHERE study_id = ? ORDER BY id", (study_id,))
+        mappings = rows(conn, "SELECT form_events.*, study_events.name AS event_name, study_events.code AS event_code FROM form_events JOIN study_events ON study_events.id = form_events.event_id WHERE form_events.study_id = ? AND form_events.required = 1", (study_id,))
         instruments = []
         data_dictionary = []
         for form in forms:
@@ -1143,6 +1294,7 @@ class App(BaseHTTPRequestHandler):
 
     def quality(self, conn, study_id: int, membership) -> None:
         forms = rows(conn, "SELECT * FROM forms WHERE study_id = ? ORDER BY id", (study_id,))
+        mappings = rows(conn, "SELECT form_events.*, study_events.name AS event_name, study_events.code AS event_code FROM form_events JOIN study_events ON study_events.id = form_events.event_id WHERE form_events.study_id = ? AND form_events.required = 1", (study_id,))
         group_filter = ""
         params: tuple = (study_id,)
         if membership.get("data_group_id"):
@@ -1182,17 +1334,20 @@ class App(BaseHTTPRequestHandler):
             participants = rows(conn, "SELECT id, study_uid FROM participants WHERE study_id = ? AND data_group_id = ?", (study_id, membership["data_group_id"]))
         else:
             participants = rows(conn, "SELECT id, study_uid FROM participants WHERE study_id = ?", (study_id,))
-        existing_pairs = {(entry["participant_id"], entry["form_id"]) for entry in entries}
+        existing_pairs = {(entry["participant_id"], entry["form_id"], entry["event_id"] or entry["event_name"]) for entry in entries}
         for participant in participants:
-            for form in forms:
-                if (participant["id"], form["id"]) not in existing_pairs:
+            expected = mappings or [{"form_id": form["id"], "event_id": None, "event_name": "Baseline", "event_code": "Baseline"} for form in forms]
+            for mapping in expected:
+                event_key = mapping.get("event_id") or mapping.get("event_code") or mapping.get("event_name") or "Baseline"
+                if (participant["id"], mapping["form_id"], event_key) not in existing_pairs:
+                    form = next((item for item in forms if item["id"] == mapping["form_id"]), {"name": "CRF"})
                     issues.append(
                         {
                             "participant_id": participant["id"],
                             "study_uid": participant["study_uid"],
-                            "form_id": form["id"],
+                            "form_id": mapping["form_id"],
                             "form_name": form["name"],
-                            "event_name": "Baseline",
+                            "event_name": mapping.get("event_name") or "Baseline",
                             "repeat_instance": 1,
                             "field_code": "",
                             "severity": "warning",
@@ -1257,15 +1412,15 @@ class App(BaseHTTPRequestHandler):
                 field_codes.append(code)
                 labels[code] = field.get("label", code)
         output = []
-        header = ["study_uid", "initials", "participant_status", "event_name", "repeat_instance", "form_name", "entry_status", "locked"] + field_codes
+        header = ["study_uid", "initials", "participant_status", "event_name", "event_code", "repeat_instance", "form_name", "entry_status", "locked"] + field_codes
         output.append(header)
         if membership.get("data_group_id"):
-            entries = rows(conn, "SELECT entries.*, participants.study_uid, participants.initials, participants.status AS participant_status, forms.name AS form_name, forms.code AS form_code FROM entries JOIN participants ON participants.id = entries.participant_id JOIN forms ON forms.id = entries.form_id WHERE entries.study_id = ? AND participants.data_group_id = ? ORDER BY participants.study_uid, forms.id", (study_id, membership["data_group_id"]))
+            entries = rows(conn, "SELECT entries.*, participants.study_uid, participants.initials, participants.status AS participant_status, forms.name AS form_name, forms.code AS form_code, study_events.name AS mapped_event_name, study_events.code AS event_code FROM entries JOIN participants ON participants.id = entries.participant_id JOIN forms ON forms.id = entries.form_id LEFT JOIN study_events ON study_events.id = entries.event_id WHERE entries.study_id = ? AND participants.data_group_id = ? ORDER BY participants.study_uid, study_events.display_order, forms.id", (study_id, membership["data_group_id"]))
         else:
-            entries = rows(conn, "SELECT entries.*, participants.study_uid, participants.initials, participants.status AS participant_status, forms.name AS form_name, forms.code AS form_code FROM entries JOIN participants ON participants.id = entries.participant_id JOIN forms ON forms.id = entries.form_id WHERE entries.study_id = ? ORDER BY participants.study_uid, forms.id", (study_id,))
+            entries = rows(conn, "SELECT entries.*, participants.study_uid, participants.initials, participants.status AS participant_status, forms.name AS form_name, forms.code AS form_code, study_events.name AS mapped_event_name, study_events.code AS event_code FROM entries JOIN participants ON participants.id = entries.participant_id JOIN forms ON forms.id = entries.form_id LEFT JOIN study_events ON study_events.id = entries.event_id WHERE entries.study_id = ? ORDER BY participants.study_uid, study_events.display_order, forms.id", (study_id,))
         for entry in entries:
             data = load_json(entry["data_json"], {})
-            line = [entry["study_uid"], entry["initials"], entry["participant_status"], entry["event_name"], entry["repeat_instance"], entry["form_name"], entry["status"], "yes" if entry["locked_at"] else "no"]
+            line = [entry["study_uid"], entry["initials"], entry["participant_status"], entry.get("mapped_event_name") or entry["event_name"], entry.get("event_code") or entry["event_name"], entry["repeat_instance"], entry["form_name"], entry["status"], "yes" if entry["locked_at"] else "no"]
             for code in field_codes:
                 prefix, field_code = code.split("__", 1)
                 line.append(data.get(field_code, "") if prefix == entry["form_code"] else "")
@@ -1286,7 +1441,11 @@ class App(BaseHTTPRequestHandler):
 
     def export_codebook(self, conn, study_id: int) -> None:
         forms = rows(conn, "SELECT * FROM forms WHERE study_id = ? ORDER BY id", (study_id,))
-        output = [["instrument_name", "instrument_label", "field_order", "field_name", "field_label", "field_type", "required", "choices", "validation_min", "validation_max", "branching_logic", "calculation", "repeatable"]]
+        form_event_rows = rows(conn, "SELECT form_events.form_id, study_events.code AS event_code FROM form_events JOIN study_events ON study_events.id = form_events.event_id WHERE form_events.study_id = ? ORDER BY study_events.display_order", (study_id,))
+        events_by_form: dict[int, list[str]] = {}
+        for item in form_event_rows:
+            events_by_form.setdefault(item["form_id"], []).append(item["event_code"])
+        output = [["instrument_name", "instrument_label", "events", "field_order", "field_name", "field_label", "field_type", "required", "choices", "validation_min", "validation_max", "branching_logic", "calculation", "repeatable"]]
         for form in forms:
             schema = load_json(form["schema_json"], {"fields": []})
             for order, field in enumerate(schema.get("fields", []), start=1):
@@ -1298,6 +1457,7 @@ class App(BaseHTTPRequestHandler):
                     [
                         form["code"],
                         form["name"],
+                        " | ".join(events_by_form.get(form["id"], [])),
                         order,
                         field["code"],
                         field["label"],

@@ -8,6 +8,7 @@ import json
 import mimetypes
 import os
 import secrets
+import shutil
 import sqlite3
 import time
 from http import HTTPStatus
@@ -19,6 +20,7 @@ from urllib.parse import parse_qs, urlparse
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
 DATA = ROOT / "data"
+BACKUPS = DATA / "backups"
 DB_PATH = DATA / "clinical_data_studio.sqlite3"
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("CDS_PORT", "8765"))
@@ -314,6 +316,17 @@ def migrate() -> None:
                 before_json TEXT,
                 after_json TEXT,
                 created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                filters_json TEXT NOT NULL DEFAULT '{}',
+                created_by INTEGER REFERENCES users(id),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
             );
             """
         )
@@ -855,6 +868,16 @@ class App(BaseHTTPRequestHandler):
                 self.send_error_json("Analysis permission required", 403)
                 return
             return self.analysis(conn, study_id, membership)
+        if resource == "reports":
+            if not membership_has(membership, "view_analysis") and not membership_has(membership, "export_data"):
+                self.send_error_json("Report permission required", 403)
+                return
+            return self.reports(conn, user, method, study_id, parts, membership)
+        if resource == "backups":
+            if not membership_has(membership, "manage_study"):
+                self.send_error_json("Study management permission required", 403)
+                return
+            return self.backups(conn, user, method, study_id, parts)
         if resource == "export" and method == "GET":
             if not membership_has(membership, "export_data"):
                 self.send_error_json("Export permission required", 403)
@@ -1403,6 +1426,9 @@ class App(BaseHTTPRequestHandler):
         self.send_json({"participant_count": len(participants), "entry_count": len(entries), "completed_entry_count": completed, "open_query_count": open_queries, "field_summaries": summaries})
 
     def export_csv(self, conn, study_id: int, membership) -> None:
+        return self.export_entries_csv(conn, study_id, membership, {}, "clinical_data_export.csv")
+
+    def export_entries_csv(self, conn, study_id: int, membership, filters: dict, filename: str) -> None:
         forms = rows(conn, "SELECT * FROM forms WHERE study_id = ? ORDER BY id", (study_id,))
         field_codes = []
         labels = {}
@@ -1414,10 +1440,35 @@ class App(BaseHTTPRequestHandler):
         output = []
         header = ["study_uid", "initials", "participant_status", "event_name", "event_code", "repeat_instance", "form_name", "entry_status", "locked"] + field_codes
         output.append(header)
+        where = ["entries.study_id = ?"]
+        params: list = [study_id]
+        if filters.get("participant_status"):
+            where.append("participants.status = ?")
+            params.append(filters["participant_status"])
+        if filters.get("entry_status"):
+            where.append("entries.status = ?")
+            params.append(filters["entry_status"])
+        if filters.get("event_id"):
+            where.append("entries.event_id = ?")
+            params.append(int(filters["event_id"]))
+        if filters.get("form_id"):
+            where.append("entries.form_id = ?")
+            params.append(int(filters["form_id"]))
         if membership.get("data_group_id"):
-            entries = rows(conn, "SELECT entries.*, participants.study_uid, participants.initials, participants.status AS participant_status, forms.name AS form_name, forms.code AS form_code, study_events.name AS mapped_event_name, study_events.code AS event_code FROM entries JOIN participants ON participants.id = entries.participant_id JOIN forms ON forms.id = entries.form_id LEFT JOIN study_events ON study_events.id = entries.event_id WHERE entries.study_id = ? AND participants.data_group_id = ? ORDER BY participants.study_uid, study_events.display_order, forms.id", (study_id, membership["data_group_id"]))
-        else:
-            entries = rows(conn, "SELECT entries.*, participants.study_uid, participants.initials, participants.status AS participant_status, forms.name AS form_name, forms.code AS form_code, study_events.name AS mapped_event_name, study_events.code AS event_code FROM entries JOIN participants ON participants.id = entries.participant_id JOIN forms ON forms.id = entries.form_id LEFT JOIN study_events ON study_events.id = entries.event_id WHERE entries.study_id = ? ORDER BY participants.study_uid, study_events.display_order, forms.id", (study_id,))
+            where.append("participants.data_group_id = ?")
+            params.append(membership["data_group_id"])
+        sql = f"""
+            SELECT entries.*, participants.study_uid, participants.initials, participants.status AS participant_status,
+                   forms.name AS form_name, forms.code AS form_code,
+                   study_events.name AS mapped_event_name, study_events.code AS event_code
+            FROM entries
+            JOIN participants ON participants.id = entries.participant_id
+            JOIN forms ON forms.id = entries.form_id
+            LEFT JOIN study_events ON study_events.id = entries.event_id
+            WHERE {" AND ".join(where)}
+            ORDER BY participants.study_uid, study_events.display_order, forms.id
+        """
+        entries = rows(conn, sql, tuple(params))
         for entry in entries:
             data = load_json(entry["data_json"], {})
             line = [entry["study_uid"], entry["initials"], entry["participant_status"], entry.get("mapped_event_name") or entry["event_name"], entry.get("event_code") or entry["event_name"], entry["repeat_instance"], entry["form_name"], entry["status"], "yes" if entry["locked_at"] else "no"]
@@ -1434,10 +1485,81 @@ class App(BaseHTTPRequestHandler):
         content = "".join(text_lines).encode("utf-8-sig")
         self.send_response(200)
         self.send_header("content-type", "text/csv; charset=utf-8")
-        self.send_header("content-disposition", "attachment; filename=clinical_data_export.csv")
+        self.send_header("content-disposition", f"attachment; filename={filename}")
         self.send_header("content-length", str(len(content)))
         self.end_headers()
         self.wfile.write(content)
+
+    def reports(self, conn, user, method, study_id, parts, membership) -> None:
+        if method == "GET" and len(parts) == 4:
+            data = rows(conn, "SELECT reports.*, users.display_name AS created_by_name FROM reports LEFT JOIN users ON users.id = reports.created_by WHERE reports.study_id = ? ORDER BY reports.updated_at DESC", (study_id,))
+            for report in data:
+                report["filters"] = load_json(report.pop("filters_json"), {})
+            self.send_json({"reports": data})
+            return
+        if method == "POST" and len(parts) == 4:
+            if not membership_has(membership, "export_data"):
+                self.send_error_json("Export permission required", 403)
+                return
+            payload = self.body()
+            timestamp = now()
+            filters = payload.get("filters") or {}
+            cur = conn.execute(
+                "INSERT INTO reports(study_id, name, description, filters_json, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (study_id, str(payload.get("name", "")).strip() or "Untitled Report", str(payload.get("description", "")).strip(), json.dumps(filters), user["id"], timestamp, timestamp),
+            )
+            after = row(conn, "SELECT * FROM reports WHERE id = ?", (cur.lastrowid,))
+            audit(conn, user["id"], "create", "report", cur.lastrowid, None, after)
+            self.send_json({"report": after}, 201)
+            return
+        if method == "GET" and len(parts) == 6 and parts[5] == "export":
+            if not membership_has(membership, "export_data"):
+                self.send_error_json("Export permission required", 403)
+                return
+            report_id = int(parts[4])
+            report = row(conn, "SELECT * FROM reports WHERE id = ? AND study_id = ?", (report_id, study_id))
+            if not report:
+                self.send_error_json("Report not found", 404)
+                return
+            filename = f"clinical_report_{normalize_code(report['name'], 'report')}.csv"
+            return self.export_entries_csv(conn, study_id, membership, load_json(report["filters_json"], {}), filename)
+        self.send_error_json("Unsupported reports operation", 405)
+
+    def backups(self, conn, user, method, study_id, parts) -> None:
+        BACKUPS.mkdir(parents=True, exist_ok=True)
+        if method == "GET" and len(parts) == 4:
+            files = []
+            for item in sorted(BACKUPS.glob("*.sqlite3"), key=lambda path: path.stat().st_mtime, reverse=True):
+                if item.name.startswith(f"study_{study_id}_"):
+                    files.append({"name": item.name, "size": item.stat().st_size, "created_at": int(item.stat().st_mtime)})
+            self.send_json({"backups": files})
+            return
+        if method == "POST" and len(parts) == 4:
+            timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+            target = BACKUPS / f"study_{study_id}_{timestamp}.sqlite3"
+            conn.commit()
+            shutil.copy2(DB_PATH, target)
+            audit(conn, user["id"], "create", "backup", study_id, None, {"filename": target.name})
+            self.send_json({"backup": {"name": target.name, "size": target.stat().st_size, "created_at": int(target.stat().st_mtime)}}, 201)
+            return
+        if method == "GET" and len(parts) == 5:
+            filename = Path(parts[4]).name
+            if not filename.startswith(f"study_{study_id}_") or not filename.endswith(".sqlite3"):
+                self.send_error_json("Backup not found", 404)
+                return
+            target = (BACKUPS / filename).resolve()
+            if not str(target).startswith(str(BACKUPS.resolve())) or not target.exists():
+                self.send_error_json("Backup not found", 404)
+                return
+            content = target.read_bytes()
+            self.send_response(200)
+            self.send_header("content-type", "application/octet-stream")
+            self.send_header("content-disposition", f"attachment; filename={target.name}")
+            self.send_header("content-length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+            return
+        self.send_error_json("Unsupported backup operation", 405)
 
     def export_codebook(self, conn, study_id: int) -> None:
         forms = rows(conn, "SELECT * FROM forms WHERE study_id = ? ORDER BY id", (study_id,))

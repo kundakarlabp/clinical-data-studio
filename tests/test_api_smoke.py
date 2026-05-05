@@ -46,6 +46,7 @@ class ApiSmokeTests(unittest.TestCase):
     def test_health_login_summary_and_encrypted_backup(self):
         health = self.request_json("/api/health")
         self.assertTrue(health["ok"])
+        self.assertIn("data_folder_encrypted", health["data_protection"])
 
         login = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})
         token = login["token"]
@@ -193,6 +194,7 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertEqual(sent["status"], "sent")
         evidence = self.request_json(f"/api/studies/{study_id}/validation", token=token)
         self.assertGreaterEqual(evidence["counts"]["survey_invitations"], 1)
+        self.assertIn("data_protection", evidence)
         self.assertTrue(evidence["checks"])
 
 

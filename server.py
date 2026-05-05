@@ -345,6 +345,21 @@ def migrate() -> None:
                 UNIQUE(event_id, form_id)
             );
 
+            CREATE TABLE IF NOT EXISTS survey_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+                form_id INTEGER NOT NULL REFERENCES forms(id) ON DELETE CASCADE,
+                event_id INTEGER REFERENCES study_events(id) ON DELETE SET NULL,
+                token TEXT UNIQUE NOT NULL,
+                title TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                consent_required INTEGER NOT NULL DEFAULT 0,
+                consent_text TEXT NOT NULL DEFAULT '',
+                created_by INTEGER REFERENCES users(id),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS form_versions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 form_id INTEGER NOT NULL REFERENCES forms(id) ON DELETE CASCADE,
@@ -421,6 +436,19 @@ def migrate() -> None:
                 user_id INTEGER REFERENCES users(id),
                 created_at INTEGER NOT NULL,
                 UNIQUE(entry_id, field_code, state)
+            );
+
+            CREATE TABLE IF NOT EXISTS consent_signatures (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+                participant_id INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+                entry_id INTEGER REFERENCES entries(id) ON DELETE SET NULL,
+                signer_name TEXT NOT NULL,
+                signature_text TEXT NOT NULL,
+                consent_text TEXT NOT NULL,
+                ip_address TEXT NOT NULL DEFAULT '',
+                user_agent TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS audit_log (
@@ -575,7 +603,7 @@ def normalize_schema(schema: dict) -> dict:
             raise ValueError(f"Duplicate field code: {code}")
         seen.add(code)
         field_type = str(source.get("type", "text")).strip() or "text"
-        if field_type not in {"text", "textarea", "number", "date", "select", "checkbox", "calc"}:
+        if field_type not in {"text", "textarea", "number", "date", "select", "checkbox", "calc", "file"}:
             raise ValueError(f"Unsupported field type: {field_type}")
         field = {
             "code": code,
@@ -648,6 +676,23 @@ def validate_entry_data(schema: dict, data: dict) -> tuple[dict, list[dict]]:
             if invalid:
                 issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} has invalid checkbox options"})
             cleaned[code] = selected
+            continue
+        if field["type"] == "file":
+            if not isinstance(value, dict):
+                issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} must be an uploaded file"})
+                cleaned[code] = {}
+                continue
+            filename = str(value.get("name", "")).strip()
+            data_b64 = str(value.get("data", "")).strip()
+            content_type = str(value.get("type", "application/octet-stream")).strip() or "application/octet-stream"
+            try:
+                raw = base64.b64decode(data_b64, validate=True)
+            except Exception:
+                issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} upload is not valid base64"})
+                raw = b""
+            if raw and len(raw) > 5 * 1024 * 1024:
+                issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} exceeds 5 MB"})
+            cleaned[code] = {"name": filename, "type": content_type, "size": len(raw), "data": data_b64}
             continue
         cleaned[code] = str(value)
     for field in schema.get("fields", []):
@@ -810,6 +855,8 @@ class App(BaseHTTPRequestHandler):
                     return self.login(conn)
                 if path == "/api/logout" and method == "POST":
                     return self.logout(conn)
+                if path.startswith("/api/public/surveys/"):
+                    return self.public_survey(conn, method, path)
                 if path == "/api/setup" and method == "GET":
                     return self.send_json({"required": setup_required(conn)})
                 if path == "/api/setup" and method == "POST":
@@ -913,6 +960,7 @@ class App(BaseHTTPRequestHandler):
         )
         after = row(conn, "SELECT id, username, display_name, role, active, must_change_password FROM users WHERE username = ?", (username,))
         audit(conn, after["id"] if after else None, "first_run_setup", "user", after["id"] if after else None, before, after)
+        conn.commit()
         self.send_json({"ok": True})
 
     def logout(self, conn: sqlite3.Connection) -> None:
@@ -1035,6 +1083,119 @@ class App(BaseHTTPRequestHandler):
         audit(conn, user["id"], "create", "study", cur.lastrowid, None, study)
         self.send_json({"study": study}, 201)
 
+    def public_survey(self, conn: sqlite3.Connection, method: str, path: str) -> None:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            self.send_error_json("Survey link not found", 404)
+            return
+        token = parts[3]
+        survey = row(
+            conn,
+            """
+            SELECT survey_links.*, studies.name AS study_name, studies.protocol_id,
+                   forms.name AS form_name, forms.code AS form_code, forms.schema_json,
+                   study_events.name AS event_name, study_events.code AS event_code
+            FROM survey_links
+            JOIN studies ON studies.id = survey_links.study_id
+            JOIN forms ON forms.id = survey_links.form_id
+            LEFT JOIN study_events ON study_events.id = survey_links.event_id
+            WHERE survey_links.token = ? AND survey_links.enabled = 1
+            """,
+            (token,),
+        )
+        if not survey:
+            self.send_error_json("Survey link not found", 404)
+            return
+        schema = load_json(survey["schema_json"], {"fields": []})
+        if method == "GET":
+            self.send_json(
+                {
+                    "survey": {
+                        "title": survey["title"],
+                        "study_name": survey["study_name"],
+                        "protocol_id": survey["protocol_id"],
+                        "form_name": survey["form_name"],
+                        "event_name": survey.get("event_name") or "Baseline",
+                        "consent_required": bool(survey["consent_required"]),
+                        "consent_text": survey["consent_text"],
+                        "schema": schema,
+                    }
+                }
+            )
+            return
+        if method != "POST":
+            self.send_error_json("Unsupported survey operation", 405)
+            return
+        payload = self.body()
+        participant_payload = payload.get("participant") or {}
+        study_uid = str(participant_payload.get("study_uid", "")).strip()
+        if not study_uid:
+            self.send_error_json("Participant study ID is required", 400)
+            return
+        cleaned, issues = validate_entry_data(schema, payload.get("data") or {})
+        if issues:
+            self.send_json({"errors": issues}, 422)
+            return
+        consent_payload = payload.get("consent") or {}
+        if survey["consent_required"]:
+            signer_name = str(consent_payload.get("signer_name", "")).strip()
+            signature_text = str(consent_payload.get("signature_text", "")).strip()
+            if not signer_name or not signature_text:
+                self.send_error_json("Consent name and signature are required", 400)
+                return
+        timestamp = now()
+        participant = row(conn, "SELECT * FROM participants WHERE study_id = ? AND study_uid = ?", (survey["study_id"], study_uid))
+        if not participant:
+            cur = conn.execute(
+                "INSERT INTO participants(study_id, study_uid, initials, status, metadata_json, created_at, updated_at) VALUES (?, ?, ?, 'screening', '{}', ?, ?)",
+                (survey["study_id"], study_uid, str(participant_payload.get("initials", "")).strip().upper(), timestamp, timestamp),
+            )
+            participant = row(conn, "SELECT * FROM participants WHERE id = ?", (cur.lastrowid,))
+            audit(conn, None, "public_create", "participant", cur.lastrowid, None, participant)
+        event_id = survey.get("event_id")
+        event_name = survey.get("event_code") or "Baseline"
+        existing = row(conn, "SELECT * FROM entries WHERE participant_id = ? AND form_id = ? AND event_name = ? AND repeat_instance = 1", (participant["id"], survey["form_id"], event_name))
+        if existing:
+            if existing.get("locked_at"):
+                self.send_error_json("This submitted CRF is locked and cannot be updated from the public link", 423)
+                return
+            conn.execute(
+                "UPDATE entries SET event_id = ?, data_json = ?, status = 'complete', updated_at = ? WHERE id = ?",
+                (event_id, json.dumps(cleaned), timestamp, existing["id"]),
+            )
+            entry_id = existing["id"]
+            after = row(conn, "SELECT * FROM entries WHERE id = ?", (entry_id,))
+            audit(conn, None, "public_update", "entry", entry_id, existing, after)
+        else:
+            cur = conn.execute(
+                "INSERT INTO entries(study_id, participant_id, form_id, event_id, event_name, repeat_instance, status, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, 'complete', ?, ?, ?)",
+                (survey["study_id"], participant["id"], survey["form_id"], event_id, event_name, json.dumps(cleaned), timestamp, timestamp),
+            )
+            entry_id = cur.lastrowid
+            after = row(conn, "SELECT * FROM entries WHERE id = ?", (entry_id,))
+            audit(conn, None, "public_create", "entry", entry_id, None, after)
+        if survey["consent_required"]:
+            conn.execute(
+                """
+                INSERT INTO consent_signatures(study_id, participant_id, entry_id, signer_name, signature_text, consent_text, ip_address, user_agent, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    survey["study_id"],
+                    participant["id"],
+                    entry_id,
+                    str(consent_payload.get("signer_name", "")).strip(),
+                    str(consent_payload.get("signature_text", "")).strip(),
+                    survey["consent_text"],
+                    self.client_address[0] if self.client_address else "",
+                    self.headers.get("user-agent", ""),
+                    timestamp,
+                ),
+            )
+            audit(conn, None, "sign", "consent", entry_id, None, {"participant_id": participant["id"], "entry_id": entry_id})
+        conn.commit()
+        self.send_json({"ok": True, "participant_id": participant["id"], "entry_id": entry_id}, 201)
+
     def study_routes(self, conn: sqlite3.Connection, user: dict, method: str, path: str, query: dict[str, list[str]]) -> None:
         parts = path.strip("/").split("/")
         if len(parts) < 3:
@@ -1077,6 +1238,11 @@ class App(BaseHTTPRequestHandler):
                 self.send_error_json("Form management permission required", 403)
                 return
             return self.form_events(conn, user, method, study_id, parts)
+        if resource == "surveys":
+            if method != "GET" and not membership_has(membership, "manage_forms"):
+                self.send_error_json("Form management permission required", 403)
+                return
+            return self.surveys(conn, user, method, study_id, parts)
         if resource == "participants":
             if method != "GET" and not membership_has(membership, "enter_data"):
                 self.send_error_json("Data entry permission required", 403)
@@ -1262,6 +1428,86 @@ class App(BaseHTTPRequestHandler):
             self.send_json({"form_event": after}, 201)
             return
         self.send_error_json("Unsupported form-event operation", 405)
+
+    def surveys(self, conn, user, method, study_id, parts) -> None:
+        if method == "GET" and len(parts) == 4:
+            survey_rows = rows(
+                conn,
+                """
+                SELECT survey_links.*, forms.name AS form_name, study_events.name AS event_name
+                FROM survey_links
+                JOIN forms ON forms.id = survey_links.form_id
+                LEFT JOIN study_events ON study_events.id = survey_links.event_id
+                WHERE survey_links.study_id = ?
+                ORDER BY survey_links.updated_at DESC
+                """,
+                (study_id,),
+            )
+            self.send_json({"surveys": survey_rows})
+            return
+        if method == "POST" and len(parts) == 4:
+            payload = self.body()
+            form_id = int(payload.get("form_id") or 0)
+            event_id = payload.get("event_id")
+            form = row(conn, "SELECT * FROM forms WHERE id = ? AND study_id = ?", (form_id, study_id))
+            if not form:
+                self.send_error_json("Form not found", 404)
+                return
+            if event_id:
+                event = row(conn, "SELECT * FROM study_events WHERE id = ? AND study_id = ?", (int(event_id), study_id))
+                if not event:
+                    self.send_error_json("Event not found", 404)
+                    return
+                event_id = event["id"]
+            else:
+                event_id = None
+            timestamp = now()
+            cur = conn.execute(
+                """
+                INSERT INTO survey_links(study_id, form_id, event_id, token, title, enabled, consent_required, consent_text, created_by, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    study_id,
+                    form_id,
+                    event_id,
+                    secrets.token_urlsafe(24),
+                    str(payload.get("title", form["name"])).strip() or form["name"],
+                    1,
+                    1 if payload.get("consent_required") else 0,
+                    str(payload.get("consent_text", "")).strip(),
+                    user["id"],
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            after = row(conn, "SELECT * FROM survey_links WHERE id = ?", (cur.lastrowid,))
+            audit(conn, user["id"], "create", "survey_link", cur.lastrowid, None, after)
+            self.send_json({"survey": after}, 201)
+            return
+        if method == "PATCH" and len(parts) == 5:
+            survey_id = int(parts[4])
+            before = row(conn, "SELECT * FROM survey_links WHERE id = ? AND study_id = ?", (survey_id, study_id))
+            if not before:
+                self.send_error_json("Survey link not found", 404)
+                return
+            payload = self.body()
+            conn.execute(
+                "UPDATE survey_links SET title = ?, enabled = ?, consent_required = ?, consent_text = ?, updated_at = ? WHERE id = ?",
+                (
+                    str(payload.get("title", before["title"])).strip() or before["title"],
+                    1 if payload.get("enabled", bool(before["enabled"])) else 0,
+                    1 if payload.get("consent_required", bool(before["consent_required"])) else 0,
+                    str(payload.get("consent_text", before["consent_text"])).strip(),
+                    now(),
+                    survey_id,
+                ),
+            )
+            after = row(conn, "SELECT * FROM survey_links WHERE id = ?", (survey_id,))
+            audit(conn, user["id"], "update", "survey_link", survey_id, before, after)
+            self.send_json({"survey": after})
+            return
+        self.send_error_json("Unsupported survey operation", 405)
 
     def dictionary(self, conn, user, method, study_id) -> None:
         if method != "POST":

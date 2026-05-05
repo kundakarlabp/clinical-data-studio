@@ -131,6 +131,53 @@ class ApiSmokeTests(unittest.TestCase):
         history = self.request_json(f"/api/studies/{study_id}/entries/{entry['id']}/history", token=token)
         self.assertTrue(history["history"])
 
+    def test_public_survey_with_consent_and_file_upload(self):
+        token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]
+        study_id = self.request_json("/api/studies", token=token)["studies"][0]["id"]
+        forms = self.request_json(f"/api/studies/{study_id}/forms", token=token)["forms"]
+        form_id = forms[0]["id"]
+        schema = forms[0]["schema"]
+        schema["fields"].append({"code": "attachment", "label": "Attachment", "type": "file", "required": False})
+        self.request_json(
+            f"/api/studies/{study_id}/forms/{form_id}",
+            "PATCH",
+            {"name": forms[0]["name"], "code": forms[0]["code"], "schema": schema},
+            token,
+        )
+        survey = self.request_json(
+            f"/api/studies/{study_id}/surveys",
+            "POST",
+            {
+                "title": "Public Intake",
+                "form_id": form_id,
+                "consent_required": True,
+                "consent_text": "I agree to submit this research form.",
+            },
+            token,
+        )["survey"]
+
+        public = self.request_json(f"/api/public/surveys/{survey['token']}")["survey"]
+        self.assertTrue(public["consent_required"])
+        submit = self.request_json(
+            f"/api/public/surveys/{survey['token']}",
+            "POST",
+            {
+                "participant": {"study_uid": "PUB001", "initials": "PB"},
+                "data": {
+                    "age": "33",
+                    "sex": "Male",
+                    "consent_date": "2026-05-05",
+                    "diagnosis": "Registry",
+                    "attachment": {"name": "note.txt", "type": "text/plain", "data": "SGVsbG8="},
+                },
+                "consent": {"signer_name": "Public User", "signature_text": "Public User"},
+            },
+        )
+        self.assertTrue(submit["ok"])
+        entries = self.request_json(f"/api/studies/{study_id}/entries", token=token)["entries"]
+        entry = next(item for item in entries if item["study_uid"] == "PUB001")
+        self.assertEqual(entry["data"]["attachment"]["name"], "note.txt")
+
 
 if __name__ == "__main__":
     unittest.main()

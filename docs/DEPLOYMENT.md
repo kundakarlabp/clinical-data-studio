@@ -33,6 +33,12 @@ Use the Backups page before CRF dictionary imports, CRF edits, or study review e
 - Store archive passphrases separately from the backup files.
 - Keep at least one copy on an encrypted external drive.
 
+## Public Survey Links
+
+Survey links are LAN/public-within-your-network URLs created from the Surveys page. Share them only on trusted networks. Each link uses an unguessable token, but anyone with the link can submit data until the link is disabled.
+
+For consent-required surveys, the app records signer name, typed signature, consent text, client IP address, browser user agent, and timestamp.
+
 ## Health Check
 
 For quick startup verification:
@@ -46,6 +52,17 @@ Expected response:
 ```json
 {"ok":true,"app":"Clinical Data Studio","database":true}
 ```
+
+## Start At Login
+
+To install a Windows scheduled task for the current user:
+
+```powershell
+.\install_service_task.ps1
+Start-ScheduledTask -TaskName ClinicalDataStudio
+```
+
+Use this only on the designated study computer after confirming backups and validation records.
 
 ## Validation Reminder
 

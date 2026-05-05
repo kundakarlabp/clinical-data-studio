@@ -23,6 +23,15 @@ class FrontendStaticTests(unittest.TestCase):
         self.assertIn("First Run Setup", app_js)
         self.assertIn("/records/import", app_js)
         self.assertIn("/history", app_js)
+        self.assertIn("/surveys", app_js)
+        self.assertIn("type=\"file\"", app_js)
+
+    def test_public_survey_shell_is_present(self):
+        survey_html = (ROOT / "static" / "survey.html").read_text(encoding="utf-8")
+        survey_js = (ROOT / "static" / "survey.js").read_text(encoding="utf-8")
+        self.assertIn('name="viewport"', survey_html)
+        self.assertIn("/api/public/surveys/", survey_js)
+        self.assertIn("Consent", survey_js)
 
 
 if __name__ == "__main__":

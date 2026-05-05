@@ -9,8 +9,8 @@ import json
 import mimetypes
 import os
 import secrets
-import shutil
 import sqlite3
+import tempfile
 import time
 from io import StringIO
 from http import HTTPStatus
@@ -92,6 +92,73 @@ def verify_password(password: str, encoded: str) -> bool:
         return hmac.compare_digest(actual, expected)
     except Exception:
         return False
+
+
+def archive_key(passphrase: str, salt: bytes) -> bytes:
+    return hashlib.pbkdf2_hmac("sha256", passphrase.encode("utf-8"), salt, PBKDF2_ROUNDS)
+
+
+def hmac_stream(key: bytes, nonce: bytes, length: int) -> bytes:
+    blocks = []
+    counter = 0
+    while sum(len(block) for block in blocks) < length:
+        counter += 1
+        blocks.append(hmac.new(key, nonce + counter.to_bytes(8, "big"), hashlib.sha256).digest())
+    return b"".join(blocks)[:length]
+
+
+def xor_bytes(data: bytes, stream: bytes) -> bytes:
+    return bytes(left ^ right for left, right in zip(data, stream))
+
+
+def encrypted_archive_bytes(plain: bytes, passphrase: str) -> bytes:
+    if len(passphrase) < 12:
+        raise ValueError("Encrypted archive passphrase must be at least 12 characters")
+    salt = secrets.token_bytes(16)
+    nonce = secrets.token_bytes(16)
+    key = archive_key(passphrase, salt)
+    cipher = xor_bytes(plain, hmac_stream(key, nonce, len(plain)))
+    header = {
+        "format": "CDSENC1",
+        "kdf": "pbkdf2_hmac_sha256",
+        "rounds": PBKDF2_ROUNDS,
+        "salt": base64.b64encode(salt).decode("ascii"),
+        "nonce": base64.b64encode(nonce).decode("ascii"),
+        "note": "Passphrase-protected local archive. Keep the passphrase separately.",
+    }
+    header_bytes = json.dumps(header, sort_keys=True).encode("utf-8")
+    tag = hmac.new(key, header_bytes + cipher, hashlib.sha256).digest()
+    return b"CDSENC1\n" + len(header_bytes).to_bytes(4, "big") + header_bytes + cipher + tag
+
+
+def decrypted_archive_bytes(archive: bytes, passphrase: str) -> bytes:
+    if not archive.startswith(b"CDSENC1\n") or len(archive) < 44:
+        raise ValueError("Unsupported encrypted archive format")
+    header_length = int.from_bytes(archive[8:12], "big")
+    header_start = 12
+    header_end = header_start + header_length
+    header_bytes = archive[header_start:header_end]
+    header = json.loads(header_bytes.decode("utf-8"))
+    if header.get("format") != "CDSENC1" or int(header.get("rounds", 0)) != PBKDF2_ROUNDS:
+        raise ValueError("Unsupported encrypted archive format")
+    salt = base64.b64decode(header["salt"])
+    nonce = base64.b64decode(header["nonce"])
+    key = archive_key(passphrase, salt)
+    cipher = archive[header_end:-32]
+    tag = archive[-32:]
+    expected = hmac.new(key, header_bytes + cipher, hashlib.sha256).digest()
+    if not hmac.compare_digest(tag, expected):
+        raise ValueError("Encrypted archive passphrase is incorrect or the file is damaged")
+    return xor_bytes(cipher, hmac_stream(key, nonce, len(cipher)))
+
+
+def write_sqlite_backup(conn: sqlite3.Connection, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    destination = sqlite3.connect(target)
+    try:
+        conn.backup(destination)
+    finally:
+        destination.close()
 
 
 def rows(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> list[dict]:
@@ -734,6 +801,8 @@ class App(BaseHTTPRequestHandler):
                     return self.login(conn)
                 if path == "/api/logout" and method == "POST":
                     return self.logout(conn)
+                if path == "/api/health" and method == "GET":
+                    return self.send_json({"ok": True, "app": "Clinical Data Studio", "database": DB_PATH.exists()})
 
                 user = self.require_user(conn)
                 if not user:
@@ -771,6 +840,8 @@ class App(BaseHTTPRequestHandler):
                         return
                     return self.send_json({"audit": rows(conn, "SELECT audit_log.*, users.display_name FROM audit_log LEFT JOIN users ON users.id = audit_log.user_id ORDER BY audit_log.id DESC LIMIT 250")})
                 self.send_error_json("Unknown endpoint", 404)
+        except ValueError as exc:
+            self.send_error_json(str(exc), 400)
         except sqlite3.IntegrityError as exc:
             self.send_error_json(f"Data conflict: {exc}", 409)
         except json.JSONDecodeError:
@@ -789,6 +860,7 @@ class App(BaseHTTPRequestHandler):
         token = secrets.token_urlsafe(32)
         conn.execute("INSERT INTO sessions(token, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)", (token, user["id"], now() + 60 * 60 * 24 * 14, now()))
         audit(conn, user["id"], "login", "session", None, None, {"username": username})
+        conn.commit()
         self.send_json({"token": token, "user": {"id": user["id"], "username": user["username"], "display_name": user["display_name"], "role": user["role"], "must_change_password": user.get("must_change_password", 0)}})
 
     def logout(self, conn: sqlite3.Connection) -> None:
@@ -984,6 +1056,11 @@ class App(BaseHTTPRequestHandler):
                 self.send_error_json("Analysis permission required", 403)
                 return
             return self.analysis(conn, study_id, membership)
+        if resource == "assist" and method == "GET" and len(parts) == 5 and parts[4] == "summary":
+            if not membership_has(membership, "view_analysis") and not membership_has(membership, "review_data"):
+                self.send_error_json("Analysis permission required", 403)
+                return
+            return self.assist_summary(conn, study_id, membership)
         if resource == "reports":
             if not membership_has(membership, "view_analysis") and not membership_has(membership, "export_data"):
                 self.send_error_json("Report permission required", 403)
@@ -1675,6 +1752,67 @@ class App(BaseHTTPRequestHandler):
         open_queries = row(conn, "SELECT COUNT(*) AS count FROM queries WHERE study_id = ? AND status = 'open'", (study_id,))["count"]
         self.send_json({"participant_count": len(participants), "entry_count": len(entries), "completed_entry_count": completed, "open_query_count": open_queries, "field_summaries": summaries})
 
+    def assist_summary(self, conn, study_id: int, membership) -> None:
+        group_join = ""
+        group_where = ""
+        params: list = [study_id]
+        if membership.get("data_group_id"):
+            group_join = "JOIN participants ON participants.id = entries.participant_id"
+            group_where = " AND participants.data_group_id = ?"
+            params.append(membership["data_group_id"])
+        participant_sql = "SELECT COUNT(*) AS count FROM participants WHERE study_id = ?"
+        participant_params: tuple = (study_id,)
+        if membership.get("data_group_id"):
+            participant_sql += " AND data_group_id = ?"
+            participant_params = (study_id, membership["data_group_id"])
+        participant_count = row(conn, participant_sql, participant_params)["count"]
+        entry_count = row(conn, f"SELECT COUNT(*) AS count FROM entries {group_join} WHERE entries.study_id = ?{group_where}", tuple(params))["count"]
+        complete_count = row(conn, f"SELECT COUNT(*) AS count FROM entries {group_join} WHERE entries.study_id = ? AND entries.status = 'complete'{group_where}", tuple(params))["count"]
+        open_queries = row(conn, "SELECT COUNT(*) AS count FROM queries WHERE study_id = ? AND status = 'open'", (study_id,))["count"]
+        issue_count = 0
+        quality_rows = rows(
+            conn,
+            f"""
+            SELECT entries.data_json, forms.schema_json
+            FROM entries
+            JOIN forms ON forms.id = entries.form_id
+            {group_join}
+            WHERE entries.study_id = ?{group_where}
+            """,
+            tuple(params),
+        )
+        for entry in quality_rows:
+            _, issues = validate_entry_data(load_json(entry["schema_json"], {"fields": []}), load_json(entry["data_json"], {}))
+            issue_count += len(issues)
+        warnings = []
+        if open_queries:
+            warnings.append(f"{open_queries} open review querie(s) should be resolved or documented before analysis export.")
+        if issue_count:
+            warnings.append(f"{issue_count} quality issue(s) are currently visible.")
+        if entry_count and complete_count < entry_count:
+            warnings.append(f"{entry_count - complete_count} CRF entrie(s) are still draft.")
+        if not participant_count:
+            warnings.append("No participants are enrolled yet.")
+        if not warnings:
+            warnings.append("No immediate query, completion, or edit-check blockers were detected.")
+        self.send_json(
+            {
+                "summary": {
+                    "participant_count": participant_count,
+                    "entry_count": entry_count,
+                    "completed_entry_count": complete_count,
+                    "open_query_count": open_queries,
+                    "quality_issue_count": issue_count,
+                    "warnings": warnings,
+                    "next_steps": [
+                        "Review open queries and field verification states.",
+                        "Export the codebook with every analysis dataset.",
+                        "Create a local backup before major CRF edits or data imports.",
+                    ],
+                }
+            }
+        )
+
     def export_csv(self, conn, study_id: int, membership) -> None:
         return self.export_entries_csv(conn, study_id, membership, {}, "clinical_data_export.csv")
 
@@ -1779,22 +1917,37 @@ class App(BaseHTTPRequestHandler):
         BACKUPS.mkdir(parents=True, exist_ok=True)
         if method == "GET" and len(parts) == 4:
             files = []
-            for item in sorted(BACKUPS.glob("*.sqlite3"), key=lambda path: path.stat().st_mtime, reverse=True):
-                if item.name.startswith(f"study_{study_id}_"):
-                    files.append({"name": item.name, "size": item.stat().st_size, "created_at": int(item.stat().st_mtime)})
+            for item in sorted(BACKUPS.iterdir(), key=lambda path: path.stat().st_mtime, reverse=True):
+                if item.is_file() and item.name.startswith(f"study_{study_id}_") and item.suffix in (".sqlite3", ".cdsenc"):
+                    files.append({"name": item.name, "size": item.stat().st_size, "created_at": int(item.stat().st_mtime), "encrypted": item.suffix == ".cdsenc"})
             self.send_json({"backups": files})
             return
         if method == "POST" and len(parts) == 4:
+            payload = self.body()
             timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-            target = BACKUPS / f"study_{study_id}_{timestamp}.sqlite3"
             conn.commit()
-            shutil.copy2(DB_PATH, target)
+            passphrase = str(payload.get("passphrase", ""))
+            if passphrase:
+                target = BACKUPS / f"study_{study_id}_{timestamp}.cdsenc"
+                with tempfile.NamedTemporaryFile(delete=False, dir=BACKUPS, suffix=".sqlite3") as temporary:
+                    plain_target = Path(temporary.name)
+                try:
+                    write_sqlite_backup(conn, plain_target)
+                    target.write_bytes(encrypted_archive_bytes(plain_target.read_bytes(), passphrase))
+                finally:
+                    if plain_target.exists():
+                        plain_target.unlink()
+                audit(conn, user["id"], "create_encrypted", "backup", study_id, None, {"filename": target.name})
+                self.send_json({"backup": {"name": target.name, "size": target.stat().st_size, "created_at": int(target.stat().st_mtime), "encrypted": True}}, 201)
+                return
+            target = BACKUPS / f"study_{study_id}_{timestamp}.sqlite3"
+            write_sqlite_backup(conn, target)
             audit(conn, user["id"], "create", "backup", study_id, None, {"filename": target.name})
-            self.send_json({"backup": {"name": target.name, "size": target.stat().st_size, "created_at": int(target.stat().st_mtime)}}, 201)
+            self.send_json({"backup": {"name": target.name, "size": target.stat().st_size, "created_at": int(target.stat().st_mtime), "encrypted": False}}, 201)
             return
         if method == "GET" and len(parts) == 5:
             filename = Path(parts[4]).name
-            if not filename.startswith(f"study_{study_id}_") or not filename.endswith(".sqlite3"):
+            if not filename.startswith(f"study_{study_id}_") or not (filename.endswith(".sqlite3") or filename.endswith(".cdsenc")):
                 self.send_error_json("Backup not found", 404)
                 return
             target = (BACKUPS / filename).resolve()
@@ -1810,19 +1963,35 @@ class App(BaseHTTPRequestHandler):
             self.wfile.write(content)
             return
         if method == "POST" and len(parts) == 6 and parts[5] == "restore":
+            payload = self.body()
             filename = Path(parts[4]).name
-            if not filename.startswith(f"study_{study_id}_") or not filename.endswith(".sqlite3"):
+            if not filename.startswith(f"study_{study_id}_") or not (filename.endswith(".sqlite3") or filename.endswith(".cdsenc")):
                 self.send_error_json("Backup not found", 404)
                 return
             target = (BACKUPS / filename).resolve()
             if not str(target).startswith(str(BACKUPS.resolve())) or not target.exists():
                 self.send_error_json("Backup not found", 404)
                 return
-            source = sqlite3.connect(target)
+            restore_target = target
+            cleanup_target = None
+            if filename.endswith(".cdsenc"):
+                passphrase = str(payload.get("passphrase", ""))
+                if not passphrase:
+                    self.send_error_json("Encrypted backup passphrase is required", 400)
+                    return
+                with tempfile.NamedTemporaryFile(delete=False, dir=BACKUPS, suffix=".sqlite3") as temporary:
+                    temporary.write(decrypted_archive_bytes(target.read_bytes(), passphrase))
+                    cleanup_target = Path(temporary.name)
+                    restore_target = cleanup_target
             try:
-                source.backup(conn)
+                source = sqlite3.connect(restore_target)
+                try:
+                    source.backup(conn)
+                finally:
+                    source.close()
             finally:
-                source.close()
+                if cleanup_target and cleanup_target.exists():
+                    cleanup_target.unlink()
             audit(conn, user["id"], "restore", "backup", study_id, None, {"filename": filename})
             self.send_json({"restored": filename})
             return

@@ -18,6 +18,7 @@ const state = {
   quality: [],
   audit: [],
   analysis: null,
+  assistantSummary: null,
   view: "dashboard",
   selectedParticipantId: 0,
   selectedEventId: Number(localStorage.getItem("cds_event_id") || 0),
@@ -81,7 +82,7 @@ async function loadStudy() {
   if (!state.studyId) return;
   const manageUsers = can("manage_users");
   const viewAnalysis = can("view_analysis") || can("review_data");
-  const [forms, events, formEvents, reports, backups, participants, entries, queries, quality, analysis, audit, groups, studyMembers, users] = await Promise.all([
+  const [forms, events, formEvents, reports, backups, participants, entries, queries, quality, analysis, assistantSummary, audit, groups, studyMembers, users] = await Promise.all([
     api(`/api/studies/${state.studyId}/forms`),
     api(`/api/studies/${state.studyId}/events`),
     api(`/api/studies/${state.studyId}/form-events`),
@@ -92,6 +93,7 @@ async function loadStudy() {
     api(`/api/studies/${state.studyId}/queries`),
     api(`/api/studies/${state.studyId}/quality`),
     viewAnalysis ? api(`/api/studies/${state.studyId}/analysis`) : Promise.resolve({ participant_count: 0, entry_count: 0, completed_entry_count: 0, open_query_count: 0, field_summaries: [] }),
+    viewAnalysis ? api(`/api/studies/${state.studyId}/assist/summary`) : Promise.resolve({ summary: null }),
     can("review_data") ? api(`/api/studies/${state.studyId}/audit`) : Promise.resolve({ audit: [] }),
     api(`/api/studies/${state.studyId}/groups`),
     manageUsers ? api(`/api/studies/${state.studyId}/memberships`) : Promise.resolve({ memberships: [] }),
@@ -110,6 +112,7 @@ async function loadStudy() {
   state.queries = queries.queries;
   state.quality = quality.issues;
   state.analysis = analysis;
+  state.assistantSummary = assistantSummary.summary;
   state.audit = audit.audit;
   state.groups = groups.groups;
   state.studyMembers = studyMembers.memberships;
@@ -602,11 +605,21 @@ function qualityView() {
 
 function analysisView() {
   const summaries = state.analysis?.field_summaries || [];
+  const assistant = state.assistantSummary;
   return `
     <section class="grid three">
       ${metric("Participants", state.analysis?.participant_count || 0, "Study records")}
       ${metric("Completed CRFs", state.analysis?.completed_entry_count || 0, "Marked complete")}
       ${metric("Open Queries", state.analysis?.open_query_count || 0, "Data issues")}
+    </section>
+    <section class="panel">
+      <h2>Assistant Review</h2>
+      ${assistant ? `
+        <div class="grid two">
+          <div class="notice">${escapeHtml((assistant.warnings || []).join(" "))}</div>
+          <div class="notice">${escapeHtml((assistant.next_steps || []).join(" "))}</div>
+        </div>
+      ` : "<p>No assistant summary available.</p>"}
     </section>
     <section class="panel">
       <h2>Field Summary</h2>
@@ -709,6 +722,10 @@ function backupsView() {
         <button id="backup-create">Create Backup</button>
       </div>
       <p>Backups are local SQLite snapshots stored under the app data folder. Keep copies on an encrypted external drive for real studies.</p>
+      <form id="encrypted-backup-form" class="form-grid">
+        <label>Archive passphrase<input name="passphrase" type="password" minlength="12" placeholder="12+ characters" /></label>
+        <div><button class="secondary">Create Encrypted Archive</button></div>
+      </form>
       ${state.backups.length ? `
         <div class="table-wrap">
           <table>
@@ -716,12 +733,12 @@ function backupsView() {
             <tbody>
               ${state.backups.map((backup) => `
                 <tr>
-                  <td>${escapeHtml(backup.name)}</td>
+                  <td>${escapeHtml(backup.name)} ${backup.encrypted ? `<span class="pill ok">encrypted</span>` : ""}</td>
                   <td>${Math.round(backup.size / 1024)} KB</td>
                   <td>${fmtTime(backup.created_at)}</td>
                   <td>
                     <a href="/api/studies/${state.studyId}/backups/${encodeURIComponent(backup.name)}" target="_blank"><button class="secondary">Download</button></a>
-                    <button class="warning" data-restore-backup="${escapeHtml(backup.name)}">Restore</button>
+                    <button class="warning" data-restore-backup="${escapeHtml(backup.name)}" data-encrypted="${backup.encrypted ? "true" : "false"}">Restore</button>
                   </td>
                 </tr>
               `).join("")}
@@ -895,7 +912,8 @@ function bindRoute() {
   document.querySelector("#form-event-form")?.addEventListener("submit", submitFormEvent);
   document.querySelector("#report-form")?.addEventListener("submit", submitReport);
   document.querySelector("#backup-create")?.addEventListener("click", createBackup);
-  document.querySelectorAll("[data-restore-backup]").forEach((button) => button.addEventListener("click", () => restoreBackup(button.dataset.restoreBackup)));
+  document.querySelector("#encrypted-backup-form")?.addEventListener("submit", createEncryptedBackup);
+  document.querySelectorAll("[data-restore-backup]").forEach((button) => button.addEventListener("click", () => restoreBackup(button.dataset.restoreBackup, button.dataset.encrypted === "true")));
   document.querySelector("#form-builder")?.addEventListener("submit", submitFormDefinition);
   document.querySelector("#dictionary-form")?.addEventListener("submit", submitDictionary);
   document.querySelector("#assist-crf-form")?.addEventListener("submit", submitAssistCrf);
@@ -1108,6 +1126,20 @@ async function createBackup() {
   }
 }
 
+async function createEncryptedBackup(event) {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(event.target));
+  try {
+    await api(`/api/studies/${state.studyId}/backups`, { method: "POST", body: JSON.stringify({ passphrase: data.passphrase }) });
+    event.target.reset();
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
 async function submitFormDefinition(event) {
   event.preventDefault();
   const formData = new FormData(event.target);
@@ -1149,10 +1181,12 @@ async function submitFormDefinition(event) {
   }
 }
 
-async function restoreBackup(name) {
+async function restoreBackup(name, encrypted = false) {
   if (!confirm(`Restore backup ${name}? Current database will be replaced by this backup.`)) return;
+  const passphrase = encrypted ? prompt("Encrypted archive passphrase") : "";
+  if (encrypted && !passphrase) return;
   try {
-    await api(`/api/studies/${state.studyId}/backups/${encodeURIComponent(name)}/restore`, { method: "POST", body: "{}" });
+    await api(`/api/studies/${state.studyId}/backups/${encodeURIComponent(name)}/restore`, { method: "POST", body: JSON.stringify({ passphrase }) });
     await loadAll();
   } catch (error) {
     state.error = error.message;

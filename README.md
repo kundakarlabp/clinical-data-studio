@@ -53,11 +53,14 @@ Implemented foundation:
 - Query response history
 - Saved reports and filtered report export
 - Local backup, download, and restore
+- Optional passphrase-protected encrypted archive export
+- Health endpoint and local LAN start helper
 - Local CRF draft assistant from pasted text
+- Local analysis/review assistant summary
+- API and mobile shell regression tests
 
 Next planned build steps:
 
-- Browser/mobile regression tests
-- Optional encrypted archive export
-- Advanced AI-assisted codebook and de-identified analysis summaries
 - Desktop shortcut/installer packaging
+- Optional audited database-at-rest encryption layer
+- Broader browser automation across common Android/iOS viewport sizes

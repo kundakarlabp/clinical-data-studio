@@ -55,11 +55,15 @@ Implemented foundation:
 - Local analysis/review assistant summary
 - Record CSV import into participant CRFs
 - Entry history and field-state review visibility
+- Public survey links for local-network participant entry
+- E-consent style name/signature capture tied to survey submissions
+- File upload fields stored inside CRF data records
+- Windows scheduled-task start-at-login helper
+- Validation execution record template
 - API and mobile shell regression tests
 
 Next planned build steps:
 
-- Desktop shortcut/installer packaging
 - Optional audited database-at-rest encryption layer
 - Broader browser automation across common Android/iOS viewport sizes
-- Survey/public form mode and e-consent flow
+- Advanced survey invitations and reminder tracking

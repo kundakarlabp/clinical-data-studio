@@ -10,6 +10,7 @@ const state = {
   studyMembers: [],
   events: [],
   formEvents: [],
+  surveyLinks: [],
   reports: [],
   backups: [],
   forms: [],
@@ -86,10 +87,11 @@ async function loadStudy() {
   if (!state.studyId) return;
   const manageUsers = can("manage_users");
   const viewAnalysis = can("view_analysis") || can("review_data");
-  const [forms, events, formEvents, reports, backups, participants, entries, queries, quality, analysis, assistantSummary, audit, groups, studyMembers, users] = await Promise.all([
+  const [forms, events, formEvents, surveyLinks, reports, backups, participants, entries, queries, quality, analysis, assistantSummary, audit, groups, studyMembers, users] = await Promise.all([
     api(`/api/studies/${state.studyId}/forms`),
     api(`/api/studies/${state.studyId}/events`),
     api(`/api/studies/${state.studyId}/form-events`),
+    can("manage_forms") ? api(`/api/studies/${state.studyId}/surveys`) : Promise.resolve({ surveys: [] }),
     viewAnalysis ? api(`/api/studies/${state.studyId}/reports`) : Promise.resolve({ reports: [] }),
     can("manage_study") ? api(`/api/studies/${state.studyId}/backups`) : Promise.resolve({ backups: [] }),
     api(`/api/studies/${state.studyId}/participants`),
@@ -106,6 +108,7 @@ async function loadStudy() {
   state.forms = forms.forms;
   state.events = events.events;
   state.formEvents = formEvents.form_events;
+  state.surveyLinks = surveyLinks.surveys;
   state.reports = reports.reports;
   state.backups = backups.backups;
   if (!state.selectedEventId && state.events[0]) state.selectedEventId = state.events[0].id;
@@ -163,6 +166,7 @@ function render() {
           ${navButton("data", "Data Entry")}
           ${navButton("forms", "CRF Builder")}
           ${can("manage_forms") ? navButton("dictionary", "Dictionary") : ""}
+          ${can("manage_forms") ? navButton("surveys", "Surveys") : ""}
           ${can("manage_study") ? navButton("events", "Events") : ""}
           ${navButton("queries", "Review Queries")}
           ${navButton("quality", "Data Quality")}
@@ -211,6 +215,7 @@ function route() {
   if (state.view === "data") return dataView();
   if (state.view === "forms") return formsView();
   if (state.view === "dictionary") return dictionaryView();
+  if (state.view === "surveys") return surveysView();
   if (state.view === "events") return eventsView();
   if (state.view === "queries") return queriesView();
   if (state.view === "quality") return qualityView();
@@ -391,6 +396,10 @@ function fieldInput(field, data) {
   if (field.type === "calc") {
     return `<label ${visibility}>${escapeHtml(field.label)}<input name="${escapeHtml(field.code)}" value="${escapeHtml(value)}" readonly placeholder="${escapeHtml(field.calculation || "Calculated on save")}" /></label>`;
   }
+  if (field.type === "file") {
+    const fileName = value?.name ? `<span class="small">Current file: ${escapeHtml(value.name)} (${Math.round((value.size || 0) / 1024)} KB)</span>` : "";
+    return `<label ${visibility}>${escapeHtml(field.label)}<input name="${escapeHtml(field.code)}" type="file" ${required} />${fileName}</label>`;
+  }
   const attrs = [`name="${escapeHtml(field.code)}"`, `value="${escapeHtml(value)}"`, required];
   if (field.type === "number") {
     attrs.push('type="number"', field.min !== undefined ? `min="${field.min}"` : "", field.max !== undefined ? `max="${field.max}"` : "", "step='any'");
@@ -535,6 +544,61 @@ function eventsView() {
   `;
 }
 
+function surveysView() {
+  const origin = window.location.origin;
+  return `
+    <section class="panel">
+      <h2>Create Public Survey Link</h2>
+      <form id="survey-link-form" class="form-grid">
+        <label>Title<input name="title" required placeholder="Baseline Intake Survey" /></label>
+        <label>CRF
+          <select name="form_id" required>
+            ${state.forms.map((form) => `<option value="${form.id}">${escapeHtml(form.name)}</option>`).join("")}
+          </select>
+        </label>
+        <label>Event
+          <select name="event_id">
+            <option value="">Baseline/default</option>
+            ${state.events.map((event) => `<option value="${event.id}">${escapeHtml(event.name)}</option>`).join("")}
+          </select>
+        </label>
+        <label>Consent required
+          <select name="consent_required">
+            <option value="false">No</option>
+            <option value="true">Yes</option>
+          </select>
+        </label>
+        <label class="full">Consent text<textarea name="consent_text" placeholder="I confirm that I have read the study information and agree to submit this form."></textarea></label>
+        <div class="full"><button>Create Survey Link</button></div>
+      </form>
+    </section>
+    <section class="panel">
+      <h2>Active Survey Links</h2>
+      ${state.surveyLinks.length ? `
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Title</th><th>CRF</th><th>Event</th><th>Consent</th><th>Link</th></tr></thead>
+            <tbody>
+              ${state.surveyLinks.map((survey) => {
+                const link = `${origin}/survey.html?token=${encodeURIComponent(survey.token)}`;
+                return `
+                  <tr>
+                    <td><strong>${escapeHtml(survey.title)}</strong><br><span class="pill ${survey.enabled ? "ok" : "bad"}">${survey.enabled ? "enabled" : "disabled"}</span></td>
+                    <td>${escapeHtml(survey.form_name)}</td>
+                    <td>${escapeHtml(survey.event_name || "Baseline")}</td>
+                    <td>${survey.consent_required ? "Required" : "No"}</td>
+                    <td><a href="${link}" target="_blank">${escapeHtml(link)}</a></td>
+                  </tr>
+                `;
+              }).join("")}
+            </tbody>
+          </table>
+        </div>
+      ` : "<p>No survey links yet.</p>"}
+    </section>
+  `;
+}
+
 function fieldEditorRow(field = null) {
   return `
     <div class="field-editor">
@@ -542,7 +606,7 @@ function fieldEditorRow(field = null) {
       <label>Code<input name="field_code" required placeholder="systolic_bp" value="${escapeHtml(field?.code || "")}" /></label>
       <label>Type
         <select name="field_type">
-          ${["text", "number", "date", "select", "checkbox", "textarea", "calc"].map((type) => `<option value="${type}" ${field?.type === type ? "selected" : ""}>${type}</option>`).join("")}
+          ${["text", "number", "date", "select", "checkbox", "textarea", "calc", "file"].map((type) => `<option value="${type}" ${field?.type === type ? "selected" : ""}>${type}</option>`).join("")}
         </select>
       </label>
       <label>Required<select name="field_required"><option value="false" ${field?.required ? "" : "selected"}>No</option><option value="true" ${field?.required ? "selected" : ""}>Yes</option></select></label>
@@ -922,6 +986,7 @@ function bindRoute() {
   document.querySelector("#membership-form")?.addEventListener("submit", submitMembership);
   document.querySelector("#event-form")?.addEventListener("submit", submitEvent);
   document.querySelector("#form-event-form")?.addEventListener("submit", submitFormEvent);
+  document.querySelector("#survey-link-form")?.addEventListener("submit", submitSurveyLink);
   document.querySelector("#report-form")?.addEventListener("submit", submitReport);
   document.querySelector("#backup-create")?.addEventListener("click", createBackup);
   document.querySelector("#encrypted-backup-form")?.addEventListener("submit", createEncryptedBackup);
@@ -1099,6 +1164,40 @@ async function submitFormEvent(event) {
         event_id: Number(data.event_id),
         form_id: Number(data.form_id),
         required: data.required === "true",
+      }),
+    });
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+function fileToPayload(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Could not read file"));
+    reader.onload = () => {
+      const dataUrl = String(reader.result || "");
+      resolve({ name: file.name, type: file.type || "application/octet-stream", size: file.size, data: dataUrl.split(",", 2)[1] || "" });
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+async function submitSurveyLink(event) {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(event.target));
+  try {
+    await api(`/api/studies/${state.studyId}/surveys`, {
+      method: "POST",
+      body: JSON.stringify({
+        title: data.title,
+        form_id: Number(data.form_id),
+        event_id: data.event_id ? Number(data.event_id) : null,
+        consent_required: data.consent_required === "true",
+        consent_text: data.consent_text || "",
       }),
     });
     await loadStudy();
@@ -1288,15 +1387,23 @@ async function submitEntry(event) {
   const data = {};
   const payload = Object.fromEntries(new FormData(form));
   const formDef = state.forms.find((item) => item.id === Number(form.dataset.formId));
-  formDef.schema.fields.forEach((field) => {
+  for (const field of formDef.schema.fields) {
     if (!form.querySelector(`[name="${field.code}"]`)?.closest(".hidden")) {
       if (field.type === "checkbox") {
         data[field.code] = [...form.querySelectorAll(`[name="${field.code}"]:checked`)].map((item) => item.value);
+      } else if (field.type === "file") {
+        const file = form.querySelector(`[name="${field.code}"]`)?.files?.[0];
+        if (file) {
+          data[field.code] = await fileToPayload(file);
+        } else {
+          const existing = state.entries.find((entry) => entry.participant_id === Number(form.dataset.participantId) && entry.form_id === Number(form.dataset.formId));
+          data[field.code] = existing?.data?.[field.code] || "";
+        }
       } else {
         data[field.code] = payload[field.code] || "";
       }
     }
-  });
+  }
   try {
     await api(`/api/studies/${state.studyId}/entries`, {
       method: "POST",

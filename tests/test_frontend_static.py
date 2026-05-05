@@ -24,6 +24,8 @@ class FrontendStaticTests(unittest.TestCase):
         self.assertIn("/records/import", app_js)
         self.assertIn("/history", app_js)
         self.assertIn("/surveys", app_js)
+        self.assertIn("/invitations", app_js)
+        self.assertIn("/validation", app_js)
         self.assertIn("type=\"file\"", app_js)
 
     def test_public_survey_shell_is_present(self):
@@ -32,6 +34,12 @@ class FrontendStaticTests(unittest.TestCase):
         self.assertIn('name="viewport"', survey_html)
         self.assertIn("/api/public/surveys/", survey_js)
         self.assertIn("Consent", survey_js)
+        self.assertIn("invitationToken", survey_js)
+
+    def test_browser_smoke_script_is_present(self):
+        smoke = (ROOT / "tests" / "browser_smoke.ps1").read_text(encoding="utf-8")
+        self.assertIn("Pixel 7", smoke)
+        self.assertIn("Browser smoke passed", smoke)
 
 
 if __name__ == "__main__":

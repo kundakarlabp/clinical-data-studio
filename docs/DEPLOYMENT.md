@@ -39,6 +39,8 @@ Survey links are LAN/public-within-your-network URLs created from the Surveys pa
 
 For consent-required surveys, the app records signer name, typed signature, consent text, client IP address, browser user agent, and timestamp.
 
+Survey invitations are tracked inside the app for manual phone/email workflows. Use the Invitation Tracker to record when a link was sent, reminded, completed, or cancelled. Automated SMS/email requires a separate approved messaging service and is not enabled by default.
+
 ## Health Check
 
 For quick startup verification:
@@ -63,6 +65,15 @@ Start-ScheduledTask -TaskName ClinicalDataStudio
 ```
 
 Use this only on the designated study computer after confirming backups and validation records.
+
+## Browser Smoke Check
+
+After starting the app, optional browser/mobile smoke automation can be run when Playwright is available:
+
+```powershell
+$env:CDS_BASE_URL = "http://127.0.0.1:8765"
+.\tests\browser_smoke.ps1
+```
 
 ## Validation Reminder
 

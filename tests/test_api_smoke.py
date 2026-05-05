@@ -178,6 +178,23 @@ class ApiSmokeTests(unittest.TestCase):
         entry = next(item for item in entries if item["study_uid"] == "PUB001")
         self.assertEqual(entry["data"]["attachment"]["name"], "note.txt")
 
+    def test_survey_invitation_tracking_and_validation_evidence(self):
+        token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]
+        study_id = self.request_json("/api/studies", token=token)["studies"][0]["id"]
+        form_id = self.request_json(f"/api/studies/{study_id}/forms", token=token)["forms"][0]["id"]
+        survey = self.request_json(f"/api/studies/{study_id}/surveys", "POST", {"title": "Invite Survey", "form_id": form_id}, token)["survey"]
+        invitation = self.request_json(
+            f"/api/studies/{study_id}/invitations",
+            "POST",
+            {"survey_link_id": survey["id"], "contact": "coordinator-call"},
+            token,
+        )["invitation"]
+        sent = self.request_json(f"/api/studies/{study_id}/invitations/{invitation['id']}", "PATCH", {"action": "mark_sent"}, token)["invitation"]
+        self.assertEqual(sent["status"], "sent")
+        evidence = self.request_json(f"/api/studies/{study_id}/validation", token=token)
+        self.assertGreaterEqual(evidence["counts"]["survey_invitations"], 1)
+        self.assertTrue(evidence["checks"])
+
 
 if __name__ == "__main__":
     unittest.main()

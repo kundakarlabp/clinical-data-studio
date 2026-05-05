@@ -451,6 +451,22 @@ def migrate() -> None:
                 created_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS survey_invitations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+                survey_link_id INTEGER NOT NULL REFERENCES survey_links(id) ON DELETE CASCADE,
+                participant_id INTEGER REFERENCES participants(id) ON DELETE SET NULL,
+                contact TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                invite_token TEXT UNIQUE NOT NULL,
+                last_sent_at INTEGER,
+                reminder_count INTEGER NOT NULL DEFAULT 0,
+                completed_at INTEGER,
+                created_by INTEGER REFERENCES users(id),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER REFERENCES users(id),
@@ -1193,6 +1209,15 @@ class App(BaseHTTPRequestHandler):
                 ),
             )
             audit(conn, None, "sign", "consent", entry_id, None, {"participant_id": participant["id"], "entry_id": entry_id})
+        invitation_token = str(payload.get("invitation_token", "")).strip()
+        if invitation_token:
+            invitation = row(conn, "SELECT * FROM survey_invitations WHERE invite_token = ? AND survey_link_id = ?", (invitation_token, survey["id"]))
+            if invitation:
+                conn.execute(
+                    "UPDATE survey_invitations SET participant_id = ?, status = 'completed', completed_at = ?, updated_at = ? WHERE id = ?",
+                    (participant["id"], timestamp, timestamp, invitation["id"]),
+                )
+                audit(conn, None, "complete", "survey_invitation", invitation["id"], invitation, {"participant_id": participant["id"], "entry_id": entry_id})
         conn.commit()
         self.send_json({"ok": True, "participant_id": participant["id"], "entry_id": entry_id}, 201)
 
@@ -1243,6 +1268,11 @@ class App(BaseHTTPRequestHandler):
                 self.send_error_json("Form management permission required", 403)
                 return
             return self.surveys(conn, user, method, study_id, parts)
+        if resource == "invitations":
+            if method != "GET" and not membership_has(membership, "manage_forms"):
+                self.send_error_json("Form management permission required", 403)
+                return
+            return self.invitations(conn, user, method, study_id, parts)
         if resource == "participants":
             if method != "GET" and not membership_has(membership, "enter_data"):
                 self.send_error_json("Data entry permission required", 403)
@@ -1275,6 +1305,11 @@ class App(BaseHTTPRequestHandler):
             return self.memberships(conn, user, method, study_id, parts)
         if resource == "metadata" and method == "GET":
             return self.metadata(conn, study_id)
+        if resource == "validation" and method == "GET":
+            if not membership_has(membership, "review_data") and not membership_has(membership, "manage_study"):
+                self.send_error_json("Validation evidence permission required", 403)
+                return
+            return self.validation_evidence(conn, study_id)
         if resource == "quality" and method == "GET":
             return self.quality(conn, study_id, membership)
         if resource == "analysis" and method == "GET":
@@ -1369,6 +1404,7 @@ class App(BaseHTTPRequestHandler):
             )
             after = row(conn, "SELECT * FROM forms WHERE id = ?", (form_id,))
             audit(conn, user["id"], "update", "form", form_id, before, after)
+            conn.commit()
             self.send_json({"form": after})
             return
         self.send_error_json("Unsupported forms operation", 405)
@@ -1483,6 +1519,7 @@ class App(BaseHTTPRequestHandler):
             )
             after = row(conn, "SELECT * FROM survey_links WHERE id = ?", (cur.lastrowid,))
             audit(conn, user["id"], "create", "survey_link", cur.lastrowid, None, after)
+            conn.commit()
             self.send_json({"survey": after}, 201)
             return
         if method == "PATCH" and len(parts) == 5:
@@ -1505,9 +1542,85 @@ class App(BaseHTTPRequestHandler):
             )
             after = row(conn, "SELECT * FROM survey_links WHERE id = ?", (survey_id,))
             audit(conn, user["id"], "update", "survey_link", survey_id, before, after)
+            conn.commit()
             self.send_json({"survey": after})
             return
         self.send_error_json("Unsupported survey operation", 405)
+
+    def invitations(self, conn, user, method, study_id, parts) -> None:
+        if method == "GET" and len(parts) == 4:
+            invitation_rows = rows(
+                conn,
+                """
+                SELECT survey_invitations.*, survey_links.title AS survey_title, participants.study_uid
+                FROM survey_invitations
+                JOIN survey_links ON survey_links.id = survey_invitations.survey_link_id
+                LEFT JOIN participants ON participants.id = survey_invitations.participant_id
+                WHERE survey_invitations.study_id = ?
+                ORDER BY survey_invitations.updated_at DESC
+                """,
+                (study_id,),
+            )
+            self.send_json({"invitations": invitation_rows})
+            return
+        if method == "POST" and len(parts) == 4:
+            payload = self.body()
+            survey_link_id = int(payload.get("survey_link_id") or 0)
+            survey = row(conn, "SELECT * FROM survey_links WHERE id = ? AND study_id = ?", (survey_link_id, study_id))
+            if not survey:
+                self.send_error_json("Survey link not found", 404)
+                return
+            contact = str(payload.get("contact", "")).strip()
+            if not contact:
+                self.send_error_json("Invitation contact is required", 400)
+                return
+            participant_id = payload.get("participant_id") or None
+            if participant_id and not row(conn, "SELECT id FROM participants WHERE id = ? AND study_id = ?", (participant_id, study_id)):
+                self.send_error_json("Participant not found", 404)
+                return
+            timestamp = now()
+            cur = conn.execute(
+                """
+                INSERT INTO survey_invitations(study_id, survey_link_id, participant_id, contact, status, invite_token, created_by, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+                """,
+                (study_id, survey_link_id, participant_id, contact, secrets.token_urlsafe(20), user["id"], timestamp, timestamp),
+            )
+            after = row(conn, "SELECT * FROM survey_invitations WHERE id = ?", (cur.lastrowid,))
+            audit(conn, user["id"], "create", "survey_invitation", cur.lastrowid, None, after)
+            conn.commit()
+            self.send_json({"invitation": after}, 201)
+            return
+        if method == "PATCH" and len(parts) == 5:
+            invitation_id = int(parts[4])
+            before = row(conn, "SELECT * FROM survey_invitations WHERE id = ? AND study_id = ?", (invitation_id, study_id))
+            if not before:
+                self.send_error_json("Invitation not found", 404)
+                return
+            payload = self.body()
+            action = str(payload.get("action", "")).strip()
+            timestamp = now()
+            if action == "mark_sent":
+                conn.execute(
+                    "UPDATE survey_invitations SET status = 'sent', last_sent_at = ?, reminder_count = reminder_count + 1, updated_at = ? WHERE id = ?",
+                    (timestamp, timestamp, invitation_id),
+                )
+            elif action == "mark_completed":
+                conn.execute(
+                    "UPDATE survey_invitations SET status = 'completed', completed_at = ?, updated_at = ? WHERE id = ?",
+                    (timestamp, timestamp, invitation_id),
+                )
+            elif action == "cancel":
+                conn.execute("UPDATE survey_invitations SET status = 'cancelled', updated_at = ? WHERE id = ?", (timestamp, invitation_id))
+            else:
+                self.send_error_json("Unsupported invitation action", 405)
+                return
+            after = row(conn, "SELECT * FROM survey_invitations WHERE id = ?", (invitation_id,))
+            audit(conn, user["id"], action, "survey_invitation", invitation_id, before, after)
+            conn.commit()
+            self.send_json({"invitation": after})
+            return
+        self.send_error_json("Unsupported invitation operation", 405)
 
     def dictionary(self, conn, user, method, study_id) -> None:
         if method != "POST":
@@ -1674,6 +1787,7 @@ class App(BaseHTTPRequestHandler):
                 audit(conn, user["id"], "import_create", "entry", cur.lastrowid, None, after)
                 imported["entries_created"] += 1
         audit(conn, user["id"], "import", "records", study_id, None, imported)
+        conn.commit()
         status = 207 if imported["errors"] else 201
         self.send_json({"imported": imported}, status)
 
@@ -2058,6 +2172,29 @@ class App(BaseHTTPRequestHandler):
                     }
                 )
         self.send_json({"project": study, "instruments": instruments, "data_dictionary": data_dictionary})
+
+    def validation_evidence(self, conn, study_id: int) -> None:
+        study = row(conn, "SELECT * FROM studies WHERE id = ?", (study_id,))
+        counts = {
+            "forms": row(conn, "SELECT COUNT(*) AS count FROM forms WHERE study_id = ?", (study_id,))["count"],
+            "participants": row(conn, "SELECT COUNT(*) AS count FROM participants WHERE study_id = ?", (study_id,))["count"],
+            "entries": row(conn, "SELECT COUNT(*) AS count FROM entries WHERE study_id = ?", (study_id,))["count"],
+            "queries_open": row(conn, "SELECT COUNT(*) AS count FROM queries WHERE study_id = ? AND status = 'open'", (study_id,))["count"],
+            "survey_links": row(conn, "SELECT COUNT(*) AS count FROM survey_links WHERE study_id = ?", (study_id,))["count"],
+            "survey_invitations": row(conn, "SELECT COUNT(*) AS count FROM survey_invitations WHERE study_id = ?", (study_id,))["count"],
+            "consent_signatures": row(conn, "SELECT COUNT(*) AS count FROM consent_signatures WHERE study_id = ?", (study_id,))["count"],
+            "audit_events": row(conn, "SELECT COUNT(*) AS count FROM audit_log", ())["count"],
+        }
+        recent_audit = rows(conn, "SELECT audit_log.*, users.display_name FROM audit_log LEFT JOIN users ON users.id = audit_log.user_id ORDER BY audit_log.id DESC LIMIT 50")
+        checks = [
+            {"name": "first_run_setup", "status": "document", "evidence": "Confirm permanent admin account setup in access review."},
+            {"name": "crf_versioning", "status": "available", "evidence": f"{counts['forms']} CRF(s) configured."},
+            {"name": "public_surveys", "status": "available" if counts["survey_links"] else "not_used", "evidence": f"{counts['survey_links']} survey link(s)."},
+            {"name": "econsent", "status": "available" if counts["consent_signatures"] else "not_used", "evidence": f"{counts['consent_signatures']} consent signature(s)."},
+            {"name": "backup_restore", "status": "document", "evidence": "Run backup restore drill and attach result."},
+            {"name": "audit_review", "status": "available", "evidence": f"{counts['audit_events']} audit event(s)."},
+        ]
+        self.send_json({"study": study, "generated_at": now(), "counts": counts, "checks": checks, "recent_audit": recent_audit})
 
     def quality(self, conn, study_id: int, membership) -> None:
         forms = rows(conn, "SELECT * FROM forms WHERE study_id = ? ORDER BY id", (study_id,))

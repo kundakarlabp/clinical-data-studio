@@ -5,6 +5,7 @@ import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import server
@@ -42,6 +43,18 @@ class ApiSmokeTests(unittest.TestCase):
         request = Request(f"{self.base_url}{path}", data=body, headers=headers, method=method)
         with urlopen(request, timeout=10) as response:
             return json.loads(response.read().decode("utf-8"))
+
+    def request_raw(self, path, method="GET", payload=None, token=None, content_type="application/json"):
+        if isinstance(payload, dict) and content_type == "application/x-www-form-urlencoded":
+            body = urlencode(payload).encode("utf-8")
+        else:
+            body = None if payload is None else json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": content_type}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        request = Request(f"{self.base_url}{path}", data=body, headers=headers, method=method)
+        with urlopen(request, timeout=10) as response:
+            return response.status, response.headers.get("content-type", ""), response.read()
 
     def test_health_login_summary_and_encrypted_backup(self):
         health = self.request_json("/api/health")
@@ -196,6 +209,58 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertGreaterEqual(evidence["counts"]["survey_invitations"], 1)
         self.assertIn("data_protection", evidence)
         self.assertTrue(evidence["checks"])
+
+    def test_api_tokens_redcap_endpoint_exports_and_randomization(self):
+        login = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})
+        token = login["token"]
+        study_id = self.request_json("/api/studies", token=token)["studies"][0]["id"]
+        api_token = self.request_json(
+            f"/api/studies/{study_id}/api-tokens",
+            "POST",
+            {"user_id": login["user"]["id"], "label": "test token"},
+            token,
+        )["token"]
+
+        metadata = self.request_json(f"/api/redcap?token={api_token}&content=metadata&format=json")
+        self.assertTrue(metadata)
+        project = self.request_json(f"/api/redcap?token={api_token}&content=project&format=json")
+        self.assertEqual(project["id"], study_id)
+        status, content_type, csv_body = self.request_raw(
+            "/api/redcap",
+            "POST",
+            {"token": api_token, "content": "record", "format": "csv"},
+            content_type="application/x-www-form-urlencoded",
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("text/csv", content_type)
+        self.assertIn(b"study_uid", csv_body)
+
+        _, odm_type, odm_body = self.request_raw(f"/api/studies/{study_id}/odm", token=token)
+        self.assertIn("application/xml", odm_type)
+        self.assertIn(b"<ODM", odm_body)
+        _, zip_type, zip_body = self.request_raw(f"/api/studies/{study_id}/stats-package?type=r", token=token)
+        self.assertIn("application/zip", zip_type)
+        self.assertGreater(len(zip_body), 100)
+
+        participant = self.request_json(
+            f"/api/studies/{study_id}/participants",
+            "POST",
+            {"study_uid": "RAND001", "initials": "RA", "status": "enrolled"},
+            token,
+        )["participant"]
+        random_list = self.request_json(
+            f"/api/studies/{study_id}/randomization",
+            "POST",
+            {"name": "1 to 1", "arms": "Control,Treatment"},
+            token,
+        )["list"]
+        allocation = self.request_json(
+            f"/api/studies/{study_id}/randomization/{random_list['id']}/allocate",
+            "POST",
+            {"participant_id": participant["id"]},
+            token,
+        )["allocation"]
+        self.assertIn(allocation["arm"], {"Control", "Treatment"})
 
 
 if __name__ == "__main__":

@@ -60,10 +60,13 @@ Implemented foundation:
 - File upload fields stored inside CRF data records
 - Windows scheduled-task start-at-login helper
 - Validation execution record template
+- Survey invitation and reminder tracking
+- Validation evidence JSON export
+- Optional Playwright browser/mobile smoke script
 - API and mobile shell regression tests
 
 Next planned build steps:
 
 - Optional audited database-at-rest encryption layer
 - Broader browser automation across common Android/iOS viewport sizes
-- Advanced survey invitations and reminder tracking
+- Email/SMS integration for automated invitations

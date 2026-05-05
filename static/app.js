@@ -11,6 +11,7 @@ const state = {
   events: [],
   formEvents: [],
   surveyLinks: [],
+  invitations: [],
   reports: [],
   backups: [],
   forms: [],
@@ -87,11 +88,12 @@ async function loadStudy() {
   if (!state.studyId) return;
   const manageUsers = can("manage_users");
   const viewAnalysis = can("view_analysis") || can("review_data");
-  const [forms, events, formEvents, surveyLinks, reports, backups, participants, entries, queries, quality, analysis, assistantSummary, audit, groups, studyMembers, users] = await Promise.all([
+  const [forms, events, formEvents, surveyLinks, invitations, reports, backups, participants, entries, queries, quality, analysis, assistantSummary, audit, groups, studyMembers, users] = await Promise.all([
     api(`/api/studies/${state.studyId}/forms`),
     api(`/api/studies/${state.studyId}/events`),
     api(`/api/studies/${state.studyId}/form-events`),
     can("manage_forms") ? api(`/api/studies/${state.studyId}/surveys`) : Promise.resolve({ surveys: [] }),
+    can("manage_forms") ? api(`/api/studies/${state.studyId}/invitations`) : Promise.resolve({ invitations: [] }),
     viewAnalysis ? api(`/api/studies/${state.studyId}/reports`) : Promise.resolve({ reports: [] }),
     can("manage_study") ? api(`/api/studies/${state.studyId}/backups`) : Promise.resolve({ backups: [] }),
     api(`/api/studies/${state.studyId}/participants`),
@@ -109,6 +111,7 @@ async function loadStudy() {
   state.events = events.events;
   state.formEvents = formEvents.form_events;
   state.surveyLinks = surveyLinks.surveys;
+  state.invitations = invitations.invitations;
   state.reports = reports.reports;
   state.backups = backups.backups;
   if (!state.selectedEventId && state.events[0]) state.selectedEventId = state.events[0].id;
@@ -573,6 +576,54 @@ function surveysView() {
       </form>
     </section>
     <section class="panel">
+      <h2>Create Invitation</h2>
+      <form id="invitation-form" class="form-grid">
+        <label>Survey
+          <select name="survey_link_id" required>
+            ${state.surveyLinks.map((survey) => `<option value="${survey.id}">${escapeHtml(survey.title)}</option>`).join("")}
+          </select>
+        </label>
+        <label>Contact<input name="contact" required placeholder="phone, email, or coordinator note" /></label>
+        <label>Participant
+          <select name="participant_id">
+            <option value="">Unassigned</option>
+            ${state.participants.map((participant) => `<option value="${participant.id}">${escapeHtml(participant.study_uid)}</option>`).join("")}
+          </select>
+        </label>
+        <div><button ${state.surveyLinks.length ? "" : "disabled"}>Create Invitation</button></div>
+      </form>
+    </section>
+    <section class="panel">
+      <h2>Invitation Tracker</h2>
+      ${state.invitations.length ? `
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Survey</th><th>Contact</th><th>Status</th><th>Last Sent</th><th>Link</th><th></th></tr></thead>
+            <tbody>
+              ${state.invitations.map((invitation) => {
+                const survey = state.surveyLinks.find((item) => item.id === invitation.survey_link_id);
+                const link = survey ? `${origin}/survey.html?token=${encodeURIComponent(survey.token)}&invite=${encodeURIComponent(invitation.invite_token)}` : "";
+                return `
+                  <tr>
+                    <td>${escapeHtml(invitation.survey_title || "")}<br><span class="small">${escapeHtml(invitation.study_uid || "Unassigned")}</span></td>
+                    <td>${escapeHtml(invitation.contact)}</td>
+                    <td><span class="pill ${invitation.status === "completed" ? "ok" : invitation.status === "cancelled" ? "bad" : "warn"}">${escapeHtml(invitation.status)}</span><br><span class="small">${invitation.reminder_count || 0} sent/reminder action(s)</span></td>
+                    <td>${fmtTime(invitation.last_sent_at)}</td>
+                    <td>${link ? `<a href="${link}" target="_blank">Open</a>` : ""}</td>
+                    <td>
+                      <button class="secondary" data-invitation-action="mark_sent" data-invitation-id="${invitation.id}">Sent</button>
+                      <button class="secondary" data-invitation-action="mark_completed" data-invitation-id="${invitation.id}">Complete</button>
+                      <button class="warning" data-invitation-action="cancel" data-invitation-id="${invitation.id}">Cancel</button>
+                    </td>
+                  </tr>
+                `;
+              }).join("")}
+            </tbody>
+          </table>
+        </div>
+      ` : "<p>No invitations yet.</p>"}
+    </section>
+    <section class="panel">
       <h2>Active Survey Links</h2>
       ${state.surveyLinks.length ? `
         <div class="table-wrap">
@@ -938,6 +989,7 @@ function settingsView() {
     <section class="panel">
       <h2>Important Use Notes</h2>
       <p>This app is local-first and suitable for small research workflows. For regulated trials, validate the system, document SOPs, review audit trails, and maintain controlled backups.</p>
+      ${state.studyId && (can("review_data") || can("manage_study")) ? `<a href="/api/studies/${state.studyId}/validation" target="_blank"><button class="secondary">Export Validation Evidence JSON</button></a>` : ""}
     </section>
     <section class="panel">
       <h2>Change Password</h2>
@@ -987,6 +1039,8 @@ function bindRoute() {
   document.querySelector("#event-form")?.addEventListener("submit", submitEvent);
   document.querySelector("#form-event-form")?.addEventListener("submit", submitFormEvent);
   document.querySelector("#survey-link-form")?.addEventListener("submit", submitSurveyLink);
+  document.querySelector("#invitation-form")?.addEventListener("submit", submitInvitation);
+  document.querySelectorAll("[data-invitation-action]").forEach((button) => button.addEventListener("click", () => updateInvitation(button.dataset.invitationId, button.dataset.invitationAction)));
   document.querySelector("#report-form")?.addEventListener("submit", submitReport);
   document.querySelector("#backup-create")?.addEventListener("click", createBackup);
   document.querySelector("#encrypted-backup-form")?.addEventListener("submit", createEncryptedBackup);
@@ -1199,6 +1253,40 @@ async function submitSurveyLink(event) {
         consent_required: data.consent_required === "true",
         consent_text: data.consent_text || "",
       }),
+    });
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function submitInvitation(event) {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(event.target));
+  try {
+    await api(`/api/studies/${state.studyId}/invitations`, {
+      method: "POST",
+      body: JSON.stringify({
+        survey_link_id: Number(data.survey_link_id),
+        participant_id: data.participant_id ? Number(data.participant_id) : null,
+        contact: data.contact,
+      }),
+    });
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function updateInvitation(id, action) {
+  try {
+    await api(`/api/studies/${state.studyId}/invitations/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ action }),
     });
     await loadStudy();
     render();

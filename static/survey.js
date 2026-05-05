@@ -1,5 +1,7 @@
 const app = document.querySelector("#survey-app");
-const token = new URLSearchParams(window.location.search).get("token") || "";
+const params = new URLSearchParams(window.location.search);
+const token = params.get("token") || "";
+const invitationToken = params.get("invite") || "";
 let survey = null;
 
 function escapeHtml(value) {
@@ -110,6 +112,7 @@ async function submitSurvey(event) {
         participant: { study_uid: payload.study_uid, initials: payload.initials || "" },
         data,
         consent: { signer_name: payload.signer_name || "", signature_text: payload.signature_text || "" },
+        invitation_token: invitationToken,
       }),
     });
     render("Survey submitted. Thank you.");

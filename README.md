@@ -64,6 +64,10 @@ Implemented foundation:
 - Survey invitation and reminder tracking
 - Validation evidence JSON export
 - Optional Playwright browser/mobile smoke script
+- REDCap-style token API for project, metadata, instruments, events, records, and randomization
+- ODM-like XML project export
+- R, SAS, SPSS, and Stata import package exports
+- Simple allocation randomization module
 - API and mobile shell regression tests
 
 Next planned build steps:
@@ -72,3 +76,15 @@ Next planned build steps:
 - Automated EFS/device-encryption compliance checks beyond local status reporting
 - Broader browser automation across common Android/iOS viewport sizes
 - Email/SMS integration for automated invitations
+- Full REDCap API edge-case parity only if a specific importing system requires it
+
+## REDCap-style Local API
+
+Create an API token from Access -> API Tokens. Use `/api/redcap` with parameters such as:
+
+- `token`: generated API token
+- `content`: `project`, `metadata`, `instrument`, `event`, `record`, or `randomization`
+- `action`: `export`, `import`, or `allocate`
+- `format`: `json` or `csv`
+
+This is REDCap-style compatibility for local workflows, not an official REDCap API implementation.

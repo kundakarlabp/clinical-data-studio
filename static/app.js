@@ -8,6 +8,8 @@ const state = {
   users: [],
   groups: [],
   studyMembers: [],
+  apiTokens: [],
+  randomization: { lists: [], allocations: [] },
   events: [],
   formEvents: [],
   surveyLinks: [],
@@ -88,7 +90,7 @@ async function loadStudy() {
   if (!state.studyId) return;
   const manageUsers = can("manage_users");
   const viewAnalysis = can("view_analysis") || can("review_data");
-  const [forms, events, formEvents, surveyLinks, invitations, reports, backups, participants, entries, queries, quality, analysis, assistantSummary, audit, groups, studyMembers, users] = await Promise.all([
+  const [forms, events, formEvents, surveyLinks, invitations, reports, backups, participants, entries, queries, quality, analysis, assistantSummary, audit, groups, studyMembers, apiTokens, randomization, users] = await Promise.all([
     api(`/api/studies/${state.studyId}/forms`),
     api(`/api/studies/${state.studyId}/events`),
     api(`/api/studies/${state.studyId}/form-events`),
@@ -105,6 +107,8 @@ async function loadStudy() {
     can("review_data") ? api(`/api/studies/${state.studyId}/audit`) : Promise.resolve({ audit: [] }),
     api(`/api/studies/${state.studyId}/groups`),
     manageUsers ? api(`/api/studies/${state.studyId}/memberships`) : Promise.resolve({ memberships: [] }),
+    manageUsers ? api(`/api/studies/${state.studyId}/api-tokens`) : Promise.resolve({ tokens: [] }),
+    can("manage_study") || can("review_data") ? api(`/api/studies/${state.studyId}/randomization`) : Promise.resolve({ lists: [], allocations: [] }),
     state.user?.role === "admin" ? api("/api/users") : Promise.resolve({ users: [] }),
   ]);
   state.forms = forms.forms;
@@ -126,6 +130,8 @@ async function loadStudy() {
   state.audit = audit.audit;
   state.groups = groups.groups;
   state.studyMembers = studyMembers.memberships;
+  state.apiTokens = apiTokens.tokens;
+  state.randomization = randomization;
   state.users = users.users;
 }
 
@@ -171,6 +177,7 @@ function render() {
           ${can("manage_forms") ? navButton("dictionary", "Dictionary") : ""}
           ${can("manage_forms") ? navButton("surveys", "Surveys") : ""}
           ${can("manage_study") ? navButton("events", "Events") : ""}
+          ${can("manage_study") || can("review_data") ? navButton("randomization", "Randomization") : ""}
           ${navButton("queries", "Review Queries")}
           ${navButton("quality", "Data Quality")}
           ${navButton("analysis", "Analysis")}
@@ -220,6 +227,7 @@ function route() {
   if (state.view === "dictionary") return dictionaryView();
   if (state.view === "surveys") return surveysView();
   if (state.view === "events") return eventsView();
+  if (state.view === "randomization") return randomizationView();
   if (state.view === "queries") return queriesView();
   if (state.view === "quality") return qualityView();
   if (state.view === "analysis") return analysisView();
@@ -672,6 +680,54 @@ function fieldEditorRow(field = null) {
   `;
 }
 
+function randomizationView() {
+  const lists = state.randomization?.lists || [];
+  const allocations = state.randomization?.allocations || [];
+  return `
+    <section class="grid two">
+      <section class="panel">
+        <h2>Create Randomization List</h2>
+        ${can("manage_study") ? `
+          <form id="randomization-list-form" class="stack">
+            <label>Name<input name="name" required placeholder="Main 1:1 allocation" /></label>
+            <label>Arms<input name="arms" required placeholder="Control, Treatment" /></label>
+            <button>Create List</button>
+          </form>
+        ` : "<p>Study management permission required.</p>"}
+      </section>
+      <section class="panel">
+        <h2>Allocate Participant</h2>
+        <form id="randomization-allocate-form" class="stack">
+          <label>List
+            <select name="list_id" required>
+              ${lists.map((item) => `<option value="${item.id}">${escapeHtml(item.name)}</option>`).join("")}
+            </select>
+          </label>
+          <label>Participant
+            <select name="participant_id" required>
+              ${state.participants.map((participant) => `<option value="${participant.id}">${escapeHtml(participant.study_uid)}</option>`).join("")}
+            </select>
+          </label>
+          <button ${lists.length && state.participants.length ? "" : "disabled"}>Allocate</button>
+        </form>
+      </section>
+    </section>
+    <section class="panel">
+      <h2>Allocations</h2>
+      ${allocations.length ? `
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Participant</th><th>List</th><th>Arm</th><th>Time</th></tr></thead>
+            <tbody>
+              ${allocations.map((item) => `<tr><td>${escapeHtml(item.study_uid)}</td><td>${escapeHtml(item.list_name)}</td><td><span class="pill ok">${escapeHtml(item.arm)}</span></td><td>${fmtTime(item.created_at)}</td></tr>`).join("")}
+            </tbody>
+          </table>
+        </div>
+      ` : "<p>No allocations yet.</p>"}
+    </section>
+  `;
+}
+
 function queriesView() {
   return `
     <section class="panel">
@@ -811,6 +867,10 @@ function reportsView() {
     </section>
     <section class="panel">
       <h2>Saved Reports</h2>
+      <div class="split-actions">
+        <a href="/api/studies/${state.studyId}/odm" target="_blank"><button class="secondary">ODM XML</button></a>
+        ${["r", "sas", "spss", "stata"].map((type) => `<a href="/api/studies/${state.studyId}/stats-package?type=${type}" target="_blank"><button class="secondary">${type.toUpperCase()} Package</button></a>`).join("")}
+      </div>
       ${state.reports.length ? `
         <div class="table-wrap">
           <table>
@@ -972,6 +1032,27 @@ function accessView() {
         </table>
       </div>
     </section>
+    <section class="panel">
+      <h2>API Tokens</h2>
+      <form id="api-token-form" class="form-grid">
+        <label>User
+          <select name="user_id" required>
+            ${state.users.map((user) => `<option value="${user.id}">${escapeHtml(user.username)}</option>`).join("")}
+          </select>
+        </label>
+        <label>Label<input name="label" required placeholder="Analysis script token" /></label>
+        <div class="full"><button>Create API Token</button></div>
+      </form>
+      <p class="small">The token is shown once after creation. Use endpoint /api/redcap with token, content, action, and format parameters.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Label</th><th>User</th><th>Active</th><th>Last Used</th></tr></thead>
+          <tbody>
+            ${state.apiTokens.map((item) => `<tr><td>${escapeHtml(item.label)}</td><td>${escapeHtml(item.username)}</td><td>${item.active ? "Yes" : "No"}</td><td>${fmtTime(item.last_used_at)}</td></tr>`).join("")}
+          </tbody>
+        </table>
+      </div>
+    </section>
   `;
 }
 
@@ -1036,8 +1117,11 @@ function bindRoute() {
   document.querySelector("#user-form")?.addEventListener("submit", submitUser);
   document.querySelector("#group-form")?.addEventListener("submit", submitGroup);
   document.querySelector("#membership-form")?.addEventListener("submit", submitMembership);
+  document.querySelector("#api-token-form")?.addEventListener("submit", submitApiToken);
   document.querySelector("#event-form")?.addEventListener("submit", submitEvent);
   document.querySelector("#form-event-form")?.addEventListener("submit", submitFormEvent);
+  document.querySelector("#randomization-list-form")?.addEventListener("submit", submitRandomizationList);
+  document.querySelector("#randomization-allocate-form")?.addEventListener("submit", submitRandomizationAllocation);
   document.querySelector("#survey-link-form")?.addEventListener("submit", submitSurveyLink);
   document.querySelector("#invitation-form")?.addEventListener("submit", submitInvitation);
   document.querySelectorAll("[data-invitation-action]").forEach((button) => button.addEventListener("click", () => updateInvitation(button.dataset.invitationId, button.dataset.invitationAction)));
@@ -1192,6 +1276,23 @@ async function submitMembership(event) {
   }
 }
 
+async function submitApiToken(event) {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(event.target));
+  try {
+    const result = await api(`/api/studies/${state.studyId}/api-tokens`, {
+      method: "POST",
+      body: JSON.stringify({ user_id: Number(data.user_id), label: data.label }),
+    });
+    alert(`API token. Store it now, it will not be shown again:\\n${result.token}`);
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
 async function submitEvent(event) {
   event.preventDefault();
   const data = Object.fromEntries(new FormData(event.target));
@@ -1200,6 +1301,39 @@ async function submitEvent(event) {
       method: "POST",
       body: JSON.stringify({ ...data, day_offset: Number(data.day_offset || 0) }),
     });
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function submitRandomizationList(event) {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(event.target));
+  try {
+    await api(`/api/studies/${state.studyId}/randomization`, {
+      method: "POST",
+      body: JSON.stringify({ name: data.name, arms: data.arms }),
+    });
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function submitRandomizationAllocation(event) {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(event.target));
+  try {
+    const result = await api(`/api/studies/${state.studyId}/randomization/${data.list_id}/allocate`, {
+      method: "POST",
+      body: JSON.stringify({ participant_id: Number(data.participant_id) }),
+    });
+    state.error = `Allocated to ${result.allocation.arm}.`;
     await loadStudy();
     render();
   } catch (error) {

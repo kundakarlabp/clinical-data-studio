@@ -13,11 +13,13 @@ import sqlite3
 import tempfile
 import time
 import ctypes
+import zipfile
 from io import StringIO
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from xml.etree import ElementTree
 
 
 ROOT = Path(__file__).resolve().parent
@@ -94,6 +96,10 @@ def verify_password(password: str, encoded: str) -> bool:
         return hmac.compare_digest(actual, expected)
     except Exception:
         return False
+
+
+def token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def archive_key(passphrase: str, salt: bytes) -> bytes:
@@ -514,6 +520,40 @@ def migrate() -> None:
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS api_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                token_hash TEXT UNIQUE NOT NULL,
+                label TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL,
+                last_used_at INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS randomization_lists (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                arms_json TEXT NOT NULL,
+                next_index INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_by INTEGER REFERENCES users(id),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS randomization_allocations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+                list_id INTEGER NOT NULL REFERENCES randomization_lists(id) ON DELETE CASCADE,
+                participant_id INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+                arm TEXT NOT NULL,
+                allocated_by INTEGER REFERENCES users(id),
+                created_at INTEGER NOT NULL,
+                UNIQUE(list_id, participant_id)
+            );
             """
         )
         add_column(conn, "entries", "repeat_instance", "INTEGER NOT NULL DEFAULT 1")
@@ -841,6 +881,15 @@ class App(BaseHTTPRequestHandler):
         raw = self.rfile.read(length).decode("utf-8")
         return json.loads(raw or "{}")
 
+    def request_values(self) -> dict:
+        length = int(self.headers.get("content-length", "0"))
+        raw = self.rfile.read(length).decode("utf-8") if length else ""
+        content_type = self.headers.get("content-type", "")
+        if "application/json" in content_type:
+            return json.loads(raw or "{}")
+        parsed = parse_qs(raw, keep_blank_values=True)
+        return {key: values[-1] if values else "" for key, values in parsed.items()}
+
     def send_json(self, payload, status: int = 200) -> None:
         encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -899,6 +948,8 @@ class App(BaseHTTPRequestHandler):
                     return self.logout(conn)
                 if path.startswith("/api/public/surveys/"):
                     return self.public_survey(conn, method, path)
+                if path == "/api/redcap":
+                    return self.redcap_api(conn, method, query)
                 if path == "/api/setup" and method == "GET":
                     return self.send_json({"required": setup_required(conn)})
                 if path == "/api/setup" and method == "POST":
@@ -1011,6 +1062,143 @@ class App(BaseHTTPRequestHandler):
         if token:
             conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
         self.send_json({"ok": True})
+
+    def user_from_api_token(self, conn: sqlite3.Connection, raw_token: str) -> tuple[dict, dict] | tuple[None, None]:
+        if not raw_token:
+            return None, None
+        token_row = row(conn, "SELECT * FROM api_tokens WHERE token_hash = ? AND active = 1", (token_digest(raw_token),))
+        if not token_row:
+            return None, None
+        user = row(conn, "SELECT id, username, display_name, role, active, must_change_password FROM users WHERE id = ? AND active = 1", (token_row["user_id"],))
+        if not user:
+            return None, None
+        conn.execute("UPDATE api_tokens SET last_used_at = ? WHERE id = ?", (now(), token_row["id"]))
+        return user, token_row
+
+    def redcap_api(self, conn: sqlite3.Connection, method: str, query: dict[str, list[str]]) -> None:
+        if method not in {"GET", "POST"}:
+            self.send_error_json("Unsupported REDCap-style API method", 405)
+            return
+        values = {key: value[-1] for key, value in query.items() if value}
+        if method == "POST":
+            values.update(self.request_values())
+        raw_token = str(values.get("token") or self.headers.get("x-cds-api-token", "")).strip()
+        user, token_row = self.user_from_api_token(conn, raw_token)
+        if not user:
+            self.send_error_json("Invalid API token", 401)
+            return
+        study_id = token_row["study_id"]
+        membership = user_membership(conn, user, study_id)
+        if not membership:
+            self.send_error_json("Study access denied", 403)
+            return
+        content = str(values.get("content", "project")).strip().lower()
+        action = str(values.get("action", "export")).strip().lower()
+        output_format = str(values.get("format", "json")).strip().lower()
+        if content in {"project", "project_info"}:
+            payload = row(conn, "SELECT * FROM studies WHERE id = ?", (study_id,))
+            return self.send_redcap_payload(payload, output_format)
+        if content in {"metadata", "data_dictionary"}:
+            payload = self.metadata_payload(conn, study_id)["data_dictionary"]
+            return self.send_redcap_payload(payload, output_format)
+        if content in {"instrument", "instruments"}:
+            payload = self.metadata_payload(conn, study_id)["instruments"]
+            return self.send_redcap_payload(payload, output_format)
+        if content in {"event", "events"}:
+            payload = rows(conn, "SELECT name AS event_name, code AS unique_event_name, arm_name, day_offset FROM study_events WHERE study_id = ? ORDER BY display_order", (study_id,))
+            return self.send_redcap_payload(payload, output_format)
+        if content in {"record", "records"}:
+            if action == "import":
+                if not membership_has(membership, "enter_data"):
+                    self.send_error_json("Data entry permission required", 403)
+                    return
+                csv_text = str(values.get("data", ""))
+                if not csv_text and output_format == "json":
+                    records = json.loads(str(values.get("records", "[]")))
+                    csv_text = self.records_json_to_csv(records)
+                return self.import_records_from_csv(conn, user, study_id, membership, csv_text)
+            if not membership_has(membership, "export_data") and not membership_has(membership, "view_analysis"):
+                self.send_error_json("Export permission required", 403)
+                return
+            payload = self.record_payload(conn, study_id, membership, {})
+            return self.send_redcap_payload(payload, output_format, self.record_fieldnames(conn, study_id))
+        if content == "randomization":
+            if action != "allocate":
+                payload = rows(conn, "SELECT * FROM randomization_lists WHERE study_id = ? AND active = 1", (study_id,))
+                return self.send_redcap_payload(payload, output_format)
+            participant_uid = str(values.get("study_uid", "")).strip()
+            list_id = int(values.get("list_id") or 0)
+            participant = row(conn, "SELECT id FROM participants WHERE study_id = ? AND study_uid = ?", (study_id, participant_uid))
+            if not participant:
+                self.send_error_json("Participant not found", 404)
+                return
+            allocation = self.allocate_randomization(conn, user, study_id, list_id, participant["id"])
+            return self.send_redcap_payload(allocation, output_format)
+        self.send_error_json("Unsupported REDCap-style content", 400)
+
+    def send_redcap_payload(self, payload, output_format: str, fieldnames: list[str] | None = None) -> None:
+        if output_format == "csv":
+            data = payload if isinstance(payload, list) else [payload]
+            fields = fieldnames or (sorted({key for item in data for key in item.keys()}) if data else [])
+            text_lines = []
+            class Sink:
+                def write(self, value):
+                    text_lines.append(value)
+            writer = csv.DictWriter(Sink(), fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(data)
+            content = "".join(text_lines).encode("utf-8-sig")
+            self.send_response(200)
+            self.send_header("content-type", "text/csv; charset=utf-8")
+            self.send_header("content-length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+            return
+        self.send_json(payload)
+
+    def record_fieldnames(self, conn, study_id: int) -> list[str]:
+        fields = ["study_uid", "initials", "participant_status", "event_name", "event_code", "repeat_instance", "form_name", "entry_status", "locked"]
+        for form in rows(conn, "SELECT * FROM forms WHERE study_id = ? ORDER BY id", (study_id,)):
+            for field in load_json(form["schema_json"], {"fields": []}).get("fields", []):
+                fields.append(f"{form['code']}__{field.get('code')}")
+        return fields
+
+    def metadata_payload(self, conn, study_id: int) -> dict:
+        study = row(conn, "SELECT * FROM studies WHERE id = ?", (study_id,))
+        forms = rows(conn, "SELECT * FROM forms WHERE study_id = ? ORDER BY id", (study_id,))
+        mappings = rows(conn, "SELECT form_events.*, study_events.name AS event_name, study_events.code AS event_code FROM form_events JOIN study_events ON study_events.id = form_events.event_id WHERE form_events.study_id = ? AND form_events.required = 1", (study_id,))
+        events_by_form: dict[int, list[str]] = {}
+        for mapping in mappings:
+            events_by_form.setdefault(mapping["form_id"], []).append(mapping["event_code"])
+        instruments = []
+        data_dictionary = []
+        for form in forms:
+            schema = load_json(form["schema_json"], {"fields": []})
+            instruments.append({"instrument_name": form["code"], "instrument_label": form["name"], "version": form["version"], "repeatable": bool(schema.get("repeatable"))})
+            for order, field in enumerate(schema.get("fields", []), start=1):
+                data_dictionary.append(
+                    {
+                        "field_name": field["code"],
+                        "form_name": form["code"],
+                        "section_header": "",
+                        "field_type": field["type"],
+                        "field_label": field["label"],
+                        "select_choices_or_calculations": " | ".join(field.get("options", [])) or field.get("calculation", ""),
+                        "field_note": "",
+                        "text_validation_type_or_show_slider_number": "",
+                        "text_validation_min": field.get("min", ""),
+                        "text_validation_max": field.get("max", ""),
+                        "identifier": "",
+                        "branching_logic": f"[{field['show_if']['field']}] = '{field['show_if']['equals']}'" if field.get("show_if") else "",
+                        "required_field": "y" if field.get("required") else "",
+                        "custom_alignment": "",
+                        "question_number": order,
+                        "matrix_group_name": "",
+                        "matrix_ranking": "",
+                        "field_annotation": "",
+                    }
+                )
+        return {"project": study, "instruments": instruments, "data_dictionary": data_dictionary, "events_by_form": events_by_form}
 
     def visible_studies(self, conn: sqlite3.Connection, user: dict) -> list[dict]:
         if user.get("role") == "admin":
@@ -1329,6 +1517,16 @@ class App(BaseHTTPRequestHandler):
                 self.send_error_json("User management permission required", 403)
                 return
             return self.memberships(conn, user, method, study_id, parts)
+        if resource == "api-tokens":
+            if not membership_has(membership, "manage_users"):
+                self.send_error_json("User management permission required", 403)
+                return
+            return self.api_tokens(conn, user, method, study_id, parts)
+        if resource == "randomization":
+            if method != "GET" and not membership_has(membership, "manage_study") and not membership_has(membership, "review_data"):
+                self.send_error_json("Study management or review permission required", 403)
+                return
+            return self.randomization(conn, user, method, study_id, parts)
         if resource == "metadata" and method == "GET":
             return self.metadata(conn, study_id)
         if resource == "validation" and method == "GET":
@@ -1363,6 +1561,17 @@ class App(BaseHTTPRequestHandler):
                 self.send_error_json("Export permission required", 403)
                 return
             return self.export_csv(conn, study_id, membership)
+        if resource == "odm" and method == "GET":
+            if not membership_has(membership, "export_data"):
+                self.send_error_json("Export permission required", 403)
+                return
+            return self.export_odm(conn, study_id)
+        if resource == "stats-package" and method == "GET":
+            if not membership_has(membership, "export_data"):
+                self.send_error_json("Export permission required", 403)
+                return
+            package = (query.get("type") or ["r"])[0].lower()
+            return self.export_stats_package(conn, study_id, membership, package)
         if resource == "codebook" and method == "GET":
             if not membership_has(membership, "export_data"):
                 self.send_error_json("Export permission required", 403)
@@ -1735,6 +1944,20 @@ class App(BaseHTTPRequestHandler):
     def import_records(self, conn, user, study_id: int, membership) -> None:
         payload = self.body()
         csv_text = str(payload.get("csv", "")).strip()
+        return self.import_records_from_csv(conn, user, study_id, membership, csv_text)
+
+    def records_json_to_csv(self, records: list[dict]) -> str:
+        fields = sorted({key for item in records for key in item.keys()})
+        text_lines = []
+        class Sink:
+            def write(self, value):
+                text_lines.append(value)
+        writer = csv.DictWriter(Sink(), fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(records)
+        return "".join(text_lines)
+
+    def import_records_from_csv(self, conn, user, study_id: int, membership, csv_text: str) -> None:
         if not csv_text:
             self.send_error_json("Record CSV content is required", 400)
             return
@@ -2165,39 +2388,128 @@ class App(BaseHTTPRequestHandler):
             return
         self.send_error_json("Unsupported membership operation", 405)
 
-    def metadata(self, conn, study_id: int) -> None:
-        study = row(conn, "SELECT * FROM studies WHERE id = ?", (study_id,))
-        forms = rows(conn, "SELECT * FROM forms WHERE study_id = ? ORDER BY id", (study_id,))
-        mappings = rows(conn, "SELECT form_events.*, study_events.name AS event_name, study_events.code AS event_code FROM form_events JOIN study_events ON study_events.id = form_events.event_id WHERE form_events.study_id = ? AND form_events.required = 1", (study_id,))
-        instruments = []
-        data_dictionary = []
-        for form in forms:
-            schema = load_json(form["schema_json"], {"fields": []})
-            instruments.append(
-                {
-                    "instrument_name": form["code"],
-                    "instrument_label": form["name"],
-                    "version": form["version"],
-                    "repeatable": bool(schema.get("repeatable")),
-                }
+    def api_tokens(self, conn, user, method, study_id, parts) -> None:
+        if method == "GET":
+            token_rows = rows(
+                conn,
+                """
+                SELECT api_tokens.id, api_tokens.study_id, api_tokens.user_id, api_tokens.label, api_tokens.active,
+                       api_tokens.created_at, api_tokens.last_used_at, users.username, users.display_name
+                FROM api_tokens
+                JOIN users ON users.id = api_tokens.user_id
+                WHERE api_tokens.study_id = ?
+                ORDER BY api_tokens.created_at DESC
+                """,
+                (study_id,),
             )
-            for order, field in enumerate(schema.get("fields", []), start=1):
-                data_dictionary.append(
-                    {
-                        "instrument_name": form["code"],
-                        "field_order": order,
-                        "field_name": field["code"],
-                        "field_label": field["label"],
-                        "field_type": field["type"],
-                        "required": bool(field.get("required")),
-                        "choices": field.get("options", []),
-                        "validation_min": field.get("min", ""),
-                        "validation_max": field.get("max", ""),
-                        "branching_logic": field.get("show_if", ""),
-                        "calculation": field.get("calculation", ""),
-                    }
-                )
-        self.send_json({"project": study, "instruments": instruments, "data_dictionary": data_dictionary})
+            self.send_json({"tokens": token_rows})
+            return
+        if method == "POST":
+            payload = self.body()
+            user_id = int(payload.get("user_id") or user["id"])
+            if not row(conn, "SELECT id FROM users WHERE id = ? AND active = 1", (user_id,)):
+                self.send_error_json("User not found", 404)
+                return
+            label = str(payload.get("label", "API token")).strip() or "API token"
+            raw_token = f"cds_{secrets.token_urlsafe(32)}"
+            timestamp = now()
+            cur = conn.execute(
+                "INSERT INTO api_tokens(study_id, user_id, token_hash, label, active, created_at) VALUES (?, ?, ?, ?, 1, ?)",
+                (study_id, user_id, token_digest(raw_token), label, timestamp),
+            )
+            after = row(conn, "SELECT id, study_id, user_id, label, active, created_at, last_used_at FROM api_tokens WHERE id = ?", (cur.lastrowid,))
+            audit(conn, user["id"], "create", "api_token", cur.lastrowid, None, after)
+            conn.commit()
+            self.send_json({"token": raw_token, "record": after}, 201)
+            return
+        if method == "PATCH" and len(parts) == 5:
+            token_id = int(parts[4])
+            before = row(conn, "SELECT id, study_id, user_id, label, active, created_at, last_used_at FROM api_tokens WHERE id = ? AND study_id = ?", (token_id, study_id))
+            if not before:
+                self.send_error_json("API token not found", 404)
+                return
+            payload = self.body()
+            active = 1 if payload.get("active", bool(before["active"])) else 0
+            conn.execute("UPDATE api_tokens SET active = ? WHERE id = ?", (active, token_id))
+            after = row(conn, "SELECT id, study_id, user_id, label, active, created_at, last_used_at FROM api_tokens WHERE id = ?", (token_id,))
+            audit(conn, user["id"], "update", "api_token", token_id, before, after)
+            self.send_json({"token": after})
+            return
+        self.send_error_json("Unsupported API token operation", 405)
+
+    def randomization(self, conn, user, method, study_id, parts) -> None:
+        if method == "GET" and len(parts) == 4:
+            lists = rows(conn, "SELECT * FROM randomization_lists WHERE study_id = ? ORDER BY created_at DESC", (study_id,))
+            allocations = rows(
+                conn,
+                """
+                SELECT randomization_allocations.*, participants.study_uid, randomization_lists.name AS list_name
+                FROM randomization_allocations
+                JOIN participants ON participants.id = randomization_allocations.participant_id
+                JOIN randomization_lists ON randomization_lists.id = randomization_allocations.list_id
+                WHERE randomization_allocations.study_id = ?
+                ORDER BY randomization_allocations.created_at DESC
+                """,
+                (study_id,),
+            )
+            for item in lists:
+                item["arms"] = load_json(item.pop("arms_json"), [])
+            self.send_json({"lists": lists, "allocations": allocations})
+            return
+        if method == "POST" and len(parts) == 4:
+            payload = self.body()
+            arms = payload.get("arms") or []
+            if isinstance(arms, str):
+                arms = [part.strip() for part in arms.replace("|", ",").split(",") if part.strip()]
+            arms = [str(arm).strip() for arm in arms if str(arm).strip()]
+            if len(arms) < 2:
+                self.send_error_json("At least two randomization arms are required", 400)
+                return
+            timestamp = now()
+            cur = conn.execute(
+                "INSERT INTO randomization_lists(study_id, name, arms_json, active, created_by, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?, ?)",
+                (study_id, str(payload.get("name", "Randomization List")).strip() or "Randomization List", json.dumps(arms), user["id"], timestamp, timestamp),
+            )
+            after = row(conn, "SELECT * FROM randomization_lists WHERE id = ?", (cur.lastrowid,))
+            audit(conn, user["id"], "create", "randomization_list", cur.lastrowid, None, after)
+            self.send_json({"list": after}, 201)
+            return
+        if method == "POST" and len(parts) == 6 and parts[5] == "allocate":
+            list_id = int(parts[4])
+            payload = self.body()
+            participant_id = int(payload.get("participant_id") or 0)
+            after = self.allocate_randomization(conn, user, study_id, list_id, participant_id)
+            self.send_json({"allocation": after}, 201)
+            return
+        self.send_error_json("Unsupported randomization operation", 405)
+
+    def allocate_randomization(self, conn, user, study_id: int, list_id: int, participant_id: int) -> dict:
+        random_list = row(conn, "SELECT * FROM randomization_lists WHERE id = ? AND study_id = ? AND active = 1", (list_id, study_id))
+        if not random_list:
+            raise ValueError("Randomization list not found")
+        if not row(conn, "SELECT id FROM participants WHERE id = ? AND study_id = ?", (participant_id, study_id)):
+            raise ValueError("Participant not found")
+        existing = row(conn, "SELECT * FROM randomization_allocations WHERE list_id = ? AND participant_id = ?", (list_id, participant_id))
+        if existing:
+            return existing
+        arms = load_json(random_list["arms_json"], [])
+        if not arms:
+            raise ValueError("Randomization list has no arms")
+        index = int(random_list["next_index"] or 0)
+        arm = arms[index % len(arms)]
+        timestamp = now()
+        cur = conn.execute(
+            "INSERT INTO randomization_allocations(study_id, list_id, participant_id, arm, allocated_by, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (study_id, list_id, participant_id, arm, user["id"], timestamp),
+        )
+        conn.execute("UPDATE randomization_lists SET next_index = ?, updated_at = ? WHERE id = ?", (index + 1, timestamp, list_id))
+        after = row(conn, "SELECT * FROM randomization_allocations WHERE id = ?", (cur.lastrowid,))
+        audit(conn, user["id"], "allocate", "randomization", cur.lastrowid, None, after)
+        return after
+
+    def metadata(self, conn, study_id: int) -> None:
+        payload = self.metadata_payload(conn, study_id)
+        self.send_json({"project": payload["project"], "instruments": payload["instruments"], "data_dictionary": payload["data_dictionary"]})
 
     def validation_evidence(self, conn, study_id: int) -> None:
         study = row(conn, "SELECT * FROM studies WHERE id = ?", (study_id,))
@@ -2398,18 +2710,12 @@ class App(BaseHTTPRequestHandler):
     def export_csv(self, conn, study_id: int, membership) -> None:
         return self.export_entries_csv(conn, study_id, membership, {}, "clinical_data_export.csv")
 
-    def export_entries_csv(self, conn, study_id: int, membership, filters: dict, filename: str) -> None:
+    def record_payload(self, conn, study_id: int, membership, filters: dict) -> list[dict]:
         forms = rows(conn, "SELECT * FROM forms WHERE study_id = ? ORDER BY id", (study_id,))
         field_codes = []
-        labels = {}
         for form in forms:
             for field in load_json(form["schema_json"], {"fields": []}).get("fields", []):
-                code = f"{form['code']}__{field.get('code')}"
-                field_codes.append(code)
-                labels[code] = field.get("label", code)
-        output = []
-        header = ["study_uid", "initials", "participant_status", "event_name", "event_code", "repeat_instance", "form_name", "entry_status", "locked"] + field_codes
-        output.append(header)
+                field_codes.append(f"{form['code']}__{field.get('code')}")
         where = ["entries.study_id = ?"]
         params: list = [study_id]
         if filters.get("participant_status"):
@@ -2438,20 +2744,36 @@ class App(BaseHTTPRequestHandler):
             WHERE {" AND ".join(where)}
             ORDER BY participants.study_uid, study_events.display_order, forms.id
         """
-        entries = rows(conn, sql, tuple(params))
-        for entry in entries:
+        payload = []
+        for entry in rows(conn, sql, tuple(params)):
             data = load_json(entry["data_json"], {})
-            line = [entry["study_uid"], entry["initials"], entry["participant_status"], entry.get("mapped_event_name") or entry["event_name"], entry.get("event_code") or entry["event_name"], entry["repeat_instance"], entry["form_name"], entry["status"], "yes" if entry["locked_at"] else "no"]
+            record = {
+                "study_uid": entry["study_uid"],
+                "initials": entry["initials"],
+                "participant_status": entry["participant_status"],
+                "event_name": entry.get("mapped_event_name") or entry["event_name"],
+                "event_code": entry.get("event_code") or entry["event_name"],
+                "repeat_instance": entry["repeat_instance"],
+                "form_name": entry["form_name"],
+                "entry_status": entry["status"],
+                "locked": "yes" if entry["locked_at"] else "no",
+            }
             for code in field_codes:
                 prefix, field_code = code.split("__", 1)
-                line.append(data.get(field_code, "") if prefix == entry["form_code"] else "")
-            output.append(line)
+                record[code] = data.get(field_code, "") if prefix == entry["form_code"] else ""
+            payload.append(record)
+        return payload
+
+    def export_entries_csv(self, conn, study_id: int, membership, filters: dict, filename: str) -> None:
+        records = self.record_payload(conn, study_id, membership, filters)
+        fieldnames = list(records[0].keys()) if records else ["study_uid", "initials", "participant_status", "event_name", "event_code", "repeat_instance", "form_name", "entry_status", "locked"]
         text_lines = []
         class Sink:
             def write(self, value):
                 text_lines.append(value)
-        writer = csv.writer(Sink())
-        writer.writerows(output)
+        writer = csv.DictWriter(Sink(), fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(records)
         content = "".join(text_lines).encode("utf-8-sig")
         self.send_response(200)
         self.send_header("content-type", "text/csv; charset=utf-8")
@@ -2494,6 +2816,65 @@ class App(BaseHTTPRequestHandler):
             filename = f"clinical_report_{normalize_code(report['name'], 'report')}.csv"
             return self.export_entries_csv(conn, study_id, membership, load_json(report["filters_json"], {}), filename)
         self.send_error_json("Unsupported reports operation", 405)
+
+    def export_odm(self, conn, study_id: int) -> None:
+        meta = self.metadata_payload(conn, study_id)
+        root = ElementTree.Element("ODM", {"ODMVersion": "1.3.2", "FileType": "Snapshot", "Description": "Clinical Data Studio ODM-like export"})
+        study_el = ElementTree.SubElement(root, "Study", {"OID": f"STUDY.{study_id}"})
+        ElementTree.SubElement(study_el, "GlobalVariables")
+        metadata = ElementTree.SubElement(study_el, "MetaDataVersion", {"OID": f"MDV.{study_id}", "Name": meta["project"]["name"]})
+        for instrument in meta["instruments"]:
+            form_def = ElementTree.SubElement(metadata, "FormDef", {"OID": f"FORM.{instrument['instrument_name']}", "Name": instrument["instrument_label"], "Repeating": "Yes" if instrument["repeatable"] else "No"})
+            for field in [item for item in meta["data_dictionary"] if item["form_name"] == instrument["instrument_name"]]:
+                item_group = ElementTree.SubElement(form_def, "ItemGroupRef", {"ItemGroupOID": f"IG.{instrument['instrument_name']}.{field['field_name']}", "Mandatory": "Yes" if field["required_field"] else "No"})
+                item_group.set("OrderNumber", str(field["question_number"]))
+                item_def = ElementTree.SubElement(metadata, "ItemDef", {"OID": f"ITEM.{instrument['instrument_name']}.{field['field_name']}", "Name": field["field_name"], "DataType": "text"})
+                ElementTree.SubElement(item_def, "Question").text = field["field_label"]
+        content = ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)
+        self.send_response(200)
+        self.send_header("content-type", "application/xml; charset=utf-8")
+        self.send_header("content-disposition", "attachment; filename=clinical_data_project.xml")
+        self.send_header("content-length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
+    def export_stats_package(self, conn, study_id: int, membership, package: str) -> None:
+        records = self.record_payload(conn, study_id, membership, {})
+        fields = list(records[0].keys()) if records else ["study_uid"]
+        syntax = {
+            "r": "data <- read.csv('clinical_data_export.csv', stringsAsFactors = FALSE)\nstr(data)\nsummary(data)\n",
+            "sas": "proc import datafile='clinical_data_export.csv' out=clinical_data dbms=csv replace;\n  guessingrows=max;\nrun;\nproc contents data=clinical_data; run;\n",
+            "spss": "GET DATA /TYPE=TXT /FILE='clinical_data_export.csv' /DELCASE=LINE /DELIMITERS=',' /ARRANGEMENT=DELIMITED /FIRSTCASE=2 /VARIABLES=" + " ".join(f"{field} A255" for field in fields) + ".\nEXECUTE.\n",
+            "stata": "import delimited using \"clinical_data_export.csv\", clear\ncodebook\nsummarize\n",
+        }
+        if package not in syntax:
+            self.send_error_json("Unsupported statistical package type", 400)
+            return
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as temporary:
+            archive_path = Path(temporary.name)
+        try:
+            with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
+                csv_lines = []
+                class Sink:
+                    def write(self, value):
+                        csv_lines.append(value)
+                writer = csv.DictWriter(Sink(), fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(records)
+                archive.writestr("clinical_data_export.csv", "".join(csv_lines))
+                extension = "R" if package == "r" else package
+                archive.writestr(f"clinical_data_import.{extension}", syntax[package])
+                archive.writestr("README.txt", "Generated by Clinical Data Studio. Review variable labels and coding before final analysis.\n")
+            content = archive_path.read_bytes()
+        finally:
+            if archive_path.exists():
+                archive_path.unlink()
+        self.send_response(200)
+        self.send_header("content-type", "application/zip")
+        self.send_header("content-disposition", f"attachment; filename=clinical_data_{package}_package.zip")
+        self.send_header("content-length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
 
     def backups(self, conn, user, method, study_id, parts) -> None:
         BACKUPS.mkdir(parents=True, exist_ok=True)

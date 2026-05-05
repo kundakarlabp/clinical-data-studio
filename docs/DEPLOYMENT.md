@@ -85,6 +85,18 @@ $env:CDS_BASE_URL = "http://127.0.0.1:8765"
 .\tests\browser_smoke.ps1
 ```
 
+## REDCap-style API and Exports
+
+Create API tokens from the Access page. The local REDCap-style endpoint is:
+
+```text
+/api/redcap
+```
+
+Supported parameters include `token`, `content`, `action`, and `format`. Supported content values are `project`, `metadata`, `instrument`, `event`, `record`, and `randomization`.
+
+The Reports page also provides ODM XML and R/SAS/SPSS/Stata package exports. Review exported syntax before formal analysis.
+
 ## Validation Reminder
 
 This deployment guide supports a small local research workflow. A regulated clinical trial still needs documented validation, SOP approval, access review, backup restore drills, and audit review sign-off.

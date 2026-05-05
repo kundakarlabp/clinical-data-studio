@@ -26,6 +26,10 @@ class FrontendStaticTests(unittest.TestCase):
         self.assertIn("/surveys", app_js)
         self.assertIn("/invitations", app_js)
         self.assertIn("/validation", app_js)
+        self.assertIn("/api-tokens", app_js)
+        self.assertIn("/randomization", app_js)
+        self.assertIn("/odm", app_js)
+        self.assertIn("/stats-package", app_js)
         self.assertIn("type=\"file\"", app_js)
 
     def test_public_survey_shell_is_present(self):

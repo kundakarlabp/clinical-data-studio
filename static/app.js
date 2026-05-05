@@ -7,6 +7,8 @@ const state = {
   users: [],
   groups: [],
   studyMembers: [],
+  events: [],
+  formEvents: [],
   forms: [],
   participants: [],
   entries: [],
@@ -16,6 +18,7 @@ const state = {
   analysis: null,
   view: "dashboard",
   selectedParticipantId: 0,
+  selectedEventId: Number(localStorage.getItem("cds_event_id") || 0),
   menuOpen: false,
   error: "",
 };
@@ -75,8 +78,10 @@ async function loadStudy() {
   if (!state.studyId) return;
   const manageUsers = can("manage_users");
   const viewAnalysis = can("view_analysis") || can("review_data");
-  const [forms, participants, entries, queries, quality, analysis, audit, groups, studyMembers, users] = await Promise.all([
+  const [forms, events, formEvents, participants, entries, queries, quality, analysis, audit, groups, studyMembers, users] = await Promise.all([
     api(`/api/studies/${state.studyId}/forms`),
+    api(`/api/studies/${state.studyId}/events`),
+    api(`/api/studies/${state.studyId}/form-events`),
     api(`/api/studies/${state.studyId}/participants`),
     api(`/api/studies/${state.studyId}/entries`),
     api(`/api/studies/${state.studyId}/queries`),
@@ -88,6 +93,11 @@ async function loadStudy() {
     state.user?.role === "admin" ? api("/api/users") : Promise.resolve({ users: [] }),
   ]);
   state.forms = forms.forms;
+  state.events = events.events;
+  state.formEvents = formEvents.form_events;
+  if (!state.selectedEventId && state.events[0]) state.selectedEventId = state.events[0].id;
+  if (state.selectedEventId && !state.events.some((event) => event.id === state.selectedEventId)) state.selectedEventId = state.events[0]?.id || 0;
+  localStorage.setItem("cds_event_id", String(state.selectedEventId || ""));
   state.participants = participants.participants;
   state.entries = entries.entries;
   state.queries = queries.queries;
@@ -138,6 +148,7 @@ function render() {
           ${navButton("participants", "Participants")}
           ${navButton("data", "Data Entry")}
           ${navButton("forms", "CRF Builder")}
+          ${can("manage_study") ? navButton("events", "Events") : ""}
           ${navButton("queries", "Review Queries")}
           ${navButton("quality", "Data Quality")}
           ${navButton("analysis", "Analysis")}
@@ -181,6 +192,7 @@ function route() {
   if (state.view === "participants") return participantsView();
   if (state.view === "data") return dataView();
   if (state.view === "forms") return formsView();
+  if (state.view === "events") return eventsView();
   if (state.view === "queries") return queriesView();
   if (state.view === "quality") return qualityView();
   if (state.view === "analysis") return analysisView();
@@ -271,23 +283,34 @@ function participantsTable(participants) {
 
 function dataView() {
   const selected = state.participants.find((item) => item.id === state.selectedParticipantId) || state.participants[0];
-  const entryCards = selected ? state.forms.map((form) => entryCard(selected, form)).join("") : "<p>Add a participant first.</p>";
+  const selectedEvent = state.events.find((event) => event.id === state.selectedEventId) || state.events[0];
+  const mappedFormIds = state.formEvents.filter((item) => item.event_id === selectedEvent?.id).map((item) => item.form_id);
+  const visibleForms = mappedFormIds.length ? state.forms.filter((form) => mappedFormIds.includes(form.id)) : state.forms;
+  const entryCards = selected ? visibleForms.map((form) => entryCard(selected, form, selectedEvent)).join("") : "<p>Add a participant first.</p>";
   return `
     <section class="panel">
       <h2>Data Entry</h2>
-      <label>
-        Participant
-        <select id="participant-picker">
-          ${state.participants.map((item) => `<option value="${item.id}" ${selected?.id === item.id ? "selected" : ""}>${escapeHtml(item.study_uid)} ${escapeHtml(item.initials)}</option>`).join("")}
-        </select>
-      </label>
+      <div class="form-grid">
+        <label>
+          Participant
+          <select id="participant-picker">
+            ${state.participants.map((item) => `<option value="${item.id}" ${selected?.id === item.id ? "selected" : ""}>${escapeHtml(item.study_uid)} ${escapeHtml(item.initials)}</option>`).join("")}
+          </select>
+        </label>
+        <label>
+          Event / visit
+          <select id="event-picker">
+            ${state.events.map((event) => `<option value="${event.id}" ${selectedEvent?.id === event.id ? "selected" : ""}>${escapeHtml(event.name)} (${escapeHtml(event.arm_name)})</option>`).join("")}
+          </select>
+        </label>
+      </div>
     </section>
     <section class="grid two">${entryCards}</section>
   `;
 }
 
-function entryCard(participant, form) {
-  const existing = state.entries.find((entry) => entry.participant_id === participant.id && entry.form_id === form.id) || { data: {}, status: "draft", event_name: "Baseline", repeat_instance: 1 };
+function entryCard(participant, form, selectedEvent) {
+  const existing = state.entries.find((entry) => entry.participant_id === participant.id && entry.form_id === form.id && (entry.event_id === selectedEvent?.id || (!entry.event_id && entry.event_name === (selectedEvent?.code || "Baseline")))) || { data: {}, status: "draft", event_name: selectedEvent?.code || "Baseline", event_id: selectedEvent?.id || null, repeat_instance: 1 };
   const locked = Boolean(existing.locked_at);
   return `
     <form class="card stack entry-form" data-form-id="${form.id}" data-participant-id="${participant.id}">
@@ -297,8 +320,9 @@ function entryCard(participant, form) {
           <span class="pill ${existing.status === "complete" ? "ok" : "warn"}">${escapeHtml(existing.status)}</span>
           ${locked ? `<span class="pill ok">locked</span>` : ""}
         </div>
-        <label>Event<input name="event_name" value="${escapeHtml(existing.event_name || "Baseline")}" /></label>
+        <label>Event<input name="event_name" value="${escapeHtml(selectedEvent?.name || existing.event_name || "Baseline")}" readonly /></label>
       </div>
+      <input type="hidden" name="event_id" value="${escapeHtml(selectedEvent?.id || "")}" />
       <label>Repeat instance<input name="repeat_instance" type="number" min="1" value="${escapeHtml(existing.repeat_instance || 1)}" ${form.schema.repeatable ? "" : "readonly"} /></label>
       ${form.schema.fields.map((field) => fieldInput(field, existing.data)).join("")}
       <label>Status
@@ -357,6 +381,10 @@ function formsView() {
               <option value="true">Yes</option>
             </select>
           </label>
+          <fieldset class="full">
+            <legend>Assign to events</legend>
+            ${state.events.map((event) => `<label class="check"><input type="checkbox" name="event_ids" value="${event.id}" ${event.code === "baseline" ? "checked" : ""} />${escapeHtml(event.name)}</label>`).join("")}
+          </fieldset>
         </div>
         <div id="fields" class="stack">
           ${fieldEditorRow()}
@@ -379,6 +407,59 @@ function formsView() {
             </div>
           </article>
         `).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function eventsView() {
+  return `
+    <section class="grid two">
+      <section class="panel">
+        <h2>Create Event</h2>
+        <form id="event-form" class="stack">
+          <label>Name<input name="name" required placeholder="Month 1 Visit" /></label>
+          <label>Code<input name="code" placeholder="month_1" /></label>
+          <label>Arm<input name="arm_name" value="Default" /></label>
+          <label>Day offset<input name="day_offset" type="number" value="0" /></label>
+          <button>Create Event</button>
+        </form>
+      </section>
+      <section class="panel">
+        <h2>Map CRF To Event</h2>
+        <form id="form-event-form" class="stack">
+          <label>Event
+            <select name="event_id">
+              ${state.events.map((event) => `<option value="${event.id}">${escapeHtml(event.name)}</option>`).join("")}
+            </select>
+          </label>
+          <label>CRF
+            <select name="form_id">
+              ${state.forms.map((form) => `<option value="${form.id}">${escapeHtml(form.name)}</option>`).join("")}
+            </select>
+          </label>
+          <label>Required
+            <select name="required">
+              <option value="true">Yes</option>
+              <option value="false">No</option>
+            </select>
+          </label>
+          <button>Save Mapping</button>
+        </form>
+      </section>
+    </section>
+    <section class="panel">
+      <h2>Schedule</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Event</th><th>Arm</th><th>Day</th><th>CRFs</th></tr></thead>
+          <tbody>
+            ${state.events.map((event) => {
+              const mapped = state.formEvents.filter((item) => item.event_id === event.id).map((item) => item.form_name).join(", ");
+              return `<tr><td><strong>${escapeHtml(event.name)}</strong><br><span class="small">${escapeHtml(event.code)}</span></td><td>${escapeHtml(event.arm_name)}</td><td>${event.day_offset}</td><td>${escapeHtml(mapped || "No CRFs mapped")}</td></tr>`;
+            }).join("")}
+          </tbody>
+        </table>
       </div>
     </section>
   `;
@@ -649,6 +730,8 @@ function bindRoute() {
   document.querySelector("#user-form")?.addEventListener("submit", submitUser);
   document.querySelector("#group-form")?.addEventListener("submit", submitGroup);
   document.querySelector("#membership-form")?.addEventListener("submit", submitMembership);
+  document.querySelector("#event-form")?.addEventListener("submit", submitEvent);
+  document.querySelector("#form-event-form")?.addEventListener("submit", submitFormEvent);
   document.querySelector("#form-builder")?.addEventListener("submit", submitFormDefinition);
   document.querySelector("#add-field")?.addEventListener("click", () => {
     document.querySelector("#fields").insertAdjacentHTML("beforeend", fieldEditorRow());
@@ -663,6 +746,11 @@ function bindRoute() {
   });
   document.querySelector("#participant-picker")?.addEventListener("change", (event) => {
     state.selectedParticipantId = Number(event.target.value);
+    render();
+  });
+  document.querySelector("#event-picker")?.addEventListener("change", (event) => {
+    state.selectedEventId = Number(event.target.value);
+    localStorage.setItem("cds_event_id", String(state.selectedEventId || ""));
     render();
   });
   document.querySelectorAll(".entry-form").forEach((form) => {
@@ -775,6 +863,42 @@ async function submitMembership(event) {
   }
 }
 
+async function submitEvent(event) {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(event.target));
+  try {
+    await api(`/api/studies/${state.studyId}/events`, {
+      method: "POST",
+      body: JSON.stringify({ ...data, day_offset: Number(data.day_offset || 0) }),
+    });
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function submitFormEvent(event) {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(event.target));
+  try {
+    await api(`/api/studies/${state.studyId}/form-events`, {
+      method: "POST",
+      body: JSON.stringify({
+        event_id: Number(data.event_id),
+        form_id: Number(data.form_id),
+        required: data.required === "true",
+      }),
+    });
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
 async function submitFormDefinition(event) {
   event.preventDefault();
   const formData = new FormData(event.target);
@@ -796,9 +920,10 @@ async function submitFormDefinition(event) {
     return field;
   });
   try {
+    const eventIds = [...event.target.querySelectorAll(`[name="event_ids"]:checked`)].map((item) => Number(item.value));
     await api(`/api/studies/${state.studyId}/forms`, {
       method: "POST",
-      body: JSON.stringify({ name: formData.get("name"), code: formData.get("code"), schema: { fields, repeatable: formData.get("repeatable") === "true" } }),
+      body: JSON.stringify({ name: formData.get("name"), code: formData.get("code"), event_ids: eventIds, schema: { fields, repeatable: formData.get("repeatable") === "true" } }),
     });
     await loadStudy();
     render();
@@ -829,6 +954,7 @@ async function submitEntry(event) {
       body: JSON.stringify({
         participant_id: Number(form.dataset.participantId),
         form_id: Number(form.dataset.formId),
+        event_id: payload.event_id ? Number(payload.event_id) : null,
         event_name: payload.event_name || "Baseline",
         repeat_instance: Number(payload.repeat_instance || 1),
         status: payload.status || "draft",

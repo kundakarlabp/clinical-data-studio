@@ -9,6 +9,8 @@ const state = {
   studyMembers: [],
   events: [],
   formEvents: [],
+  reports: [],
+  backups: [],
   forms: [],
   participants: [],
   entries: [],
@@ -78,10 +80,12 @@ async function loadStudy() {
   if (!state.studyId) return;
   const manageUsers = can("manage_users");
   const viewAnalysis = can("view_analysis") || can("review_data");
-  const [forms, events, formEvents, participants, entries, queries, quality, analysis, audit, groups, studyMembers, users] = await Promise.all([
+  const [forms, events, formEvents, reports, backups, participants, entries, queries, quality, analysis, audit, groups, studyMembers, users] = await Promise.all([
     api(`/api/studies/${state.studyId}/forms`),
     api(`/api/studies/${state.studyId}/events`),
     api(`/api/studies/${state.studyId}/form-events`),
+    viewAnalysis ? api(`/api/studies/${state.studyId}/reports`) : Promise.resolve({ reports: [] }),
+    can("manage_study") ? api(`/api/studies/${state.studyId}/backups`) : Promise.resolve({ backups: [] }),
     api(`/api/studies/${state.studyId}/participants`),
     api(`/api/studies/${state.studyId}/entries`),
     api(`/api/studies/${state.studyId}/queries`),
@@ -95,6 +99,8 @@ async function loadStudy() {
   state.forms = forms.forms;
   state.events = events.events;
   state.formEvents = formEvents.form_events;
+  state.reports = reports.reports;
+  state.backups = backups.backups;
   if (!state.selectedEventId && state.events[0]) state.selectedEventId = state.events[0].id;
   if (state.selectedEventId && !state.events.some((event) => event.id === state.selectedEventId)) state.selectedEventId = state.events[0]?.id || 0;
   localStorage.setItem("cds_event_id", String(state.selectedEventId || ""));
@@ -152,6 +158,8 @@ function render() {
           ${navButton("queries", "Review Queries")}
           ${navButton("quality", "Data Quality")}
           ${navButton("analysis", "Analysis")}
+          ${can("view_analysis") || can("export_data") ? navButton("reports", "Reports") : ""}
+          ${can("manage_study") ? navButton("backups", "Backups") : ""}
           ${navButton("audit", "Audit Trail")}
           ${can("manage_users") ? navButton("access", "Access") : ""}
           ${navButton("settings", "Study Setup")}
@@ -196,6 +204,8 @@ function route() {
   if (state.view === "queries") return queriesView();
   if (state.view === "quality") return qualityView();
   if (state.view === "analysis") return analysisView();
+  if (state.view === "reports") return reportsView();
+  if (state.view === "backups") return backupsView();
   if (state.view === "audit") return auditView();
   if (state.view === "access") return accessView();
   if (state.view === "settings") return settingsView();
@@ -572,6 +582,107 @@ function analysisView() {
   `;
 }
 
+function reportsView() {
+  return `
+    <section class="panel">
+      <h2>Create Report</h2>
+      ${can("export_data") ? `
+        <form id="report-form" class="form-grid">
+          <label>Name<input name="name" required placeholder="Completed Baseline CRFs" /></label>
+          <label>Description<input name="description" placeholder="Optional report note" /></label>
+          <label>Participant status
+            <select name="participant_status">
+              <option value="">Any</option>
+              <option value="screening">screening</option>
+              <option value="enrolled">enrolled</option>
+              <option value="completed">completed</option>
+              <option value="withdrawn">withdrawn</option>
+            </select>
+          </label>
+          <label>Entry status
+            <select name="entry_status">
+              <option value="">Any</option>
+              <option value="draft">draft</option>
+              <option value="complete">complete</option>
+            </select>
+          </label>
+          <label>Event
+            <select name="event_id">
+              <option value="">Any</option>
+              ${state.events.map((event) => `<option value="${event.id}">${escapeHtml(event.name)}</option>`).join("")}
+            </select>
+          </label>
+          <label>CRF
+            <select name="form_id">
+              <option value="">Any</option>
+              ${state.forms.map((form) => `<option value="${form.id}">${escapeHtml(form.name)}</option>`).join("")}
+            </select>
+          </label>
+          <div class="full"><button>Save Report</button></div>
+        </form>
+      ` : "<p>Your role can view reports but cannot create exportable reports.</p>"}
+    </section>
+    <section class="panel">
+      <h2>Saved Reports</h2>
+      ${state.reports.length ? `
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Name</th><th>Filters</th><th>Created By</th><th></th></tr></thead>
+            <tbody>
+              ${state.reports.map((report) => `
+                <tr>
+                  <td><strong>${escapeHtml(report.name)}</strong><br><span class="small">${escapeHtml(report.description || "")}</span></td>
+                  <td>${escapeHtml(reportFilterText(report.filters || {}))}</td>
+                  <td>${escapeHtml(report.created_by_name || "")}</td>
+                  <td>${can("export_data") ? `<a href="/api/studies/${state.studyId}/reports/${report.id}/export" target="_blank"><button class="secondary">Export</button></a>` : ""}</td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+      ` : "<p>No saved reports.</p>"}
+    </section>
+  `;
+}
+
+function reportFilterText(filters) {
+  const parts = [];
+  if (filters.participant_status) parts.push(`participant: ${filters.participant_status}`);
+  if (filters.entry_status) parts.push(`entry: ${filters.entry_status}`);
+  if (filters.event_id) parts.push(`event id: ${filters.event_id}`);
+  if (filters.form_id) parts.push(`form id: ${filters.form_id}`);
+  return parts.length ? parts.join(", ") : "No filters";
+}
+
+function backupsView() {
+  return `
+    <section class="panel">
+      <div class="row">
+        <h2>Backups</h2>
+        <button id="backup-create">Create Backup</button>
+      </div>
+      <p>Backups are local SQLite snapshots stored under the app data folder. Keep copies on an encrypted external drive for real studies.</p>
+      ${state.backups.length ? `
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>File</th><th>Size</th><th>Created</th><th></th></tr></thead>
+            <tbody>
+              ${state.backups.map((backup) => `
+                <tr>
+                  <td>${escapeHtml(backup.name)}</td>
+                  <td>${Math.round(backup.size / 1024)} KB</td>
+                  <td>${fmtTime(backup.created_at)}</td>
+                  <td><a href="/api/studies/${state.studyId}/backups/${encodeURIComponent(backup.name)}" target="_blank"><button class="secondary">Download</button></a></td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+      ` : "<p>No backups yet.</p>"}
+    </section>
+  `;
+}
+
 function auditView() {
   return `
     <section class="panel">
@@ -732,6 +843,8 @@ function bindRoute() {
   document.querySelector("#membership-form")?.addEventListener("submit", submitMembership);
   document.querySelector("#event-form")?.addEventListener("submit", submitEvent);
   document.querySelector("#form-event-form")?.addEventListener("submit", submitFormEvent);
+  document.querySelector("#report-form")?.addEventListener("submit", submitReport);
+  document.querySelector("#backup-create")?.addEventListener("click", createBackup);
   document.querySelector("#form-builder")?.addEventListener("submit", submitFormDefinition);
   document.querySelector("#add-field")?.addEventListener("click", () => {
     document.querySelector("#fields").insertAdjacentHTML("beforeend", fieldEditorRow());
@@ -891,6 +1004,37 @@ async function submitFormEvent(event) {
         required: data.required === "true",
       }),
     });
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function submitReport(event) {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(event.target));
+  const filters = {};
+  ["participant_status", "entry_status", "event_id", "form_id"].forEach((key) => {
+    if (data[key]) filters[key] = key.endsWith("_id") ? Number(data[key]) : data[key];
+  });
+  try {
+    await api(`/api/studies/${state.studyId}/reports`, {
+      method: "POST",
+      body: JSON.stringify({ name: data.name, description: data.description || "", filters }),
+    });
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function createBackup() {
+  try {
+    await api(`/api/studies/${state.studyId}/backups`, { method: "POST", body: "{}" });
     await loadStudy();
     render();
   } catch (error) {

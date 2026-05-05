@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import base64
 import csv
 import hashlib
@@ -11,6 +12,7 @@ import secrets
 import shutil
 import sqlite3
 import time
+from io import StringIO
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,6 +27,14 @@ DB_PATH = DATA / "clinical_data_studio.sqlite3"
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("CDS_PORT", "8765"))
 PBKDF2_ROUNDS = 260_000
+CALC_OPERATORS = {
+    ast.Add: lambda a, b: a + b,
+    ast.Sub: lambda a, b: a - b,
+    ast.Mult: lambda a, b: a * b,
+    ast.Div: lambda a, b: a / b,
+    ast.USub: lambda a: -a,
+    ast.UAdd: lambda a: a,
+}
 
 ROLE_PERMISSIONS = {
     "admin": {
@@ -180,6 +190,7 @@ def migrate() -> None:
                 display_name TEXT NOT NULL,
                 role TEXT NOT NULL DEFAULT 'admin',
                 active INTEGER NOT NULL DEFAULT 1,
+                must_change_password INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL
             );
 
@@ -260,6 +271,18 @@ def migrate() -> None:
                 UNIQUE(event_id, form_id)
             );
 
+            CREATE TABLE IF NOT EXISTS form_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                form_id INTEGER NOT NULL REFERENCES forms(id) ON DELETE CASCADE,
+                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+                version INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                code TEXT NOT NULL,
+                schema_json TEXT NOT NULL,
+                saved_by INTEGER REFERENCES users(id),
+                saved_at INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS participants (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
@@ -307,6 +330,25 @@ def migrate() -> None:
                 updated_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS query_responses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                query_id INTEGER NOT NULL REFERENCES queries(id) ON DELETE CASCADE,
+                user_id INTEGER REFERENCES users(id),
+                message TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS field_states (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+                field_code TEXT NOT NULL,
+                state TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                user_id INTEGER REFERENCES users(id),
+                created_at INTEGER NOT NULL,
+                UNIQUE(entry_id, field_code, state)
+            );
+
             CREATE TABLE IF NOT EXISTS audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER REFERENCES users(id),
@@ -336,6 +378,7 @@ def migrate() -> None:
         add_column(conn, "entries", "lock_reason", "TEXT NOT NULL DEFAULT ''")
         add_column(conn, "entries", "event_id", "INTEGER REFERENCES study_events(id) ON DELETE SET NULL")
         add_column(conn, "participants", "data_group_id", "INTEGER REFERENCES data_groups(id) ON DELETE SET NULL")
+        add_column(conn, "users", "must_change_password", "INTEGER NOT NULL DEFAULT 0")
         migrate_entries_unique_key(conn)
         if not row(conn, "SELECT id FROM users WHERE username = ?", ("admin",)):
             user = {
@@ -345,10 +388,13 @@ def migrate() -> None:
                 "created_at": now(),
             }
             conn.execute(
-                "INSERT INTO users(username, password_hash, display_name, role, created_at) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO users(username, password_hash, display_name, role, must_change_password, created_at) VALUES (?, ?, ?, ?, 1, ?)",
                 ("admin", encode_password("admin123"), user["display_name"], user["role"], user["created_at"]),
             )
             audit(conn, None, "seed", "user", 1, None, user)
+        default_admin = row(conn, "SELECT id, password_hash FROM users WHERE username = 'admin'")
+        if default_admin and verify_password("admin123", default_admin["password_hash"]):
+            conn.execute("UPDATE users SET must_change_password = 1 WHERE id = ?", (default_admin["id"],))
         if not row(conn, "SELECT id FROM studies LIMIT 1"):
             seed_study(conn)
         seed_admin_memberships(conn)
@@ -499,6 +545,8 @@ def validate_entry_data(schema: dict, data: dict) -> tuple[dict, list[dict]]:
                 issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} is required"})
             cleaned[code] = "" if field["type"] != "checkbox" else []
             continue
+        if field["type"] == "calc":
+            continue
         if field["type"] == "number":
             try:
                 number = float(value)
@@ -526,7 +574,41 @@ def validate_entry_data(schema: dict, data: dict) -> tuple[dict, list[dict]]:
             cleaned[code] = selected
             continue
         cleaned[code] = str(value)
+    for field in schema.get("fields", []):
+        if field["type"] != "calc":
+            continue
+        code = field["code"]
+        calculation = field.get("calculation", "")
+        if not calculation:
+            cleaned[code] = ""
+            continue
+        try:
+            cleaned[code] = round(float(evaluate_calculation(calculation, cleaned)), 6)
+        except Exception:
+            issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} calculation could not be evaluated"})
     return cleaned, issues
+
+
+def evaluate_calculation(expression: str, values: dict) -> float:
+    def eval_node(node):
+        if isinstance(node, ast.Expression):
+            return eval_node(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return float(node.value)
+        if isinstance(node, ast.Name):
+            value = values.get(node.id, 0)
+            return float(value or 0)
+        if isinstance(node, ast.BinOp) and type(node.op) in CALC_OPERATORS:
+            right = eval_node(node.right)
+            if isinstance(node.op, ast.Div) and right == 0:
+                raise ZeroDivisionError
+            return CALC_OPERATORS[type(node.op)](eval_node(node.left), right)
+        if isinstance(node, ast.UnaryOp) and type(node.op) in CALC_OPERATORS:
+            return CALC_OPERATORS[type(node.op)](eval_node(node.operand))
+        raise ValueError("Unsupported calculation")
+
+    parsed = ast.parse(expression, mode="eval")
+    return eval_node(parsed)
 
 
 def user_membership(conn: sqlite3.Connection, user: dict, study_id: int) -> dict | None:
@@ -630,7 +712,7 @@ class App(BaseHTTPRequestHandler):
         user = row(
             conn,
             """
-            SELECT users.id, users.username, users.display_name, users.role, users.active
+            SELECT users.id, users.username, users.display_name, users.role, users.active, users.must_change_password
             FROM sessions JOIN users ON users.id = sessions.user_id
             WHERE sessions.token = ? AND sessions.expires_at > ? AND users.active = 1
             """,
@@ -673,6 +755,8 @@ class App(BaseHTTPRequestHandler):
                     return self.send_json({"user": user, "memberships": memberships})
                 if path == "/api/password" and method == "POST":
                     return self.change_password(conn, user)
+                if path == "/api/assist/crf" and method == "POST":
+                    return self.assist_crf(conn, user)
                 if path == "/api/studies" and method == "GET":
                     return self.send_json({"studies": self.visible_studies(conn, user)})
                 if path == "/api/studies" and method == "POST":
@@ -705,7 +789,7 @@ class App(BaseHTTPRequestHandler):
         token = secrets.token_urlsafe(32)
         conn.execute("INSERT INTO sessions(token, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)", (token, user["id"], now() + 60 * 60 * 24 * 14, now()))
         audit(conn, user["id"], "login", "session", None, None, {"username": username})
-        self.send_json({"token": token, "user": {"id": user["id"], "username": user["username"], "display_name": user["display_name"], "role": user["role"]}})
+        self.send_json({"token": token, "user": {"id": user["id"], "username": user["username"], "display_name": user["display_name"], "role": user["role"], "must_change_password": user.get("must_change_password", 0)}})
 
     def logout(self, conn: sqlite3.Connection) -> None:
         header = self.headers.get("authorization", "")
@@ -734,7 +818,7 @@ class App(BaseHTTPRequestHandler):
             self.send_error_json("Admin permission required", 403)
             return
         if method == "GET":
-            users = rows(conn, "SELECT id, username, display_name, role, active, created_at FROM users ORDER BY username")
+            users = rows(conn, "SELECT id, username, display_name, role, active, must_change_password, created_at FROM users ORDER BY username")
             self.send_json({"users": users})
             return
         if method == "POST":
@@ -754,7 +838,7 @@ class App(BaseHTTPRequestHandler):
                 "INSERT INTO users(username, password_hash, display_name, role, active, created_at) VALUES (?, ?, ?, ?, 1, ?)",
                 (username, encode_password(password), display_name, role_name, timestamp),
             )
-            after = row(conn, "SELECT id, username, display_name, role, active, created_at FROM users WHERE id = ?", (cur.lastrowid,))
+            after = row(conn, "SELECT id, username, display_name, role, active, must_change_password, created_at FROM users WHERE id = ?", (cur.lastrowid,))
             audit(conn, user["id"], "create", "user", cur.lastrowid, None, after)
             self.send_json({"user": after}, 201)
             return
@@ -771,9 +855,36 @@ class App(BaseHTTPRequestHandler):
         if len(new_password) < 8:
             self.send_error_json("New password must be at least 8 characters", 400)
             return
-        conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (encode_password(new_password), user["id"]))
+        conn.execute("UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?", (encode_password(new_password), user["id"]))
         audit(conn, user["id"], "change_password", "user", user["id"], None, {"user_id": user["id"]})
         self.send_json({"ok": True})
+
+    def assist_crf(self, conn: sqlite3.Connection, user: dict) -> None:
+        payload = self.body()
+        text = str(payload.get("text", "")).strip()
+        if not text:
+            self.send_error_json("CRF text is required", 400)
+            return
+        fields = []
+        for line in text.splitlines():
+            label = line.strip(" -:\t")
+            if not label:
+                continue
+            lower = label.lower()
+            field_type = "text"
+            if any(word in lower for word in ("date", "day")):
+                field_type = "date"
+            elif any(word in lower for word in ("age", "weight", "height", "score", "bp", "pressure", "dose")):
+                field_type = "number"
+            elif lower.startswith("any ") or lower.endswith("?"):
+                field_type = "select"
+            field = {"code": normalize_code(label), "label": label, "type": field_type, "required": False}
+            if field_type == "select":
+                field["options"] = ["No", "Yes"]
+            fields.append(field)
+            if len(fields) >= 40:
+                break
+        self.send_json({"schema": normalize_schema({"fields": fields or [{"code": "notes", "label": "Notes", "type": "textarea"}]})})
 
     def create_study(self, conn: sqlite3.Connection, user: dict) -> None:
         payload = self.body()
@@ -819,6 +930,11 @@ class App(BaseHTTPRequestHandler):
                 self.send_error_json("Form management permission required", 403)
                 return
             return self.forms(conn, user, method, study_id, parts)
+        if resource == "dictionary":
+            if not membership_has(membership, "manage_forms"):
+                self.send_error_json("Form management permission required", 403)
+                return
+            return self.dictionary(conn, user, method, study_id)
         if resource == "events":
             if method != "GET" and not membership_has(membership, "manage_study"):
                 self.send_error_json("Study management permission required", 403)
@@ -896,13 +1012,18 @@ class App(BaseHTTPRequestHandler):
         self.send_error_json("Unknown study route", 404)
 
     def forms(self, conn, user, method, study_id, parts) -> None:
+        if method == "GET" and len(parts) == 6 and parts[5] == "versions":
+            form_id = int(parts[4])
+            versions = rows(conn, "SELECT id, form_id, study_id, version, name, code, saved_by, saved_at FROM form_versions WHERE form_id = ? AND study_id = ? ORDER BY version DESC", (form_id, study_id))
+            self.send_json({"versions": versions})
+            return
         if method == "GET":
             forms = rows(conn, "SELECT * FROM forms WHERE study_id = ? ORDER BY id", (study_id,))
             for form in forms:
                 form["schema"] = load_json(form.pop("schema_json"), {"fields": []})
             self.send_json({"forms": forms})
             return
-        if method == "POST":
+        if method == "POST" and len(parts) == 4:
             payload = self.body()
             timestamp = now()
             schema = normalize_schema(payload.get("schema") or {"fields": []})
@@ -935,6 +1056,10 @@ class App(BaseHTTPRequestHandler):
                 return
             payload = self.body()
             schema = normalize_schema(payload.get("schema", load_json(before["schema_json"], {})))
+            conn.execute(
+                "INSERT INTO form_versions(form_id, study_id, version, name, code, schema_json, saved_by, saved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (form_id, study_id, before["version"], before["name"], before["code"], before["schema_json"], user["id"], now()),
+            )
             conn.execute(
                 "UPDATE forms SET name = ?, code = ?, schema_json = ?, version = version + 1, updated_at = ? WHERE id = ? AND study_id = ?",
                 (str(payload.get("name", before["name"])).strip(), normalize_code(str(payload.get("code", before["code"])), before["code"]), json.dumps(schema), now(), form_id, study_id),
@@ -1000,6 +1125,90 @@ class App(BaseHTTPRequestHandler):
             self.send_json({"form_event": after}, 201)
             return
         self.send_error_json("Unsupported form-event operation", 405)
+
+    def dictionary(self, conn, user, method, study_id) -> None:
+        if method != "POST":
+            self.send_error_json("Unsupported dictionary operation", 405)
+            return
+        payload = self.body()
+        csv_text = str(payload.get("csv", "")).strip()
+        if not csv_text:
+            self.send_error_json("CSV content is required", 400)
+            return
+        reader = csv.DictReader(StringIO(csv_text))
+        required = {"instrument_name", "instrument_label", "field_name", "field_label", "field_type"}
+        if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
+            self.send_error_json("Dictionary CSV is missing required columns", 400)
+            return
+        grouped: dict[str, dict] = {}
+        for raw in reader:
+            instrument = normalize_code(raw.get("instrument_name", ""))
+            if not instrument:
+                continue
+            grouped.setdefault(
+                instrument,
+                {
+                    "name": raw.get("instrument_label") or instrument,
+                    "code": instrument,
+                    "events": raw.get("events", ""),
+                    "repeatable": str(raw.get("repeatable", "")).strip().lower() in {"yes", "true", "1"},
+                    "fields": [],
+                },
+            )
+            field_type = str(raw.get("field_type", "text")).strip() or "text"
+            choices = [item.strip() for item in str(raw.get("choices", "")).replace("|", ",").split(",") if item.strip()]
+            field = {
+                "code": raw.get("field_name", ""),
+                "label": raw.get("field_label", ""),
+                "type": field_type,
+                "required": str(raw.get("required", "")).strip().lower() in {"yes", "true", "1"},
+            }
+            if choices:
+                field["options"] = choices
+            if raw.get("validation_min") not in (None, ""):
+                field["min"] = raw.get("validation_min")
+            if raw.get("validation_max") not in (None, ""):
+                field["max"] = raw.get("validation_max")
+            if raw.get("calculation"):
+                field["calculation"] = raw.get("calculation")
+                field["type"] = "calc"
+            grouped[instrument]["fields"].append(field)
+        imported = []
+        timestamp = now()
+        for item in grouped.values():
+            schema = normalize_schema({"fields": item["fields"], "repeatable": item["repeatable"]})
+            existing = row(conn, "SELECT * FROM forms WHERE study_id = ? AND code = ?", (study_id, item["code"]))
+            if existing:
+                conn.execute(
+                    "INSERT INTO form_versions(form_id, study_id, version, name, code, schema_json, saved_by, saved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (existing["id"], study_id, existing["version"], existing["name"], existing["code"], existing["schema_json"], user["id"], timestamp),
+                )
+                conn.execute(
+                    "UPDATE forms SET name = ?, schema_json = ?, version = version + 1, updated_at = ? WHERE id = ?",
+                    (item["name"], json.dumps(schema), timestamp, existing["id"]),
+                )
+                form_id = existing["id"]
+                action = "update"
+            else:
+                cur = conn.execute(
+                    "INSERT INTO forms(study_id, name, code, schema_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (study_id, item["name"], item["code"], json.dumps(schema), timestamp, timestamp),
+                )
+                form_id = cur.lastrowid
+                action = "create"
+            event_codes = [normalize_code(part.strip()) for part in str(item.get("events", "")).replace("|", ",").split(",") if part.strip()]
+            if not event_codes:
+                event_codes = ["baseline"]
+            for event_code in event_codes:
+                event = row(conn, "SELECT id FROM study_events WHERE study_id = ? AND code = ?", (study_id, event_code))
+                if event:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO form_events(study_id, event_id, form_id, required, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)",
+                        (study_id, event["id"], form_id, timestamp, timestamp),
+                    )
+            imported.append({"form_id": form_id, "code": item["code"], "action": action})
+        audit(conn, user["id"], "import", "dictionary", study_id, None, {"forms": imported})
+        self.send_json({"imported": imported})
 
     def participants(self, conn, user, method, study_id, parts, membership) -> None:
         if method == "GET":
@@ -1155,6 +1364,23 @@ class App(BaseHTTPRequestHandler):
                 audit(conn, user["id"], "unlock", "entry", entry_id, before, {"entry": after, "reason": reason})
                 self.send_json({"entry": after})
                 return
+            if action in {"verify_field", "freeze_field"}:
+                field_code = normalize_code(str(payload.get("field_code", "")))
+                if not field_code:
+                    self.send_error_json("Field code is required", 400)
+                    return
+                state = "verified" if action == "verify_field" else "frozen"
+                reason = str(payload.get("reason", "")).strip()
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO field_states(entry_id, field_code, state, reason, user_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (entry_id, field_code, state, reason, user["id"], now()),
+                )
+                audit(conn, user["id"], action, "entry", entry_id, before, {"field_code": field_code, "state": state, "reason": reason})
+                self.send_json({"field_state": {"entry_id": entry_id, "field_code": field_code, "state": state}})
+                return
             self.send_error_json("Unsupported entry action", 405)
             return
         self.send_error_json("Unsupported entries operation", 405)
@@ -1176,9 +1402,15 @@ class App(BaseHTTPRequestHandler):
                 )
             else:
                 data = rows(conn, "SELECT queries.*, participants.study_uid, forms.name AS form_name FROM queries LEFT JOIN participants ON participants.id = queries.participant_id LEFT JOIN forms ON forms.id = queries.form_id WHERE queries.study_id = ? ORDER BY queries.status, queries.updated_at DESC", (study_id,))
+            responses = rows(conn, "SELECT query_responses.*, users.display_name FROM query_responses LEFT JOIN users ON users.id = query_responses.user_id WHERE query_id IN (SELECT id FROM queries WHERE study_id = ?) ORDER BY created_at", (study_id,))
+            by_query: dict[int, list[dict]] = {}
+            for response in responses:
+                by_query.setdefault(response["query_id"], []).append(response)
+            for query_item in data:
+                query_item["responses"] = by_query.get(query_item["id"], [])
             self.send_json({"queries": data})
             return
-        if method == "POST":
+        if method == "POST" and len(parts) == 4:
             payload = self.body()
             timestamp = now()
             participant_id = payload.get("participant_id")
@@ -1203,6 +1435,24 @@ class App(BaseHTTPRequestHandler):
             after = row(conn, "SELECT * FROM queries WHERE id = ?", (query_id,))
             audit(conn, user["id"], "update", "query", query_id, before, after)
             self.send_json({"query": after})
+            return
+        if method == "POST" and len(parts) == 6 and parts[5] == "responses":
+            query_id = int(parts[4])
+            if not row(conn, "SELECT id FROM queries WHERE id = ? AND study_id = ?", (query_id, study_id)):
+                self.send_error_json("Query not found", 404)
+                return
+            payload = self.body()
+            message = str(payload.get("message", "")).strip()
+            if not message:
+                self.send_error_json("Response message is required", 400)
+                return
+            cur = conn.execute(
+                "INSERT INTO query_responses(query_id, user_id, message, created_at) VALUES (?, ?, ?, ?)",
+                (query_id, user["id"], message, now()),
+            )
+            after = row(conn, "SELECT * FROM query_responses WHERE id = ?", (cur.lastrowid,))
+            audit(conn, user["id"], "respond", "query", query_id, None, after)
+            self.send_json({"response": after}, 201)
             return
         self.send_error_json("Unsupported queries operation", 405)
 
@@ -1558,6 +1808,23 @@ class App(BaseHTTPRequestHandler):
             self.send_header("content-length", str(len(content)))
             self.end_headers()
             self.wfile.write(content)
+            return
+        if method == "POST" and len(parts) == 6 and parts[5] == "restore":
+            filename = Path(parts[4]).name
+            if not filename.startswith(f"study_{study_id}_") or not filename.endswith(".sqlite3"):
+                self.send_error_json("Backup not found", 404)
+                return
+            target = (BACKUPS / filename).resolve()
+            if not str(target).startswith(str(BACKUPS.resolve())) or not target.exists():
+                self.send_error_json("Backup not found", 404)
+                return
+            source = sqlite3.connect(target)
+            try:
+                source.backup(conn)
+            finally:
+                source.close()
+            audit(conn, user["id"], "restore", "backup", study_id, None, {"filename": filename})
+            self.send_json({"restored": filename})
             return
         self.send_error_json("Unsupported backup operation", 405)
 

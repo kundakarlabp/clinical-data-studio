@@ -48,6 +48,7 @@ Implemented foundation:
 - Saved reports and filtered report export
 - Local backup, download, and restore
 - Optional passphrase-protected encrypted archive export
+- Optional Windows EFS data-folder at-rest protection helper
 - Health endpoint and local LAN start helper
 - First-run administrator password setup
 - Login lockout after repeated failed attempts
@@ -68,5 +69,6 @@ Implemented foundation:
 Next planned build steps:
 
 - Optional audited database-at-rest encryption layer
+- Automated EFS/device-encryption compliance checks beyond local status reporting
 - Broader browser automation across common Android/iOS viewport sizes
 - Email/SMS integration for automated invitations

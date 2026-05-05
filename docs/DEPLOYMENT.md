@@ -26,6 +26,16 @@ data\clinical_data_studio.sqlite3
 
 Use the Backups page before CRF dictionary imports, CRF edits, or study review exports.
 
+## Data Folder At-Rest Protection
+
+On Windows, protect the app `data` folder with Encrypting File System for the current Windows account:
+
+```powershell
+.\protect_data_folder.ps1
+```
+
+This protects the live SQLite database files at rest on that Windows profile. It is not a replacement for study SOPs, Windows account security, device encryption, and encrypted backup archives. Record the output of `/api/health` or `/api/studies/<id>/validation` after enabling protection.
+
 ## Backup Policy
 
 - Plain backups can be restored in-app.

@@ -12,6 +12,7 @@ import secrets
 import sqlite3
 import tempfile
 import time
+import ctypes
 from io import StringIO
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -35,6 +36,7 @@ CALC_OPERATORS = {
     ast.USub: lambda a: -a,
     ast.UAdd: lambda a: a,
 }
+FILE_ATTRIBUTE_ENCRYPTED = 0x4000
 
 ROLE_PERMISSIONS = {
     "admin": {
@@ -159,6 +161,30 @@ def write_sqlite_backup(conn: sqlite3.Connection, target: Path) -> None:
         conn.backup(destination)
     finally:
         destination.close()
+
+
+def path_encrypted(path: Path) -> bool:
+    if os.name != "nt":
+        return False
+    target = str(path.resolve())
+    attributes = ctypes.windll.kernel32.GetFileAttributesW(target)
+    if attributes == -1:
+        return False
+    return bool(attributes & FILE_ATTRIBUTE_ENCRYPTED)
+
+
+def data_protection_status() -> dict:
+    DATA.mkdir(exist_ok=True)
+    return {
+        "platform": os.name,
+        "data_path": str(DATA),
+        "database_path": str(DB_PATH),
+        "efs_supported": os.name == "nt",
+        "data_folder_encrypted": path_encrypted(DATA),
+        "database_file_encrypted": path_encrypted(DB_PATH) if DB_PATH.exists() else False,
+        "archive_encryption_available": True,
+        "note": "Windows EFS protects the local data folder at rest for the current Windows account. Encrypted archive export protects backup copies.",
+    }
 
 
 def setup_required(conn: sqlite3.Connection) -> bool:
@@ -878,7 +904,7 @@ class App(BaseHTTPRequestHandler):
                 if path == "/api/setup" and method == "POST":
                     return self.first_run_setup(conn)
                 if path == "/api/health" and method == "GET":
-                    return self.send_json({"ok": True, "app": "Clinical Data Studio", "database": DB_PATH.exists()})
+                    return self.send_json({"ok": True, "app": "Clinical Data Studio", "database": DB_PATH.exists(), "data_protection": data_protection_status()})
 
                 user = self.require_user(conn)
                 if not user:
@@ -2185,6 +2211,7 @@ class App(BaseHTTPRequestHandler):
             "consent_signatures": row(conn, "SELECT COUNT(*) AS count FROM consent_signatures WHERE study_id = ?", (study_id,))["count"],
             "audit_events": row(conn, "SELECT COUNT(*) AS count FROM audit_log", ())["count"],
         }
+        protection = data_protection_status()
         recent_audit = rows(conn, "SELECT audit_log.*, users.display_name FROM audit_log LEFT JOIN users ON users.id = audit_log.user_id ORDER BY audit_log.id DESC LIMIT 50")
         checks = [
             {"name": "first_run_setup", "status": "document", "evidence": "Confirm permanent admin account setup in access review."},
@@ -2192,9 +2219,10 @@ class App(BaseHTTPRequestHandler):
             {"name": "public_surveys", "status": "available" if counts["survey_links"] else "not_used", "evidence": f"{counts['survey_links']} survey link(s)."},
             {"name": "econsent", "status": "available" if counts["consent_signatures"] else "not_used", "evidence": f"{counts['consent_signatures']} consent signature(s)."},
             {"name": "backup_restore", "status": "document", "evidence": "Run backup restore drill and attach result."},
+            {"name": "data_folder_encryption", "status": "available" if protection["data_folder_encrypted"] else "not_enabled", "evidence": protection["note"]},
             {"name": "audit_review", "status": "available", "evidence": f"{counts['audit_events']} audit event(s)."},
         ]
-        self.send_json({"study": study, "generated_at": now(), "counts": counts, "checks": checks, "recent_audit": recent_audit})
+        self.send_json({"study": study, "generated_at": now(), "counts": counts, "data_protection": protection, "checks": checks, "recent_audit": recent_audit})
 
     def quality(self, conn, study_id: int, membership) -> None:
         forms = rows(conn, "SELECT * FROM forms WHERE study_id = ? ORDER BY id", (study_id,))

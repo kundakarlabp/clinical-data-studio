@@ -15,6 +15,7 @@ const state = {
   surveyLinks: [],
   invitations: [],
   reports: [],
+  caseIntake: { cases: [], series: null },
   backups: [],
   forms: [],
   participants: [],
@@ -96,13 +97,14 @@ async function loadStudy() {
   const manageUsers = can("manage_users");
   const viewAnalysis = can("view_analysis") || can("review_data");
   const readinessAllowed = can("manage_study") || can("review_data") || can("view_analysis");
-  const [forms, events, formEvents, surveyLinks, invitations, reports, backups, participants, entries, queries, quality, analysis, assistantSummary, readiness, audit, groups, studyMembers, apiTokens, randomization, users] = await Promise.all([
+  const [forms, events, formEvents, surveyLinks, invitations, reports, caseIntake, backups, participants, entries, queries, quality, analysis, assistantSummary, readiness, audit, groups, studyMembers, apiTokens, randomization, users] = await Promise.all([
     api(`/api/studies/${state.studyId}/forms`),
     api(`/api/studies/${state.studyId}/events`),
     api(`/api/studies/${state.studyId}/form-events`),
     can("manage_forms") ? api(`/api/studies/${state.studyId}/surveys`) : Promise.resolve({ surveys: [] }),
     can("manage_forms") ? api(`/api/studies/${state.studyId}/invitations`) : Promise.resolve({ invitations: [] }),
     viewAnalysis ? api(`/api/studies/${state.studyId}/reports`) : Promise.resolve({ reports: [] }),
+    (can("enter_data") || can("view_analysis") || can("review_data")) ? api(`/api/studies/${state.studyId}/case-intake`) : Promise.resolve({ cases: [], series: null }),
     can("manage_study") ? api(`/api/studies/${state.studyId}/backups`) : Promise.resolve({ backups: [] }),
     api(`/api/studies/${state.studyId}/participants`),
     api(`/api/studies/${state.studyId}/entries`),
@@ -124,6 +126,7 @@ async function loadStudy() {
   state.surveyLinks = surveyLinks.surveys;
   state.invitations = invitations.invitations;
   state.reports = reports.reports;
+  state.caseIntake = caseIntake;
   state.backups = backups.backups;
   if (!state.selectedEventId && state.events[0]) state.selectedEventId = state.events[0].id;
   if (state.selectedEventId && !state.events.some((event) => event.id === state.selectedEventId)) state.selectedEventId = state.events[0]?.id || 0;
@@ -188,6 +191,7 @@ function render() {
           ${can("manage_study") || can("review_data") ? navButton("randomization", "Randomization") : ""}
           ${navButton("queries", "Review Queries")}
           ${navButton("quality", "Data Quality")}
+          ${(can("enter_data") || can("view_analysis") || can("review_data")) ? navButton("case-intake", "Case Intake") : ""}
           ${navButton("analysis", "Analysis")}
           ${can("view_analysis") || can("export_data") ? navButton("reports", "Reports") : ""}
           ${can("manage_study") ? navButton("backups", "Backups") : ""}
@@ -242,6 +246,7 @@ function route() {
   if (state.view === "randomization") return randomizationView();
   if (state.view === "queries") return queriesView();
   if (state.view === "quality") return qualityView();
+  if (state.view === "case-intake") return caseIntakeView();
   if (state.view === "analysis") return analysisView();
   if (state.view === "reports") return reportsView();
   if (state.view === "backups") return backupsView();
@@ -910,6 +915,101 @@ function qualityView() {
   `;
 }
 
+function caseIntakeView() {
+  const cases = state.caseIntake?.cases || [];
+  const series = state.caseIntake?.series || { case_count: 0, group_count: 0, groups: [], missing_field_count: 0, warning_count: 0, draft_outline: [] };
+  return `
+    <section class="metrics-grid">
+      ${metric("Cases", series.case_count || 0, "Unstructured case records")}
+      ${metric("Groups", series.group_count || 0, "Diagnosis/treatment clusters")}
+      ${metric("Missing Items", series.missing_field_count || 0, "Publication fields to complete")}
+      ${metric("Warnings", series.warning_count || 0, "De-identification or data issues")}
+    </section>
+    <section class="panel">
+      <h2>Capture Case Evidence</h2>
+      <p>Store typed notes, dictated text, photos, audio, PDFs, or scanned case details before a final CRF is ready. Keep identifiers minimal and review extracted fields before publication.</p>
+      <form id="case-intake-form" class="stack">
+        <div class="form-grid">
+          <label>Case ID<input name="case_uid" placeholder="CASE-001" /></label>
+          <label>Title<input name="title" required placeholder="Oseltamivir dose adjustment case" /></label>
+          <label>Link participant
+            <select name="participant_id">
+              <option value="">Not linked yet</option>
+              ${state.participants.map((item) => `<option value="${item.id}">${escapeHtml(item.study_uid)} ${escapeHtml(item.initials || "")}</option>`).join("")}
+            </select>
+          </label>
+          <label>Status
+            <select name="status">
+              <option value="draft">draft</option>
+              <option value="triaged">triaged</option>
+              <option value="ready">ready</option>
+              <option value="excluded">excluded</option>
+            </select>
+          </label>
+        </div>
+        <label>Typed notes / OCR text / dictated transcript<textarea name="source_text" id="case-source-text" placeholder="Paste case details, Google Lens text, discharge summary notes, or dictate using the button below."></textarea></label>
+        <div class="split-actions">
+          <button type="button" class="secondary" id="case-dictate">Start Dictation</button>
+          <span class="small">Dictation works only in browsers that support speech recognition. Uploaded audio is stored as evidence; local transcription is not automatic.</span>
+        </div>
+        <label>Evidence files<input name="files" type="file" multiple accept="image/*,audio/*,.pdf,.txt,.csv" /></label>
+        <button>Save And Organize Case</button>
+      </form>
+    </section>
+    <section class="panel">
+      <div class="row">
+        <h2>Case Series Builder</h2>
+        <button class="secondary" id="case-export">Export Case CSV</button>
+      </div>
+      <div class="grid two">
+        <div class="notice">${escapeHtml((series.draft_outline || []).join(" "))}</div>
+        <div class="notice">Group similar cases by extracted diagnosis/treatment, then complete missing age, sex, presentation, investigation, treatment, outcome, and follow-up items before writing.</div>
+      </div>
+      <div class="readiness-list">
+        ${(series.groups || []).map((group) => `
+          <div class="readiness-item">
+            <span class="pill ok">${group.count}</span>
+            <div><strong>${escapeHtml(group.group)}</strong><p>${escapeHtml((group.case_uids || []).join(", "))}</p><span class="small">${escapeHtml((group.tags || []).join(", "))}</span></div>
+          </div>
+        `).join("") || "<p>No case groups yet.</p>"}
+      </div>
+    </section>
+    <section class="panel">
+      <h2>Case Library</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Case</th><th>Group</th><th>Extracted Details</th><th>Files</th><th>Status</th></tr></thead>
+          <tbody>
+            ${cases.map((item) => {
+              const extracted = item.extracted || {};
+              const clinical = extracted.clinical || {};
+              const demographics = extracted.demographics || {};
+              return `
+                <tr>
+                  <td><strong>${escapeHtml(item.case_uid)}</strong><br><span class="small">${escapeHtml(item.title)}</span></td>
+                  <td>${escapeHtml(extracted.group_label || "Ungrouped case")}<br><span class="small">${escapeHtml((item.tags || []).join(", "))}</span></td>
+                  <td>
+                    <strong>${escapeHtml([demographics.age ? `${demographics.age}y` : "", demographics.sex || ""].filter(Boolean).join(" / "))}</strong><br>
+                    Dx: ${escapeHtml(clinical.diagnosis || "needs review")}<br>
+                    Tx: ${escapeHtml(clinical.treatment || "needs review")}<br>
+                    Outcome: ${escapeHtml(clinical.outcome || "needs review")}
+                    ${extracted.missing_fields?.length ? `<br><span class="small">Missing: ${escapeHtml(extracted.missing_fields.join(", "))}</span>` : ""}
+                    ${extracted.warnings?.length ? `<br><span class="small">${escapeHtml(extracted.warnings.join(" "))}</span>` : ""}
+                  </td>
+                  <td>
+                    ${(item.files || []).map((file) => `<button type="button" class="secondary" data-case-id="${item.id}" data-case-file="${file.id}" data-case-file-name="${escapeHtml(file.name)}">${escapeHtml(file.name)}</button>`).join(" ") || "None"}
+                  </td>
+                  <td><span class="pill">${escapeHtml(item.status)}</span><br><span class="small">${fmtTime(item.updated_at)}</span></td>
+                </tr>
+              `;
+            }).join("") || `<tr><td colspan="5">No cases captured yet.</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
 function analysisView() {
   const summaries = state.analysis?.field_summaries || [];
   const assistant = state.assistantSummary;
@@ -1275,6 +1375,12 @@ function bindRoute() {
   document.querySelector("#invitation-form")?.addEventListener("submit", submitInvitation);
   document.querySelectorAll("[data-invitation-action]").forEach((button) => button.addEventListener("click", () => updateInvitation(button.dataset.invitationId, button.dataset.invitationAction)));
   document.querySelector("#report-form")?.addEventListener("submit", submitReport);
+  document.querySelector("#case-intake-form")?.addEventListener("submit", submitCaseIntake);
+  document.querySelector("#case-dictate")?.addEventListener("click", startCaseDictation);
+  document.querySelector("#case-export")?.addEventListener("click", () => downloadApi(`/api/studies/${state.studyId}/case-intake/export`, "case_intake_export.csv"));
+  document.querySelectorAll("[data-case-file]").forEach((button) => {
+    button.addEventListener("click", () => downloadApi(`/api/studies/${state.studyId}/case-intake/${button.dataset.caseId}/files/${button.dataset.caseFile}`, button.dataset.caseFileName || "case_evidence"));
+  });
   document.querySelector("#backup-create")?.addEventListener("click", createBackup);
   document.querySelector("#encrypted-backup-form")?.addEventListener("submit", createEncryptedBackup);
   document.querySelectorAll("[data-restore-backup]").forEach((button) => button.addEventListener("click", () => restoreBackup(button.dataset.restoreBackup, button.dataset.encrypted === "true")));
@@ -1608,6 +1714,78 @@ async function submitReport(event) {
     });
     await loadStudy();
     render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function submitCaseIntake(event) {
+  event.preventDefault();
+  const form = event.target;
+  const data = Object.fromEntries(new FormData(form));
+  const files = await Promise.all([...form.querySelector(`[name="files"]`).files].map(fileToPayload));
+  try {
+    const result = await api(`/api/studies/${state.studyId}/case-intake`, {
+      method: "POST",
+      body: JSON.stringify({
+        case_uid: data.case_uid,
+        title: data.title,
+        participant_id: data.participant_id ? Number(data.participant_id) : null,
+        status: data.status,
+        source_text: data.source_text || "",
+        files,
+      }),
+    });
+    state.error = `Case saved and grouped as ${result.case.extracted?.group_label || "Ungrouped case"}.`;
+    form.reset();
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+function startCaseDictation() {
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition) {
+    state.error = "This browser does not support built-in dictation. Record audio as a file or type/paste the transcript.";
+    render();
+    return;
+  }
+  const target = document.querySelector("#case-source-text");
+  const recognition = new SpeechRecognition();
+  recognition.continuous = true;
+  recognition.interimResults = false;
+  recognition.lang = navigator.language || "en-US";
+  recognition.onresult = (event) => {
+    const text = [...event.results].map((result) => result[0]?.transcript || "").join(" ").trim();
+    target.value = `${target.value ? `${target.value}\n` : ""}${text}`.trim();
+  };
+  recognition.onerror = () => {
+    state.error = "Dictation stopped or permission was denied. You can still type or upload the audio file.";
+    render();
+  };
+  recognition.start();
+}
+
+async function downloadApi(path, filename) {
+  try {
+    const response = await fetch(path, { headers: { Authorization: `Bearer ${state.token}` } });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({ error: response.statusText }));
+      throw new Error(payload.error || response.statusText);
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
   } catch (error) {
     state.error = error.message;
     render();

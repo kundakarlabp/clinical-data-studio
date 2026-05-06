@@ -63,6 +63,7 @@ Implemented foundation:
 - Public survey links for local-network participant entry
 - E-consent style name/signature capture tied to survey submissions
 - File upload fields stored inside CRF data records
+- Smart Case Intake for unstructured retrospective case notes, photos, audio evidence, local extraction, grouping, and case-series CSV export
 - Windows scheduled-task start-at-login helper
 - Validation execution record template
 - Survey invitation and reminder tracking
@@ -107,6 +108,10 @@ $env:OPENAI_API_KEY = "your_api_key"
 ```
 
 Do not send patient identifiers or PHI to external AI unless your study policy and data agreement allow it. AI drafts must be reviewed before use.
+
+## Case Reports And Case Series
+
+Use **Case Intake** when case material arrives as notes, images, audio, scanned details, or rough typed summaries before a formal CRF is ready. The app stores original evidence, extracts draft demographics/diagnosis/treatment/outcome fields locally, groups similar cases, and exports a case-series CSV. See [docs/CASE_SERIES_WORKFLOW.md](docs/CASE_SERIES_WORKFLOW.md).
 
 ## Android And Multi-Device Use
 

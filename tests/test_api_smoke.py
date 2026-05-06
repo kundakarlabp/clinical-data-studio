@@ -159,6 +159,33 @@ class ApiSmokeTests(unittest.TestCase):
         history = self.request_json(f"/api/studies/{study_id}/entries/{entry['id']}/history", token=token)
         self.assertTrue(history["history"])
 
+    def test_case_intake_groups_unstructured_cases_and_exports(self):
+        token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]
+        study_id = self.request_json("/api/studies", token=token)["studies"][0]["id"]
+        created = self.request_json(
+            f"/api/studies/{study_id}/case-intake",
+            "POST",
+            {
+                "case_uid": "CASE-RETRO-001",
+                "title": "Influenza pneumonia with oseltamivir",
+                "source_text": "A 42 year old female presented with fever. Diagnosis: influenza pneumonia. Treatment: oseltamivir. Outcome: improved.",
+                "files": [{"name": "case-note.txt", "type": "text/plain", "size": 12, "data": "Y2FzZSBub3Rl"}],
+            },
+            token,
+        )["case"]
+        self.assertEqual(created["case_uid"], "CASE-RETRO-001")
+        self.assertEqual(created["extracted"]["demographics"]["age"], "42")
+        self.assertTrue(created["files"])
+        _, file_type, file_body = self.request_raw(f"/api/studies/{study_id}/case-intake/{created['id']}/files/{created['files'][0]['id']}", token=token)
+        self.assertIn("text/plain", file_type)
+        self.assertEqual(file_body, b"case note")
+        library = self.request_json(f"/api/studies/{study_id}/case-intake", token=token)
+        self.assertEqual(library["series"]["case_count"], 1)
+        self.assertTrue(library["series"]["groups"])
+        _, csv_type, csv_body = self.request_raw(f"/api/studies/{study_id}/case-intake/export", token=token)
+        self.assertIn("text/csv", csv_type)
+        self.assertIn(b"CASE-RETRO-001", csv_body)
+
     def test_public_survey_with_consent_and_file_upload(self):
         token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]
         study_id = self.request_json("/api/studies", token=token)["studies"][0]["id"]

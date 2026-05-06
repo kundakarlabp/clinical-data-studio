@@ -4,6 +4,7 @@ Set-Location -LiteralPath $PSScriptRoot
 $port = if ($env:CDS_PORT) { $env:CDS_PORT } else { "8765" }
 
 Write-Host "Clinical Data Studio remote access helper"
+Write-Host "Best free path: private VPN access to this study computer."
 Write-Host ""
 Write-Host "1. Start the app first:"
 Write-Host "   .\start.ps1"
@@ -21,6 +22,7 @@ if (Get-Command tailscale -ErrorAction SilentlyContinue) {
     if ($tailscaleIp) {
       Write-Host "   Tailscale detected. Approved tailnet devices can try:"
       Write-Host "   http://$tailscaleIp`:$port"
+      Write-Host "   Keep Clinical Data Studio accounts separate for each user."
     }
     else {
       Write-Host "   Tailscale detected, but no IPv4 address was returned. Sign in to Tailscale first."
@@ -32,6 +34,7 @@ if (Get-Command tailscale -ErrorAction SilentlyContinue) {
 }
 else {
   Write-Host "   Tailscale is not installed. Install and sign in on the study computer and approved devices."
+  Write-Host "   After setup, rerun this helper to print the private VPN URL."
 }
 
 Write-Host ""
@@ -42,7 +45,11 @@ if (Get-Command cloudflared -ErrorAction SilentlyContinue) {
 }
 else {
   Write-Host "   cloudflared is not installed. Use it only if your study approves public tunnel access."
+  Write-Host "   Demo command after installation: cloudflared tunnel --url http://127.0.0.1:$port"
 }
 
+Write-Host ""
+Write-Host "5. True free cloud VM:"
+Write-Host "   See docs\FREE_REMOTE_ACCESS.md for Oracle Always Free VM steps."
 Write-Host ""
 Write-Host "Do not store the live database or PHI in GitHub or unsupervised Google Drive sync."

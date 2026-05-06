@@ -1,0 +1,7 @@
+tunnel: clinical-data-studio
+credentials-file: /home/ubuntu/.cloudflared/<tunnel-id>.json
+
+ingress:
+  - hostname: cds.example.org
+    service: http://127.0.0.1:8765
+  - service: http_status:404

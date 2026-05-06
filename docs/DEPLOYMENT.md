@@ -22,6 +22,8 @@ For multiple users on disconnected computers or phones, use each disconnected de
 
 Remote clinical data entry needs one central app instance and one central database. Do not run separate database copies for real study data unless you have a validated import/reconciliation SOP.
 
+For a fuller free setup guide, see [Free Remote Access Setup](FREE_REMOTE_ACCESS.md).
+
 Preferred sequence:
 
 - Local LAN: keep the study computer powered on, run `.\start.ps1`, and use the printed Wi-Fi URL on approved devices.

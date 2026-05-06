@@ -72,12 +72,16 @@ class FrontendStaticTests(unittest.TestCase):
         self.assertIn("remote_access.ps1", app_js)
         self.assertIn("VPN Overlay", app_js)
         self.assertIn("HTTPS Tunnel", app_js)
+        self.assertIn("Best Free Route", app_js)
+        self.assertIn("Oracle Always Free", app_js)
         self.assertIn("Google Drive / GitHub Pages", app_js)
         self.assertIn("metrics-grid", css)
         self.assertIn("remote-grid", css)
         self.assertIn("Private VPN overlay", readme)
+        self.assertIn("docs/FREE_REMOTE_ACCESS.md", readme)
         self.assertIn("Do not use GitHub Pages or Google Drive", readme)
         self.assertIn("Remote Access Options", deployment)
+        self.assertIn("Free Remote Access Setup", deployment)
         self.assertIn("GitHub Pages: useful for documentation", deployment)
 
     def test_remote_access_helper_script_is_present(self):
@@ -85,7 +89,20 @@ class FrontendStaticTests(unittest.TestCase):
         self.assertIn("Get-NetIPAddress", helper)
         self.assertIn("tailscale ip -4", helper)
         self.assertIn("cloudflared tunnel --url", helper)
+        self.assertIn("Oracle Always Free", helper)
         self.assertIn("Do not store the live database", helper)
+
+    def test_free_remote_access_deployment_files_are_present(self):
+        guide = (ROOT / "docs" / "FREE_REMOTE_ACCESS.md").read_text(encoding="utf-8")
+        linux_service = (ROOT / "deploy" / "install_linux_service.sh").read_text(encoding="utf-8")
+        tunnel_config = (ROOT / "deploy" / "cloudflared-config.example.yml").read_text(encoding="utf-8")
+        self.assertIn("Best Free Path", guide)
+        self.assertIn("Tailscale", guide)
+        self.assertIn("Cloudflare Tunnel", guide)
+        self.assertIn("Oracle Cloud Always Free", guide)
+        self.assertIn("systemctl enable --now clinical-data-studio.service", linux_service)
+        self.assertIn("ExecStart=$PYTHON_BIN $APP_DIR/server.py", linux_service)
+        self.assertIn("service: http://127.0.0.1:8765", tunnel_config)
 
 
 if __name__ == "__main__":

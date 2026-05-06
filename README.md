@@ -63,6 +63,7 @@ Implemented foundation:
 - Validation execution record template
 - Survey invitation and reminder tracking
 - Validation evidence JSON export
+- Downloadable validation package with evidence, audit sample, codebook, SOP checklist, and execution-record template
 - Optional Playwright browser/mobile smoke script
 - REDCap-style token API for project, metadata, instruments, events, records, and randomization
 - REDCap-style user-rights, data access group, arm, and API-version exports

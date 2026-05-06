@@ -209,6 +209,9 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertGreaterEqual(evidence["counts"]["survey_invitations"], 1)
         self.assertIn("data_protection", evidence)
         self.assertTrue(evidence["checks"])
+        _, package_type, package_body = self.request_raw(f"/api/studies/{study_id}/validation-package", token=token)
+        self.assertIn("application/zip", package_type)
+        self.assertIn(b"validation_evidence.json", package_body)
 
     def test_api_tokens_redcap_endpoint_exports_and_randomization(self):
         login = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})

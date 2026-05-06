@@ -1095,6 +1095,9 @@ class App(BaseHTTPRequestHandler):
         content = str(values.get("content", "project")).strip().lower()
         action = str(values.get("action", "export")).strip().lower()
         output_format = str(values.get("format", "json")).strip().lower()
+        audit(conn, user["id"], "api_request", "api_token", token_row["id"], None, {"content": content, "action": action, "format": output_format})
+        if content in {"version", "api_version"}:
+            return self.send_redcap_payload({"api_version": "local-redcap-style-v1", "application": "Clinical Data Studio"}, output_format)
         if content in {"project", "project_info"}:
             payload = row(conn, "SELECT * FROM studies WHERE id = ?", (study_id,))
             return self.send_redcap_payload(payload, output_format)
@@ -1106,6 +1109,21 @@ class App(BaseHTTPRequestHandler):
             return self.send_redcap_payload(payload, output_format)
         if content in {"event", "events"}:
             payload = rows(conn, "SELECT name AS event_name, code AS unique_event_name, arm_name, day_offset FROM study_events WHERE study_id = ? ORDER BY display_order", (study_id,))
+            return self.send_redcap_payload(payload, output_format)
+        if content in {"arm", "arms"}:
+            payload = self.arm_payload(conn, study_id)
+            return self.send_redcap_payload(payload, output_format)
+        if content in {"dag", "dags", "data_access_group", "data_access_groups"}:
+            if not membership_has(membership, "manage_users"):
+                self.send_error_json("User management permission required", 403)
+                return
+            payload = rows(conn, "SELECT code AS unique_group_name, name AS data_access_group_name FROM data_groups WHERE study_id = ? ORDER BY name", (study_id,))
+            return self.send_redcap_payload(payload, output_format)
+        if content in {"user", "users", "user_rights"}:
+            if not membership_has(membership, "manage_users"):
+                self.send_error_json("User management permission required", 403)
+                return
+            payload = self.user_rights_payload(conn, study_id)
             return self.send_redcap_payload(payload, output_format)
         if content in {"record", "records"}:
             if action == "import":
@@ -1199,6 +1217,46 @@ class App(BaseHTTPRequestHandler):
                     }
                 )
         return {"project": study, "instruments": instruments, "data_dictionary": data_dictionary, "events_by_form": events_by_form}
+
+    def arm_payload(self, conn, study_id: int) -> list[dict]:
+        arms = []
+        seen = set()
+        for event in rows(conn, "SELECT arm_name FROM study_events WHERE study_id = ? ORDER BY display_order, id", (study_id,)):
+            arm_name = event.get("arm_name") or "Arm 1"
+            if arm_name in seen:
+                continue
+            seen.add(arm_name)
+            arms.append({"arm_num": len(arms) + 1, "name": arm_name})
+        return arms or [{"arm_num": 1, "name": "Arm 1"}]
+
+    def user_rights_payload(self, conn, study_id: int) -> list[dict]:
+        memberships = rows(
+            conn,
+            """
+            SELECT study_memberships.*, users.username, users.display_name, data_groups.code AS data_access_group
+            FROM study_memberships
+            JOIN users ON users.id = study_memberships.user_id
+            LEFT JOIN data_groups ON data_groups.id = study_memberships.data_group_id
+            WHERE study_memberships.study_id = ?
+            ORDER BY users.username
+            """,
+            (study_id,),
+        )
+        permissions = ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis"]
+        payload = []
+        for member in memberships:
+            granted = ROLE_PERMISSIONS.get(member["role"], set()) if member["active"] else set()
+            item = {
+                "username": member["username"],
+                "display_name": member["display_name"],
+                "role": member["role"],
+                "data_access_group": member.get("data_access_group") or "",
+                "active": "1" if member["active"] else "0",
+            }
+            for permission in permissions:
+                item[permission] = "1" if permission in granted else "0"
+            payload.append(item)
+        return payload
 
     def visible_studies(self, conn: sqlite3.Connection, user: dict) -> list[dict]:
         if user.get("role") == "admin":

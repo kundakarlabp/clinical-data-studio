@@ -225,6 +225,21 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertTrue(metadata)
         project = self.request_json(f"/api/redcap?token={api_token}&content=project&format=json")
         self.assertEqual(project["id"], study_id)
+        version = self.request_json(f"/api/redcap?token={api_token}&content=version&format=json")
+        self.assertEqual(version["application"], "Clinical Data Studio")
+        arms = self.request_json(f"/api/redcap?token={api_token}&content=arm&format=json")
+        self.assertEqual(arms[0]["arm_num"], 1)
+        users = self.request_json(f"/api/redcap?token={api_token}&content=user&format=json")
+        self.assertEqual(users[0]["username"], "admin")
+        self.assertEqual(users[0]["manage_users"], "1")
+        group = self.request_json(
+            f"/api/studies/{study_id}/groups",
+            "POST",
+            {"name": "Site A", "code": "site_a"},
+            token,
+        )["group"]
+        dags = self.request_json(f"/api/redcap?token={api_token}&content=dag&format=json")
+        self.assertEqual(dags[0]["unique_group_name"], group["code"])
         status, content_type, csv_body = self.request_raw(
             "/api/redcap",
             "POST",
@@ -261,6 +276,20 @@ class ApiSmokeTests(unittest.TestCase):
             token,
         )["allocation"]
         self.assertIn(allocation["arm"], {"Control", "Treatment"})
+        audit_rows = self.request_json(f"/api/studies/{study_id}/audit", token=token)["audit"]
+        self.assertTrue(any(item["action"] == "api_request" for item in audit_rows))
+
+        token_record = self.request_json(f"/api/studies/{study_id}/api-tokens", token=token)["tokens"][0]
+        revoked = self.request_json(
+            f"/api/studies/{study_id}/api-tokens/{token_record['id']}",
+            "PATCH",
+            {"active": False},
+            token,
+        )["token"]
+        self.assertFalse(revoked["active"])
+        with self.assertRaises(HTTPError) as denied:
+            self.request_json(f"/api/redcap?token={api_token}&content=project&format=json")
+        self.assertEqual(denied.exception.code, 401)
 
 
 if __name__ == "__main__":

@@ -93,7 +93,9 @@ Create API tokens from the Access page. The local REDCap-style endpoint is:
 /api/redcap
 ```
 
-Supported parameters include `token`, `content`, `action`, and `format`. Supported content values are `project`, `metadata`, `instrument`, `event`, `record`, and `randomization`.
+Supported parameters include `token`, `content`, `action`, and `format`. Supported content values are `project`, `metadata`, `instrument`, `event`, `arm`, `dag`, `user`, `record`, `randomization`, and `version`.
+
+Review API token usage in the study audit log. Revoke unused or exposed API tokens from Access -> API Tokens.
 
 The Reports page also provides ODM XML and R/SAS/SPSS/Stata package exports. Review exported syntax before formal analysis.
 

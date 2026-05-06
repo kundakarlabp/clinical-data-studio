@@ -65,6 +65,8 @@ Implemented foundation:
 - Validation evidence JSON export
 - Optional Playwright browser/mobile smoke script
 - REDCap-style token API for project, metadata, instruments, events, records, and randomization
+- REDCap-style user-rights, data access group, arm, and API-version exports
+- API token usage audit entries and token revoke workflow
 - ODM-like XML project export
 - R, SAS, SPSS, and Stata import package exports
 - Simple allocation randomization module
@@ -83,7 +85,7 @@ Next planned build steps:
 Create an API token from Access -> API Tokens. Use `/api/redcap` with parameters such as:
 
 - `token`: generated API token
-- `content`: `project`, `metadata`, `instrument`, `event`, `record`, or `randomization`
+- `content`: `project`, `metadata`, `instrument`, `event`, `arm`, `dag`, `user`, `record`, `randomization`, or `version`
 - `action`: `export`, `import`, or `allocate`
 - `format`: `json` or `csv`
 

@@ -1046,9 +1046,17 @@ function accessView() {
       <p class="small">The token is shown once after creation. Use endpoint /api/redcap with token, content, action, and format parameters.</p>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Label</th><th>User</th><th>Active</th><th>Last Used</th></tr></thead>
+          <thead><tr><th>Label</th><th>User</th><th>Active</th><th>Last Used</th><th></th></tr></thead>
           <tbody>
-            ${state.apiTokens.map((item) => `<tr><td>${escapeHtml(item.label)}</td><td>${escapeHtml(item.username)}</td><td>${item.active ? "Yes" : "No"}</td><td>${fmtTime(item.last_used_at)}</td></tr>`).join("")}
+            ${state.apiTokens.map((item) => `
+              <tr>
+                <td>${escapeHtml(item.label)}</td>
+                <td>${escapeHtml(item.username)}</td>
+                <td>${item.active ? "Yes" : "No"}</td>
+                <td>${fmtTime(item.last_used_at)}</td>
+                <td>${item.active ? `<button class="secondary" data-revoke-token="${item.id}">Revoke</button>` : ""}</td>
+              </tr>
+            `).join("")}
           </tbody>
         </table>
       </div>
@@ -1118,6 +1126,7 @@ function bindRoute() {
   document.querySelector("#group-form")?.addEventListener("submit", submitGroup);
   document.querySelector("#membership-form")?.addEventListener("submit", submitMembership);
   document.querySelector("#api-token-form")?.addEventListener("submit", submitApiToken);
+  document.querySelectorAll("[data-revoke-token]").forEach((button) => button.addEventListener("click", () => revokeApiToken(button.dataset.revokeToken)));
   document.querySelector("#event-form")?.addEventListener("submit", submitEvent);
   document.querySelector("#form-event-form")?.addEventListener("submit", submitFormEvent);
   document.querySelector("#randomization-list-form")?.addEventListener("submit", submitRandomizationList);
@@ -1285,6 +1294,21 @@ async function submitApiToken(event) {
       body: JSON.stringify({ user_id: Number(data.user_id), label: data.label }),
     });
     alert(`API token. Store it now, it will not be shown again:\\n${result.token}`);
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function revokeApiToken(tokenId) {
+  if (!confirm("Revoke this API token? Scripts using it will stop working.")) return;
+  try {
+    await api(`/api/studies/${state.studyId}/api-tokens/${tokenId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ active: false }),
+    });
     await loadStudy();
     render();
   } catch (error) {

@@ -126,4 +126,6 @@ Recommended options:
 
 Run `.\remote_access.ps1` after starting the app to print the LAN address and detect whether Tailscale or cloudflared is available on the study computer.
 
+For a free remote-access decision guide and Oracle Always Free VM notes, see [docs/FREE_REMOTE_ACCESS.md](docs/FREE_REMOTE_ACCESS.md).
+
 Do not use GitHub Pages or Google Drive as the live clinical database host. GitHub Pages is for static site files, not this Python backend and SQLite database. Google Drive can store encrypted backup archives, but live SQLite databases are not safe to edit through file-sync storage from multiple users. Do not place PHI, identifiers, live exports, database files, or backup passphrases in a public or shared GitHub repository.

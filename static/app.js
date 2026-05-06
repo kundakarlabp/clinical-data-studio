@@ -364,6 +364,18 @@ function remoteAccessView() {
         ].map((item) => `<div class="readiness-item"><span class="pill warn">check</span><div><strong>${escapeHtml(item)}</strong></div></div>`).join("")}
       </div>
     </section>
+    <section class="panel">
+      <h2>Best Free Route</h2>
+      <div class="readiness-list">
+        ${[
+          "Install Tailscale or ZeroTier on the study computer and approved user devices.",
+          "Start Clinical Data Studio on the study computer with .\\start.ps1.",
+          "Run .\\remote_access.ps1 and open the private VPN URL from each approved device.",
+          "Use Cloudflare Tunnel only if users cannot install a VPN app and access controls are approved.",
+          "Use Oracle Always Free only if you are ready to manage a Linux VM, backups, firewall, and updates."
+        ].map((item) => `<div class="readiness-item"><span class="pill ok">free</span><div><strong>${escapeHtml(item)}</strong></div></div>`).join("")}
+      </div>
+    </section>
   `;
 }
 

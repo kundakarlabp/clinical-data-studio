@@ -24,6 +24,7 @@ const state = {
   audit: [],
   analysis: null,
   assistantSummary: null,
+  assistDraft: null,
   view: "dashboard",
   selectedParticipantId: 0,
   selectedEventId: Number(localStorage.getItem("cds_event_id") || 0),
@@ -493,11 +494,18 @@ function dictionaryView() {
     </section>
     <section class="panel">
       <h2>AI-Assisted CRF Draft</h2>
-      <p>This local helper turns pasted CRF item text into draft fields. It does not send data outside this app.</p>
+      <p>This assistant turns de-identified CRF item text into draft fields. It stays local by default; external AI is used only when explicitly enabled on the server.</p>
       <form id="assist-crf-form" class="stack">
         <label>CRF text<textarea name="text" required placeholder="Age&#10;Visit date&#10;Any adverse event?"></textarea></label>
         <button>Draft Schema</button>
       </form>
+      ${state.assistDraft ? `
+        <div class="notice">
+          Drafted ${state.assistDraft.assistant.field_count} field(s) using ${escapeHtml(state.assistDraft.assistant.mode)} mode.
+          ${state.assistDraft.assistant.warnings.length ? escapeHtml(state.assistDraft.assistant.warnings.join(" ")) : escapeHtml(state.assistDraft.assistant.safety_note)}
+        </div>
+        <label>Reviewed Draft JSON<textarea readonly>${escapeHtml(JSON.stringify(state.assistDraft.schema, null, 2))}</textarea></label>
+      ` : ""}
     </section>
   `;
 }
@@ -1605,7 +1613,9 @@ async function submitAssistCrf(event) {
       method: "POST",
       body: JSON.stringify({ text: data.text }),
     });
-    alert(JSON.stringify(result.schema, null, 2));
+    state.assistDraft = result;
+    state.error = "Draft created. Review the JSON before importing or saving as a CRF.";
+    render();
   } catch (error) {
     state.error = error.message;
     render();

@@ -60,6 +60,7 @@ class ApiSmokeTests(unittest.TestCase):
         health = self.request_json("/api/health")
         self.assertTrue(health["ok"])
         self.assertIn("data_folder_encrypted", health["data_protection"])
+        self.assertFalse(health["ai"]["external_ai_enabled"])
 
         login = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})
         token = login["token"]
@@ -69,6 +70,14 @@ class ApiSmokeTests(unittest.TestCase):
         summary = self.request_json(f"/api/studies/{study_id}/assist/summary", token=token)["summary"]
         self.assertIn("participant_count", summary)
         self.assertTrue(summary["next_steps"])
+        draft = self.request_json(
+            "/api/assist/crf",
+            "POST",
+            {"text": "Age\nVisit date\nAny adverse event?"},
+            token,
+        )
+        self.assertEqual(draft["assistant"]["mode"], "local")
+        self.assertEqual(draft["schema"]["fields"][0]["type"], "number")
 
         backup = self.request_json(f"/api/studies/{study_id}/backups", "POST", {"passphrase": "LongLocalPassphrase123"}, token)["backup"]
         self.assertTrue(backup["encrypted"])
@@ -293,9 +302,13 @@ class ApiSmokeTests(unittest.TestCase):
             token,
         )["token"]
         self.assertFalse(revoked["active"])
-        with self.assertRaises(HTTPError) as denied:
+        try:
             self.request_json(f"/api/redcap?token={api_token}&content=project&format=json")
-        self.assertEqual(denied.exception.code, 401)
+        except HTTPError as denied:
+            self.assertEqual(denied.code, 401)
+            denied.close()
+        else:
+            self.fail("Revoked token should be rejected")
 
 
 if __name__ == "__main__":

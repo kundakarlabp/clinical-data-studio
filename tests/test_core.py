@@ -30,6 +30,15 @@ class CoreEdcTests(unittest.TestCase):
         self.assertEqual(issues, [])
         self.assertEqual(cleaned["double_weight"], 100)
 
+    def test_local_crf_assistant_detects_types_and_choices(self):
+        schema, warnings = server.draft_crf_schema_locally("Age\nVisit date\nSex (Female, Male, Unknown)\nAny adverse event?")
+        self.assertEqual(warnings, [])
+        fields = {field["code"]: field for field in schema["fields"]}
+        self.assertEqual(fields["age"]["type"], "number")
+        self.assertEqual(fields["visit_date"]["type"], "date")
+        self.assertEqual(fields["sex"]["options"], ["Female", "Male", "Unknown"])
+        self.assertEqual(fields["any_adverse_event"]["options"], ["No", "Yes"])
+
     def test_migration_creates_database(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             original_data = server.DATA

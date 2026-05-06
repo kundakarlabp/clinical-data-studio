@@ -51,6 +51,8 @@ class FrontendStaticTests(unittest.TestCase):
         self.assertIn("startCaseDictation", app_js)
         self.assertIn("downloadApi", app_js)
         self.assertIn("data-case-file", app_js)
+        self.assertIn("Academic AI Review", app_js)
+        self.assertIn("requestCaseAiReview", app_js)
 
     def test_public_survey_shell_is_present(self):
         survey_html = (ROOT / "static" / "survey.html").read_text(encoding="utf-8")

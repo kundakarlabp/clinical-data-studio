@@ -22,6 +22,7 @@ from io import StringIO
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request as UrlRequest, urlopen as urlopen_request
 from xml.etree import ElementTree
@@ -35,6 +36,8 @@ DB_PATH = DATA / "clinical_data_studio.sqlite3"
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("CDS_PORT", "8765"))
 PBKDF2_ROUNDS = 260_000
+DEFAULT_OPENAI_MODEL = "gpt-5.2"
+DEFAULT_TRANSCRIBE_MODEL = "gpt-4o-transcribe"
 CALC_OPERATORS = {
     ast.Add: lambda a, b: a + b,
     ast.Sub: lambda a, b: a - b,
@@ -201,11 +204,14 @@ def data_protection_status() -> dict:
 def ai_status() -> dict:
     provider = os.environ.get("CDS_AI_PROVIDER", "local").strip().lower() or "local"
     external_enabled = provider == "openai" and bool(os.environ.get("OPENAI_API_KEY", "").strip())
+    multimodal_enabled = external_enabled and os.environ.get("CDS_AI_MULTIMODAL", "").strip().lower() in {"1", "true", "yes", "on"}
     return {
         "provider": provider if external_enabled else "local",
         "external_ai_enabled": external_enabled,
-        "model": os.environ.get("CDS_AI_MODEL", "gpt-5-mini") if external_enabled else "local-rules",
-        "note": "External AI is disabled unless CDS_AI_PROVIDER=openai and OPENAI_API_KEY are configured.",
+        "model": os.environ.get("CDS_AI_MODEL", DEFAULT_OPENAI_MODEL) if external_enabled else "local-rules",
+        "transcribe_model": os.environ.get("CDS_AI_TRANSCRIBE_MODEL", DEFAULT_TRANSCRIBE_MODEL) if external_enabled else "local-rules",
+        "multimodal_enabled": multimodal_enabled,
+        "note": "External AI is disabled unless CDS_AI_PROVIDER=openai and OPENAI_API_KEY are configured. Uploaded evidence files are sent only when CDS_AI_MULTIMODAL=1.",
     }
 
 
@@ -327,6 +333,7 @@ STUDY_AUDIT_FILTER = """
     OR (audit_log.entity_type = 'survey_invitation' AND audit_log.entity_id IN (SELECT id FROM survey_invitations WHERE study_id = ?))
     OR (audit_log.entity_type = 'report' AND audit_log.entity_id IN (SELECT id FROM reports WHERE study_id = ?))
     OR (audit_log.entity_type = 'case_intake' AND audit_log.entity_id IN (SELECT id FROM case_intakes WHERE study_id = ?))
+    OR (audit_log.entity_type = 'case_ai_review' AND audit_log.entity_id IN (SELECT id FROM case_ai_reviews WHERE study_id = ?))
 )
 """
 
@@ -598,6 +605,18 @@ def migrate() -> None:
                 content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
                 size INTEGER NOT NULL DEFAULT 0,
                 data_base64 TEXT NOT NULL DEFAULT '',
+                created_by INTEGER REFERENCES users(id),
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS case_ai_reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                case_id INTEGER NOT NULL REFERENCES case_intakes(id) ON DELETE CASCADE,
+                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+                user_prompt TEXT NOT NULL DEFAULT '',
+                mode TEXT NOT NULL DEFAULT 'local',
+                response_json TEXT NOT NULL DEFAULT '{}',
+                file_count INTEGER NOT NULL DEFAULT 0,
                 created_by INTEGER REFERENCES users(id),
                 created_at INTEGER NOT NULL
             );
@@ -971,7 +990,7 @@ def draft_crf_schema_with_openai(text: str) -> dict:
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise ValueError("OPENAI_API_KEY is not configured")
-    model = os.environ.get("CDS_AI_MODEL", "gpt-5-mini").strip() or "gpt-5-mini"
+    model = os.environ.get("CDS_AI_MODEL", DEFAULT_OPENAI_MODEL).strip() or DEFAULT_OPENAI_MODEL
     schema = {
         "type": "object",
         "additionalProperties": False,
@@ -1022,6 +1041,84 @@ def draft_crf_schema_with_openai(text: str) -> dict:
         raise ValueError("AI response did not contain text output")
     parsed = json.loads(output_text)
     return normalize_schema(parsed)
+
+
+def openai_error_message(exc: HTTPError) -> str:
+    try:
+        detail = exc.read().decode("utf-8", errors="replace")
+    except Exception:
+        detail = exc.reason
+    return f"OpenAI API error {exc.code}: {str(detail)[:600]}"
+
+
+def openai_response_json(system_prompt: str, content_parts: list[dict], schema_name: str, schema: dict, timeout: int = 90) -> dict:
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY is not configured")
+    model = os.environ.get("CDS_AI_MODEL", DEFAULT_OPENAI_MODEL).strip() or DEFAULT_OPENAI_MODEL
+    request_payload = {
+        "model": model,
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+            {"role": "user", "content": content_parts},
+        ],
+        "text": {"format": {"type": "json_schema", "name": schema_name, "strict": True, "schema": schema}},
+    }
+    request = UrlRequest(
+        "https://api.openai.com/v1/responses",
+        data=json.dumps(request_payload).encode("utf-8"),
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen_request(request, timeout=timeout) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        raise ValueError(openai_error_message(exc)) from exc
+    output_text = extract_openai_text(result)
+    if not output_text:
+        raise ValueError("AI response did not contain text output")
+    return json.loads(output_text)
+
+
+def openai_transcribe_audio(filename: str, content_type: str, content: bytes) -> str:
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY is not configured")
+    model = os.environ.get("CDS_AI_TRANSCRIBE_MODEL", DEFAULT_TRANSCRIBE_MODEL).strip() or DEFAULT_TRANSCRIBE_MODEL
+    boundary = f"----cds{secrets.token_hex(16)}"
+    chunks: list[bytes] = []
+
+    def add_field(name: str, value: str) -> None:
+        chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+        chunks.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
+        chunks.append(value.encode("utf-8"))
+        chunks.append(b"\r\n")
+
+    def add_file(name: str, file_name: str, file_type: str, value: bytes) -> None:
+        safe_name = Path(file_name).name or "audio"
+        chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+        chunks.append(f'Content-Disposition: form-data; name="{name}"; filename="{safe_name}"\r\n'.encode("utf-8"))
+        chunks.append(f"Content-Type: {file_type or 'application/octet-stream'}\r\n\r\n".encode("utf-8"))
+        chunks.append(value)
+        chunks.append(b"\r\n")
+
+    add_field("model", model)
+    add_field("response_format", "json")
+    add_file("file", filename, content_type, content)
+    chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+    request = UrlRequest(
+        "https://api.openai.com/v1/audio/transcriptions",
+        data=b"".join(chunks),
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    try:
+        with urlopen_request(request, timeout=120) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        raise ValueError(openai_error_message(exc)) from exc
+    return str(payload.get("text", "")).strip()
 
 
 def first_matching_line(text: str, labels: tuple[str, ...]) -> str:
@@ -1131,6 +1228,47 @@ def extract_case_intelligence(text: str, title: str = "") -> dict:
     }
 
 
+def adaptive_case_fields(case_items: list[dict]) -> list[dict]:
+    fields = [
+        {"code": "case_uid", "label": "Case ID", "type": "text", "required": True, "reason": "Stable case tracking"},
+        {"code": "age", "label": "Age", "type": "number", "required": False, "reason": "Core case-report demographic item"},
+        {"code": "sex", "label": "Sex", "type": "select", "required": False, "options": ["Female", "Male", "Other", "Unknown"], "reason": "Core case-report demographic item"},
+        {"code": "diagnosis", "label": "Diagnosis", "type": "textarea", "required": True, "reason": "Main grouping and publication variable"},
+        {"code": "presentation", "label": "Presentation", "type": "textarea", "required": False, "reason": "Symptoms and clinical context"},
+        {"code": "investigations", "label": "Investigations", "type": "textarea", "required": False, "reason": "Diagnostic evidence"},
+        {"code": "treatment", "label": "Treatment / Management", "type": "textarea", "required": False, "reason": "Intervention or exposure"},
+        {"code": "outcome", "label": "Outcome", "type": "textarea", "required": False, "reason": "Clinical course and publication relevance"},
+        {"code": "follow_up", "label": "Follow-up Duration", "type": "text", "required": False, "reason": "Case-series comparability"},
+    ]
+    tag_counts: dict[str, int] = {}
+    for item in case_items:
+        for tag in (item.get("extracted") or {}).get("tags", []):
+            if len(tag) >= 4:
+                tag_counts[tag] = tag_counts.get(tag, 0) + 1
+    for tag, count in sorted(tag_counts.items(), key=lambda pair: (-pair[1], pair[0]))[:8]:
+        if count < 2 and len(case_items) > 1:
+            continue
+        fields.append(
+            {
+                "code": normalize_code(f"has_{tag}")[:40],
+                "label": f"{tag.title()} present",
+                "type": "select",
+                "required": False,
+                "options": ["No", "Yes", "Unknown"],
+                "reason": f"Detected in {count} case(s); consider a structured field if clinically meaningful.",
+            }
+        )
+    normalized = []
+    seen = set()
+    for field in fields:
+        code = normalize_code(field["code"])[:60]
+        if code in seen:
+            continue
+        seen.add(code)
+        normalized.append({**field, "code": code, "options": field.get("options", [])})
+    return normalized
+
+
 def case_series_summary(case_items: list[dict]) -> dict:
     groups: dict[str, dict] = {}
     missing_total = 0
@@ -1153,6 +1291,7 @@ def case_series_summary(case_items: list[dict]) -> dict:
         "groups": group_list,
         "missing_field_count": missing_total,
         "warning_count": warnings,
+        "adaptive_fields": adaptive_case_fields(case_items),
         "draft_outline": [
             "Title: concise diagnosis/intervention/outcome signal.",
             "Background: why these cases are clinically useful.",
@@ -1161,6 +1300,210 @@ def case_series_summary(case_items: list[dict]) -> dict:
             "Discussion: patterns, novelty, limitations, and lessons.",
         ],
     }
+
+
+def academic_review_schema() -> dict:
+    field_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "code": {"type": "string"},
+            "label": {"type": "string"},
+            "type": {"type": "string", "enum": ["text", "textarea", "number", "date", "select", "checkbox", "file"]},
+            "required": {"type": "boolean"},
+            "options": {"type": "array", "items": {"type": "string"}},
+            "reason": {"type": "string"},
+        },
+        "required": ["code", "label", "type", "required", "options", "reason"],
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "case_summary": {"type": "string"},
+            "structured_case_data": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "demographics": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {"age": {"type": "string"}, "sex": {"type": "string"}},
+                        "required": ["age", "sex"],
+                    },
+                    "clinical": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "diagnosis": {"type": "string"},
+                            "presentation": {"type": "string"},
+                            "investigations": {"type": "string"},
+                            "treatment": {"type": "string"},
+                            "outcome": {"type": "string"},
+                            "follow_up": {"type": "string"},
+                        },
+                        "required": ["diagnosis", "presentation", "investigations", "treatment", "outcome", "follow_up"],
+                    },
+                },
+                "required": ["demographics", "clinical"],
+            },
+            "evidence_notes": {"type": "array", "items": {"type": "string"}},
+            "adaptive_crf_suggestions": {"type": "array", "items": field_schema},
+            "publication_guidance": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "case_report_potential": {"type": "string", "enum": ["low", "moderate", "high", "unclear"]},
+                    "case_series_potential": {"type": "string", "enum": ["low", "moderate", "high", "unclear"]},
+                    "suggested_article_type": {"type": "string"},
+                    "rationale": {"type": "string"},
+                    "manuscript_outline": {"type": "array", "items": {"type": "string"}},
+                    "missing_items": {"type": "array", "items": {"type": "string"}},
+                    "follow_up_questions": {"type": "array", "items": {"type": "string"}},
+                    "literature_search_terms": {"type": "array", "items": {"type": "string"}},
+                    "ethics_and_privacy_notes": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": [
+                    "case_report_potential",
+                    "case_series_potential",
+                    "suggested_article_type",
+                    "rationale",
+                    "manuscript_outline",
+                    "missing_items",
+                    "follow_up_questions",
+                    "literature_search_terms",
+                    "ethics_and_privacy_notes",
+                ],
+            },
+            "response_to_question": {"type": "string"},
+            "safety_notes": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": [
+            "case_summary",
+            "structured_case_data",
+            "evidence_notes",
+            "adaptive_crf_suggestions",
+            "publication_guidance",
+            "response_to_question",
+            "safety_notes",
+        ],
+    }
+
+
+def local_academic_case_review(case_item: dict, all_cases: list[dict], question: str = "") -> dict:
+    extracted = case_item.get("extracted") or {}
+    clinical = extracted.get("clinical") or {}
+    demographics = extracted.get("demographics") or {}
+    missing = list(extracted.get("missing_fields", []))
+    case_count = len(all_cases)
+    has_outcome = bool(clinical.get("outcome"))
+    potential = "moderate" if clinical.get("diagnosis") and has_outcome else "unclear"
+    if len(missing) > 3:
+        potential = "low"
+    return {
+        "case_summary": " ".join(part for part in [clinical.get("diagnosis", ""), clinical.get("presentation", ""), clinical.get("outcome", "")] if part)[:1200] or "Insufficient structured case text for a reliable summary.",
+        "structured_case_data": {
+            "demographics": {"age": demographics.get("age", ""), "sex": demographics.get("sex", "")},
+            "clinical": {
+                "diagnosis": clinical.get("diagnosis", ""),
+                "presentation": clinical.get("presentation", ""),
+                "investigations": clinical.get("investigations", ""),
+                "treatment": clinical.get("treatment", ""),
+                "outcome": clinical.get("outcome", ""),
+                "follow_up": "",
+            },
+        },
+        "evidence_notes": [
+            f"{len(case_item.get('files', []))} evidence file(s) are stored locally.",
+            "Local review uses typed/dictated/OCR text only; enable OpenAI multimodal review for image/audio interpretation.",
+        ],
+        "adaptive_crf_suggestions": adaptive_case_fields(all_cases),
+        "publication_guidance": {
+            "case_report_potential": potential,
+            "case_series_potential": "moderate" if case_count >= 3 else "low",
+            "suggested_article_type": "case report" if case_count < 3 else "case series",
+            "rationale": "Publication potential depends on novelty, complete timeline, diagnostic evidence, intervention details, outcome/follow-up, consent/ethics, and a focused literature gap.",
+            "manuscript_outline": [
+                "Background and clinical rationale",
+                "Case presentation with de-identified timeline",
+                "Investigations and differential diagnosis",
+                "Treatment or intervention",
+                "Outcome and follow-up",
+                "Discussion against existing literature",
+            ],
+            "missing_items": missing,
+            "follow_up_questions": [
+                "What makes this case uncommon, educational, or practice-changing?",
+                "Are inclusion criteria consistent across similar cases?",
+                "Is follow-up duration available for every publishable case?",
+            ],
+            "literature_search_terms": [value for value in [clinical.get("diagnosis", ""), clinical.get("treatment", ""), clinical.get("outcome", "")] if value][:8],
+            "ethics_and_privacy_notes": [
+                "Confirm consent/ethics requirements for case reports or retrospective case series.",
+                "Remove names, MRNs, phone numbers, exact DOB, and unnecessary dates before external AI or publication.",
+            ],
+        },
+        "response_to_question": question[:1200] if question else "Use the missing-item list and adaptive CRF suggestions to decide which fields to standardize next.",
+        "safety_notes": list(extracted.get("warnings", [])) + ["AI/local suggestions are review aids, not final clinical interpretation."],
+    }
+
+
+def build_openai_case_content(conn: sqlite3.Connection, study_id: int, case_item: dict, all_cases: list[dict], question: str) -> tuple[list[dict], list[str], int]:
+    status = ai_status()
+    evidence_notes = []
+    case_context = {
+        "case": {
+            "case_uid": case_item.get("case_uid"),
+            "title": case_item.get("title"),
+            "status": case_item.get("status"),
+            "source_text": str(case_item.get("source_text", ""))[:18000],
+            "local_extraction": case_item.get("extracted", {}),
+        },
+        "series_summary": case_series_summary(all_cases),
+        "user_question": question[:3000],
+    }
+    content_parts = [{"type": "input_text", "text": "Review this de-identified clinical case intake JSON:\n" + json.dumps(case_context, ensure_ascii=False)}]
+    file_rows = rows(conn, "SELECT * FROM case_files WHERE case_id = ? AND study_id = ? ORDER BY id", (case_item["id"], study_id))
+    for file_row in file_rows:
+        name = file_row["name"]
+        content_type = file_row["content_type"] or mimetypes.guess_type(name)[0] or "application/octet-stream"
+        try:
+            decoded = base64.b64decode(file_row["data_base64"], validate=True)
+        except Exception:
+            evidence_notes.append(f"{name}: could not decode stored evidence.")
+            continue
+        if (content_type.startswith("text/") or Path(name).suffix.lower() in {".txt", ".csv"}) and status["multimodal_enabled"]:
+            text = decoded.decode("utf-8", errors="replace")[:10000]
+            content_parts.append({"type": "input_text", "text": f"Evidence text file {name}:\n{text}"})
+            evidence_notes.append(f"{name}: text evidence included.")
+        elif content_type.startswith("image/") and status["multimodal_enabled"] and len(decoded) <= 8 * 1024 * 1024:
+            content_parts.append({"type": "input_image", "image_url": f"data:{content_type};base64,{file_row['data_base64']}"})
+            evidence_notes.append(f"{name}: image sent for AI vision review.")
+        elif content_type.startswith("audio/") and status["multimodal_enabled"] and len(decoded) <= 24 * 1024 * 1024:
+            transcript = openai_transcribe_audio(name, content_type, decoded)
+            content_parts.append({"type": "input_text", "text": f"Audio transcript from {name}:\n{transcript[:12000]}"})
+            evidence_notes.append(f"{name}: audio transcribed and included.")
+        elif not status["multimodal_enabled"] and (content_type.startswith(("image/", "audio/", "text/")) or Path(name).suffix.lower() in {".txt", ".csv"}):
+            evidence_notes.append(f"{name}: stored locally but not sent because CDS_AI_MULTIMODAL is not enabled.")
+        else:
+            evidence_notes.append(f"{name}: stored locally; unsupported for AI interpretation in this version.")
+    content_parts.append({"type": "input_text", "text": "Evidence handling notes:\n" + "\n".join(evidence_notes)})
+    return content_parts, evidence_notes, len(file_rows)
+
+
+def openai_academic_case_review(conn: sqlite3.Connection, study_id: int, case_item: dict, all_cases: list[dict], question: str) -> dict:
+    content_parts, evidence_notes, _ = build_openai_case_content(conn, study_id, case_item, all_cases, question)
+    system_prompt = (
+        "You are an academic clinical research assistant inside a local EDC app. "
+        "Extract only what is supported by the supplied material. Do not invent facts. "
+        "Suggest adaptive CRF fields for repeated retrospective cases. "
+        "Assess publication possibilities using case report/case series thinking, but never claim novelty without a literature search. "
+        "Prioritize de-identification, consent/ethics, missing data, and reviewer-verifiable outputs."
+    )
+    result = openai_response_json(system_prompt, content_parts, "academic_case_review", academic_review_schema(), timeout=120)
+    if evidence_notes:
+        result["evidence_notes"] = list(dict.fromkeys([*result.get("evidence_notes", []), *evidence_notes]))
+    return result
 
 
 def user_membership(conn: sqlite3.Connection, user: dict, study_id: int) -> dict | None:
@@ -1919,7 +2262,11 @@ class App(BaseHTTPRequestHandler):
                     self.send_error_json("Case intake permission required", 403)
                     return
             elif method == "POST":
-                if not membership_has(membership, "enter_data"):
+                ai_review = len(parts) == 6 and parts[5] == "ai-review"
+                if ai_review and not (membership_has(membership, "view_analysis") or membership_has(membership, "review_data")):
+                    self.send_error_json("Analysis or review permission required", 403)
+                    return
+                if not ai_review and not membership_has(membership, "enter_data"):
                     self.send_error_json("Data entry permission required", 403)
                     return
             elif method == "PATCH":
@@ -2702,6 +3049,15 @@ class App(BaseHTTPRequestHandler):
         payload["extracted"] = load_json(payload.pop("extracted_json", "{}"), {})
         payload["tags"] = load_json(payload.pop("tags_json", "[]"), [])
         payload["files"] = rows(conn, "SELECT id, name, content_type, size, created_at FROM case_files WHERE case_id = ? ORDER BY id", (case["id"],))
+        reviews = rows(
+            conn,
+            "SELECT id, user_prompt, mode, response_json, file_count, created_by, created_at FROM case_ai_reviews WHERE case_id = ? ORDER BY id DESC LIMIT 5",
+            (case["id"],),
+        )
+        for review in reviews:
+            review["response"] = load_json(review.pop("response_json"), {})
+        payload["ai_reviews"] = reviews
+        payload["latest_ai_review"] = reviews[0] if reviews else None
         return payload
 
     def case_rows(self, conn: sqlite3.Connection, study_id: int) -> list[dict]:
@@ -2736,7 +3092,7 @@ class App(BaseHTTPRequestHandler):
     def case_intake(self, conn, user, method, study_id, parts, membership) -> None:
         if method == "GET" and len(parts) == 4:
             cases = self.case_rows(conn, study_id)
-            self.send_json({"cases": cases, "series": case_series_summary(cases)})
+            self.send_json({"cases": cases, "series": case_series_summary(cases), "ai": ai_status()})
             return
         if method == "GET" and len(parts) == 5 and parts[4] == "export":
             if not membership_has(membership, "export_data") and not membership_has(membership, "view_analysis"):
@@ -2757,6 +3113,42 @@ class App(BaseHTTPRequestHandler):
             self.send_header("content-length", str(len(content)))
             self.end_headers()
             self.wfile.write(content)
+            return
+        if method == "POST" and len(parts) == 6 and parts[5] == "ai-review":
+            case_id = int(parts[4])
+            case_row = row(conn, "SELECT * FROM case_intakes WHERE id = ? AND study_id = ?", (case_id, study_id))
+            if not case_row:
+                self.send_error_json("Case not found", 404)
+                return
+            payload = self.body()
+            question = str(payload.get("question", "")).strip()
+            all_cases = self.case_rows(conn, study_id)
+            case_item = self.case_payload(conn, case_row)
+            status = ai_status()
+            mode = "local"
+            try:
+                if status["external_ai_enabled"]:
+                    response = openai_academic_case_review(conn, study_id, case_item, all_cases, question)
+                    mode = "openai"
+                else:
+                    response = local_academic_case_review(case_item, all_cases, question)
+            except Exception as exc:
+                response = local_academic_case_review(case_item, all_cases, question)
+                response["safety_notes"].append(f"External AI review failed; local fallback used: {exc}")
+            file_count = len(case_item.get("files", []))
+            timestamp = now()
+            cur = conn.execute(
+                """
+                INSERT INTO case_ai_reviews(case_id, study_id, user_prompt, mode, response_json, file_count, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (case_id, study_id, question, mode, json.dumps(response), file_count, user["id"], timestamp),
+            )
+            review = row(conn, "SELECT id, user_prompt, mode, response_json, file_count, created_by, created_at FROM case_ai_reviews WHERE id = ?", (cur.lastrowid,))
+            audit(conn, user["id"], "academic_ai_review", "case_ai_review", cur.lastrowid, None, {"case_id": case_id, "mode": mode, "file_count": file_count})
+            conn.commit()
+            review["response"] = load_json(review.pop("response_json"), {})
+            self.send_json({"review": review, "ai": status}, 201)
             return
         if method == "POST" and len(parts) == 4:
             payload = self.body()

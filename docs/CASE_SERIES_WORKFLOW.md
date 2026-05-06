@@ -29,9 +29,10 @@ References:
 1. Add each case in Case Intake.
 2. Upload evidence files and paste/dictate the clinical narrative.
 3. Review the extracted group, diagnosis, treatment, and outcome.
-4. Complete missing items before moving a case to ready status.
-5. Export Case CSV for analysis.
-6. Use Reports or Analysis after converting stable fields into formal CRFs if the case series becomes a larger study.
+4. Use Academic AI review only on de-identified material or when your study policy allows external AI.
+5. Complete missing items before moving a case to ready status.
+6. Convert stable repeated variables into formal CRFs when the case series becomes a larger study.
+7. Export Case CSV for analysis.
 
 ## Privacy Rules
 

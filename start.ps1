@@ -6,4 +6,5 @@ Write-Host "Phone/tablet URLs on this Wi-Fi:"
 Get-NetIPAddress -AddressFamily IPv4 |
   Where-Object { $_.IPAddress -notlike "127.*" -and $_.PrefixOrigin -ne "WellKnown" } |
   ForEach-Object { Write-Host "  http://$($_.IPAddress):$port" }
+Write-Host "For remote/VPN/tunnel guidance, run .\remote_access.ps1 in another PowerShell window."
 python .\server.py

@@ -62,6 +62,31 @@ class FrontendStaticTests(unittest.TestCase):
         self.assertIn("Pixel 7", smoke)
         self.assertIn("Browser smoke passed", smoke)
 
+    def test_remote_access_guidance_is_present(self):
+        app_js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        css = (ROOT / "static" / "styles.css").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        deployment = (ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
+        self.assertIn("Remote Access", app_js)
+        self.assertIn("remoteAccessView", app_js)
+        self.assertIn("remote_access.ps1", app_js)
+        self.assertIn("VPN Overlay", app_js)
+        self.assertIn("HTTPS Tunnel", app_js)
+        self.assertIn("Google Drive / GitHub Pages", app_js)
+        self.assertIn("metrics-grid", css)
+        self.assertIn("remote-grid", css)
+        self.assertIn("Private VPN overlay", readme)
+        self.assertIn("Do not use GitHub Pages or Google Drive", readme)
+        self.assertIn("Remote Access Options", deployment)
+        self.assertIn("GitHub Pages: useful for documentation", deployment)
+
+    def test_remote_access_helper_script_is_present(self):
+        helper = (ROOT / "remote_access.ps1").read_text(encoding="utf-8")
+        self.assertIn("Get-NetIPAddress", helper)
+        self.assertIn("tailscale ip -4", helper)
+        self.assertIn("cloudflared tunnel --url", helper)
+        self.assertIn("Do not store the live database", helper)
+
 
 if __name__ == "__main__":
     unittest.main()

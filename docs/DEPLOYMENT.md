@@ -18,6 +18,31 @@ Open the study Wi-Fi URL in Chrome or Edge and use **Install App** or **Add to H
 
 For multiple users on disconnected computers or phones, use each disconnected device only for test/pilot workflows unless you have a validated sync process. For production data, prefer one reachable study computer on a trusted LAN, VPN, or approved hosting environment so audit trails and record locks stay centralized.
 
+## Remote Access Options
+
+Remote clinical data entry needs one central app instance and one central database. Do not run separate database copies for real study data unless you have a validated import/reconciliation SOP.
+
+Preferred sequence:
+
+- Local LAN: keep the study computer powered on, run `.\start.ps1`, and use the printed Wi-Fi URL on approved devices.
+- Private VPN overlay: use Tailscale, ZeroTier, or an equivalent approved private network so named users can reach the study computer from outside the building without exposing the app directly to the public internet.
+- HTTPS tunnel: Cloudflare Tunnel or a similar tunnel can expose the local app, but it must be paired with identity access controls, strong application passwords, HTTPS-only access, backups, and documented study approval.
+- Proper hosting: if you later accept paid hosting, use a small VM or managed app platform with persistent database storage, HTTPS, environment-managed secrets, backup automation, and restore testing.
+
+After the app is running, use the helper script to print available addresses and detect optional remote tools:
+
+```powershell
+.\remote_access.ps1
+```
+
+The helper does not start a public tunnel by itself. It prints the Cloudflare Tunnel command only when `cloudflared` is already installed.
+
+Not suitable for the live app:
+
+- GitHub Pages: useful for documentation or a static landing page only. It cannot run this Python backend or manage SQLite writes.
+- GitHub repository storage: use for source code only. Never commit PHI, identifiers, live exports, SQLite databases, backup archives, or passphrases.
+- Google Drive: useful for manually stored encrypted backup archives, not for live multi-user database editing. File sync can corrupt or fork SQLite data under concurrent access.
+
 ## Firewall
 
 If another device cannot open the app, allow Python through Windows Defender Firewall for private networks, or open TCP port `8765` only on the trusted local network.

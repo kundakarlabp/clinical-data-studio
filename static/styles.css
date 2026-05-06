@@ -220,6 +220,12 @@ legend {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.metrics-grid {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
 .panel,
 .card {
   background: var(--panel);
@@ -266,7 +272,7 @@ p {
 }
 
 h1 {
-  font-size: clamp(24px, 4vw, 36px);
+  font-size: 32px;
   margin-bottom: 2px;
 }
 
@@ -285,13 +291,27 @@ p {
   line-height: 1.5;
 }
 
+code {
+  background: #eef2f7;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: #12324f;
+  font-size: 0.95em;
+  padding: 2px 5px;
+}
+
 .metric {
   display: grid;
   gap: 4px;
+  min-height: 88px;
 }
 
 .metric strong {
   font-size: 28px;
+}
+
+.metric span:last-child {
+  color: var(--muted);
 }
 
 .pill {
@@ -436,6 +456,32 @@ th {
   margin-bottom: 4px;
 }
 
+.remote-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 12px;
+}
+
+.remote-option {
+  background: white;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+}
+
+.remote-option.recommended {
+  background: #f4fbfa;
+  border-color: rgba(15, 118, 110, 0.38);
+}
+
+.remote-option h3,
+.remote-option p {
+  margin-bottom: 0;
+}
+
 .field-editor {
   display: grid;
   grid-template-columns: 1fr 1fr 140px 88px 44px;
@@ -479,12 +525,19 @@ th {
     position: sticky;
     top: 0;
     z-index: 4;
+    align-items: flex-start;
+    flex-wrap: wrap;
   }
 
   .grid.two,
   .grid.three,
-  .form-grid {
+  .form-grid,
+  .remote-grid {
     grid-template-columns: 1fr;
+  }
+
+  h1 {
+    font-size: 26px;
   }
 
   .field-editor {

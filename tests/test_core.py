@@ -51,6 +51,21 @@ class CoreEdcTests(unittest.TestCase):
         self.assertIn("oseltamivir", extracted["clinical"]["treatment"].lower())
         self.assertNotIn("outcome", extracted["missing_fields"])
 
+    def test_local_academic_review_suggests_adaptive_fields(self):
+        case = {
+            "id": 1,
+            "case_uid": "CASE-001",
+            "files": [{"name": "note.txt"}],
+            "extracted": server.extract_case_intelligence(
+                "A 42 year old female. Diagnosis: influenza pneumonia. Treatment: oseltamivir. Outcome: improved.",
+                "Influenza pneumonia",
+            ),
+        }
+        review = server.local_academic_case_review(case, [case], "publication angle?")
+        self.assertIn("publication_guidance", review)
+        self.assertTrue(review["adaptive_crf_suggestions"])
+        self.assertTrue(any(field["code"] == "diagnosis" for field in review["adaptive_crf_suggestions"]))
+
     def test_migration_creates_database(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             original_data = server.DATA

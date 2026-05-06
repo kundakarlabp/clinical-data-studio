@@ -179,8 +179,20 @@ class ApiSmokeTests(unittest.TestCase):
         _, file_type, file_body = self.request_raw(f"/api/studies/{study_id}/case-intake/{created['id']}/files/{created['files'][0]['id']}", token=token)
         self.assertIn("text/plain", file_type)
         self.assertEqual(file_body, b"case note")
+        review = self.request_json(
+            f"/api/studies/{study_id}/case-intake/{created['id']}/ai-review",
+            "POST",
+            {"question": "Can this become a case report?"},
+            token,
+        )["review"]
+        self.assertEqual(review["mode"], "local")
+        self.assertIn("publication_guidance", review["response"])
+        self.assertTrue(review["response"]["adaptive_crf_suggestions"])
         library = self.request_json(f"/api/studies/{study_id}/case-intake", token=token)
         self.assertEqual(library["series"]["case_count"], 1)
+        self.assertTrue(library["series"]["adaptive_fields"])
+        saved_case = next(item for item in library["cases"] if item["case_uid"] == "CASE-RETRO-001")
+        self.assertTrue(saved_case["latest_ai_review"])
         self.assertTrue(library["series"]["groups"])
         _, csv_type, csv_body = self.request_raw(f"/api/studies/{study_id}/case-intake/export", token=token)
         self.assertIn("text/csv", csv_type)

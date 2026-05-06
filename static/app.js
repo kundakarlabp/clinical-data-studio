@@ -16,6 +16,7 @@ const state = {
   invitations: [],
   reports: [],
   caseIntake: { cases: [], series: null },
+  caseAiReview: null,
   backups: [],
   forms: [],
   participants: [],
@@ -917,7 +918,9 @@ function qualityView() {
 
 function caseIntakeView() {
   const cases = state.caseIntake?.cases || [];
-  const series = state.caseIntake?.series || { case_count: 0, group_count: 0, groups: [], missing_field_count: 0, warning_count: 0, draft_outline: [] };
+  const series = state.caseIntake?.series || { case_count: 0, group_count: 0, groups: [], missing_field_count: 0, warning_count: 0, draft_outline: [], adaptive_fields: [] };
+  const ai = state.caseIntake?.ai || { provider: "local", external_ai_enabled: false, multimodal_enabled: false, model: "local-rules" };
+  const review = state.caseAiReview?.response;
   return `
     <section class="metrics-grid">
       ${metric("Cases", series.case_count || 0, "Unstructured case records")}
@@ -957,6 +960,26 @@ function caseIntakeView() {
       </form>
     </section>
     <section class="panel">
+      <h2>Academic AI Review</h2>
+      <div class="grid two">
+        <div class="notice">
+          AI mode: ${escapeHtml(ai.provider)} / ${escapeHtml(ai.model)}. ${ai.external_ai_enabled ? "External AI enabled." : "Local fallback active."} ${ai.multimodal_enabled ? "Image/audio review enabled." : "Image/audio stays local unless multimodal is enabled."}
+        </div>
+        <label>Question for AI<textarea id="case-ai-question" placeholder="Ask about publication potential, missing variables, evolving CRF sections, or manuscript angle."></textarea></label>
+      </div>
+      ${review ? `
+        <div class="grid two">
+          <div class="notice"><strong>Summary</strong><br>${escapeHtml(review.case_summary || "")}</div>
+          <div class="notice"><strong>Publication</strong><br>${escapeHtml(review.publication_guidance?.suggested_article_type || "")}: ${escapeHtml(review.publication_guidance?.rationale || "")}</div>
+        </div>
+        <div class="readiness-list">
+          ${(review.publication_guidance?.missing_items || []).map((item) => `<div class="readiness-item"><span class="pill warn">missing</span><div><strong>${escapeHtml(item)}</strong></div></div>`).join("")}
+          ${(review.publication_guidance?.literature_search_terms || []).map((item) => `<div class="readiness-item"><span class="pill ok">search</span><div><strong>${escapeHtml(item)}</strong></div></div>`).join("")}
+        </div>
+        <label>AI Review JSON<textarea readonly>${escapeHtml(JSON.stringify(review, null, 2))}</textarea></label>
+      ` : ""}
+    </section>
+    <section class="panel">
       <div class="row">
         <h2>Case Series Builder</h2>
         <button class="secondary" id="case-export">Export Case CSV</button>
@@ -973,17 +996,22 @@ function caseIntakeView() {
           </div>
         `).join("") || "<p>No case groups yet.</p>"}
       </div>
+      <h3>Adaptive Draft CRF Fields</h3>
+      <div class="stack">
+        ${(series.adaptive_fields || []).map((field) => `<span class="pill">${escapeHtml(field.label)} (${escapeHtml(field.type)})</span>`).join("") || "<span class=\"small\">No adaptive fields yet.</span>"}
+      </div>
     </section>
     <section class="panel">
       <h2>Case Library</h2>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Case</th><th>Group</th><th>Extracted Details</th><th>Files</th><th>Status</th></tr></thead>
+          <thead><tr><th>Case</th><th>Group</th><th>Extracted Details</th><th>Files</th><th>Academic AI</th><th>Status</th></tr></thead>
           <tbody>
             ${cases.map((item) => {
               const extracted = item.extracted || {};
               const clinical = extracted.clinical || {};
               const demographics = extracted.demographics || {};
+              const latestReview = item.latest_ai_review?.response;
               return `
                 <tr>
                   <td><strong>${escapeHtml(item.case_uid)}</strong><br><span class="small">${escapeHtml(item.title)}</span></td>
@@ -999,10 +1027,14 @@ function caseIntakeView() {
                   <td>
                     ${(item.files || []).map((file) => `<button type="button" class="secondary" data-case-id="${item.id}" data-case-file="${file.id}" data-case-file-name="${escapeHtml(file.name)}">${escapeHtml(file.name)}</button>`).join(" ") || "None"}
                   </td>
+                  <td>
+                    <button type="button" class="secondary" data-case-ai="${item.id}">AI Review</button>
+                    ${latestReview ? `<br><span class="small">${escapeHtml(latestReview.publication_guidance?.suggested_article_type || latestReview.publication_guidance?.case_report_potential || "reviewed")}</span>` : ""}
+                  </td>
                   <td><span class="pill">${escapeHtml(item.status)}</span><br><span class="small">${fmtTime(item.updated_at)}</span></td>
                 </tr>
               `;
-            }).join("") || `<tr><td colspan="5">No cases captured yet.</td></tr>`}
+            }).join("") || `<tr><td colspan="6">No cases captured yet.</td></tr>`}
           </tbody>
         </table>
       </div>
@@ -1380,6 +1412,9 @@ function bindRoute() {
   document.querySelector("#case-export")?.addEventListener("click", () => downloadApi(`/api/studies/${state.studyId}/case-intake/export`, "case_intake_export.csv"));
   document.querySelectorAll("[data-case-file]").forEach((button) => {
     button.addEventListener("click", () => downloadApi(`/api/studies/${state.studyId}/case-intake/${button.dataset.caseId}/files/${button.dataset.caseFile}`, button.dataset.caseFileName || "case_evidence"));
+  });
+  document.querySelectorAll("[data-case-ai]").forEach((button) => {
+    button.addEventListener("click", () => requestCaseAiReview(button.dataset.caseAi));
   });
   document.querySelector("#backup-create")?.addEventListener("click", createBackup);
   document.querySelector("#encrypted-backup-form")?.addEventListener("submit", createEncryptedBackup);
@@ -1768,6 +1803,23 @@ function startCaseDictation() {
     render();
   };
   recognition.start();
+}
+
+async function requestCaseAiReview(caseId) {
+  const question = document.querySelector("#case-ai-question")?.value || "";
+  try {
+    const result = await api(`/api/studies/${state.studyId}/case-intake/${caseId}/ai-review`, {
+      method: "POST",
+      body: JSON.stringify({ question }),
+    });
+    state.caseAiReview = result.review;
+    state.error = `Academic AI review created using ${result.review.mode} mode.`;
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
 }
 
 async function downloadApi(path, filename) {

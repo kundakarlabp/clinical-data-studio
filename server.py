@@ -8,8 +8,10 @@ import hmac
 import json
 import mimetypes
 import os
+import platform
 import secrets
 import sqlite3
+import sys
 import tempfile
 import time
 import ctypes
@@ -1592,6 +1594,11 @@ class App(BaseHTTPRequestHandler):
                 self.send_error_json("Validation evidence permission required", 403)
                 return
             return self.validation_evidence(conn, study_id)
+        if resource == "validation-package" and method == "GET":
+            if not membership_has(membership, "review_data") and not membership_has(membership, "manage_study"):
+                self.send_error_json("Validation evidence permission required", 403)
+                return
+            return self.export_validation_package(conn, study_id)
         if resource == "quality" and method == "GET":
             return self.quality(conn, study_id, membership)
         if resource == "analysis" and method == "GET":
@@ -2570,6 +2577,9 @@ class App(BaseHTTPRequestHandler):
         self.send_json({"project": payload["project"], "instruments": payload["instruments"], "data_dictionary": payload["data_dictionary"]})
 
     def validation_evidence(self, conn, study_id: int) -> None:
+        self.send_json(self.validation_payload(conn, study_id))
+
+    def validation_payload(self, conn, study_id: int) -> dict:
         study = row(conn, "SELECT * FROM studies WHERE id = ?", (study_id,))
         counts = {
             "forms": row(conn, "SELECT COUNT(*) AS count FROM forms WHERE study_id = ?", (study_id,))["count"],
@@ -2592,7 +2602,50 @@ class App(BaseHTTPRequestHandler):
             {"name": "data_folder_encryption", "status": "available" if protection["data_folder_encrypted"] else "not_enabled", "evidence": protection["note"]},
             {"name": "audit_review", "status": "available", "evidence": f"{counts['audit_events']} audit event(s)."},
         ]
-        self.send_json({"study": study, "generated_at": now(), "counts": counts, "data_protection": protection, "checks": checks, "recent_audit": recent_audit})
+        return {"study": study, "generated_at": now(), "counts": counts, "data_protection": protection, "checks": checks, "recent_audit": recent_audit}
+
+    def export_validation_package(self, conn, study_id: int) -> None:
+        study = row(conn, "SELECT * FROM studies WHERE id = ?", (study_id,))
+        evidence = self.validation_payload(conn, study_id)
+        metadata = self.metadata_payload(conn, study_id)
+        audit_sample = rows(conn, "SELECT audit_log.*, users.display_name FROM audit_log LEFT JOIN users ON users.id = audit_log.user_id ORDER BY audit_log.id DESC LIMIT 250")
+        manifest = {
+            "application": "Clinical Data Studio",
+            "generated_at": now(),
+            "study_id": study["id"],
+            "study_name": study["name"],
+            "python": sys.version,
+            "platform": platform.platform(),
+            "database": str(DB_PATH),
+            "data_folder": str(DATA),
+            "commit": os.environ.get("CDS_COMMIT", "record-current-git-commit-manually"),
+        }
+        checklist = (ROOT / "docs" / "SOP_VALIDATION_CHECKLIST.md").read_text(encoding="utf-8")
+        execution_record = (ROOT / "docs" / "VALIDATION_EXECUTION_RECORD.md").read_text(encoding="utf-8")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
+            archive_path = Path(tmp.name)
+        try:
+            with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("validation_evidence.json", json.dumps(evidence, indent=2))
+                archive.writestr("metadata_codebook.json", json.dumps(metadata, indent=2))
+                archive.writestr("audit_sample.json", json.dumps(audit_sample, indent=2))
+                archive.writestr("system_manifest.json", json.dumps(manifest, indent=2))
+                archive.writestr("SOP_VALIDATION_CHECKLIST.md", checklist)
+                archive.writestr("VALIDATION_EXECUTION_RECORD.md", execution_record)
+                archive.writestr(
+                    "README.txt",
+                    "Clinical Data Studio validation package.\nReview every file, complete the execution record, attach screenshots, and sign off before real study use.\n",
+                )
+            content = archive_path.read_bytes()
+        finally:
+            archive_path.unlink(missing_ok=True)
+        safe_name = normalize_code(study["name"], "study")
+        self.send_response(200)
+        self.send_header("content-type", "application/zip")
+        self.send_header("content-disposition", f"attachment; filename={safe_name}_validation_package.zip")
+        self.send_header("content-length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
 
     def quality(self, conn, study_id: int, membership) -> None:
         forms = rows(conn, "SELECT * FROM forms WHERE study_id = ? ORDER BY id", (study_id,))

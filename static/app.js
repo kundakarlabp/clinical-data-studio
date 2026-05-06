@@ -1078,7 +1078,12 @@ function settingsView() {
     <section class="panel">
       <h2>Important Use Notes</h2>
       <p>This app is local-first and suitable for small research workflows. For regulated trials, validate the system, document SOPs, review audit trails, and maintain controlled backups.</p>
-      ${state.studyId && (can("review_data") || can("manage_study")) ? `<a href="/api/studies/${state.studyId}/validation" target="_blank"><button class="secondary">Export Validation Evidence JSON</button></a>` : ""}
+      ${state.studyId && (can("review_data") || can("manage_study")) ? `
+        <div class="split-actions">
+          <a href="/api/studies/${state.studyId}/validation" target="_blank"><button class="secondary">Validation Evidence JSON</button></a>
+          <a href="/api/studies/${state.studyId}/validation-package" target="_blank"><button class="secondary">Validation Package ZIP</button></a>
+        </div>
+      ` : ""}
     </section>
     <section class="panel">
       <h2>Change Password</h2>

@@ -69,6 +69,8 @@ Expected response:
 
 From Settings, download the Validation Package ZIP before study launch and after major CRF or workflow changes. The package includes validation evidence JSON, CRF metadata/codebook JSON, an audit sample, a system manifest, the SOP checklist, and an execution-record template.
 
+The Audit page also provides a CSV export for monitor review or periodic access and data-change sign-off.
+
 ## Start At Login
 
 To install a Windows scheduled task for the current user:

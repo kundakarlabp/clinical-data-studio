@@ -1647,6 +1647,11 @@ class App(BaseHTTPRequestHandler):
                 self.send_error_json("Review permission required", 403)
                 return
             return self.send_json({"audit": rows(conn, "SELECT audit_log.*, users.display_name FROM audit_log LEFT JOIN users ON users.id = audit_log.user_id WHERE entity_id IN (SELECT id FROM participants WHERE study_id = ?) OR entity_type = 'study' ORDER BY audit_log.id DESC LIMIT 250", (study_id,))})
+        if resource == "audit-export" and method == "GET":
+            if not membership_has(membership, "review_data"):
+                self.send_error_json("Review permission required", 403)
+                return
+            return self.export_audit_csv(conn, study_id)
         self.send_error_json("Unknown study route", 404)
 
     def forms(self, conn, user, method, study_id, parts) -> None:
@@ -2889,6 +2894,37 @@ class App(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("content-type", "text/csv; charset=utf-8")
         self.send_header("content-disposition", f"attachment; filename={filename}")
+        self.send_header("content-length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
+    def export_audit_csv(self, conn, study_id: int) -> None:
+        audit_rows = rows(
+            conn,
+            """
+            SELECT audit_log.id, audit_log.created_at, users.username, users.display_name,
+                   audit_log.action, audit_log.entity_type, audit_log.entity_id, audit_log.before_json, audit_log.after_json
+            FROM audit_log
+            LEFT JOIN users ON users.id = audit_log.user_id
+            WHERE audit_log.entity_id IN (SELECT id FROM participants WHERE study_id = ?)
+               OR audit_log.entity_type IN ('study', 'form', 'entry', 'query', 'field_state', 'randomization', 'api_token', 'membership', 'data_group')
+            ORDER BY audit_log.id DESC
+            LIMIT 5000
+            """,
+            (study_id,),
+        )
+        fieldnames = ["id", "created_at", "username", "display_name", "action", "entity_type", "entity_id", "before_json", "after_json"]
+        text_lines = []
+        class Sink:
+            def write(self, value):
+                text_lines.append(value)
+        writer = csv.DictWriter(Sink(), fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows([dict(item) for item in audit_rows])
+        content = "".join(text_lines).encode("utf-8-sig")
+        self.send_response(200)
+        self.send_header("content-type", "text/csv; charset=utf-8")
+        self.send_header("content-disposition", "attachment; filename=audit_trail_export.csv")
         self.send_header("content-length", str(len(content)))
         self.end_headers()
         self.wfile.write(content)

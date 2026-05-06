@@ -281,6 +281,9 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertIn(allocation["arm"], {"Control", "Treatment"})
         audit_rows = self.request_json(f"/api/studies/{study_id}/audit", token=token)["audit"]
         self.assertTrue(any(item["action"] == "api_request" for item in audit_rows))
+        _, audit_type, audit_body = self.request_raw(f"/api/studies/{study_id}/audit-export", token=token)
+        self.assertIn("text/csv", audit_type)
+        self.assertIn(b"api_request", audit_body)
 
         token_record = self.request_json(f"/api/studies/{study_id}/api-tokens", token=token)["tokens"][0]
         revoked = self.request_json(

@@ -940,7 +940,10 @@ function backupsView() {
 function auditView() {
   return `
     <section class="panel">
-      <h2>Audit Trail</h2>
+      <div class="row">
+        <h2>Audit Trail</h2>
+        <a href="/api/studies/${state.studyId}/audit-export" target="_blank"><button class="secondary">Export CSV</button></a>
+      </div>
       <div class="table-wrap">
         <table>
           <thead><tr><th>Time</th><th>User</th><th>Action</th><th>Entity</th></tr></thead>

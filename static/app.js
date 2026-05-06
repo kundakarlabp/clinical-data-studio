@@ -193,6 +193,7 @@ function render() {
           ${can("manage_study") ? navButton("backups", "Backups") : ""}
           ${navButton("audit", "Audit Trail")}
           ${can("manage_users") ? navButton("access", "Access") : ""}
+          ${navButton("remote", "Remote Access")}
           ${navButton("settings", "Study Setup")}
         </nav>
       </aside>
@@ -246,6 +247,7 @@ function route() {
   if (state.view === "backups") return backupsView();
   if (state.view === "audit") return auditView();
   if (state.view === "access") return accessView();
+  if (state.view === "remote") return remoteAccessView();
   if (state.view === "settings") return settingsView();
   return dashboardView();
 }
@@ -255,7 +257,7 @@ function dashboardView() {
   const total = state.analysis?.entry_count || 0;
   const completion = total ? Math.round((complete / total) * 100) : 0;
   return `
-    <section class="grid three">
+    <section class="metrics-grid">
       ${metric("Participants", state.analysis?.participant_count || 0, "Enrolled or screening records")}
       ${metric("CRF Entries", total, `${completion}% complete`)}
       ${metric("Open Queries", state.analysis?.open_query_count || 0, "Needs review")}
@@ -306,6 +308,63 @@ function readinessPanel(readiness) {
 
 function metric(label, value, hint) {
   return `<div class="card metric"><span class="small">${label}</span><strong>${value}</strong><span>${escapeHtml(hint)}</span></div>`;
+}
+
+function remoteAccessView() {
+  const origin = window.location.origin;
+  const lanUrl = origin.includes("127.0.0.1") || origin.includes("localhost")
+    ? "Use the Wi-Fi URL printed by start.ps1, for example http://192.168.x.x:8765"
+    : origin;
+  return `
+    <section class="panel">
+      <div class="row">
+        <div>
+          <h2>Remote Access</h2>
+          <p>Use one central running app for real study data so audit trails, locks, backups, and user permissions remain consistent.</p>
+        </div>
+        <span class="pill ${state.online ? "ok" : "bad"}">${state.online ? "online" : "offline"}</span>
+      </div>
+      <div class="remote-grid">
+        <div class="remote-option recommended">
+          <span class="pill ok">recommended</span>
+          <h3>Same Wi-Fi / LAN</h3>
+          <p>Run <code>.\\start.ps1</code> on the study computer. Phones and other computers open the printed Wi-Fi address.</p>
+          <span class="small">Run <code>.\\remote_access.ps1</code> to list LAN, Tailscale, and tunnel options.</span>
+          <code>${escapeHtml(lanUrl)}</code>
+        </div>
+        <div class="remote-option">
+          <span class="pill ok">private remote</span>
+          <h3>VPN Overlay</h3>
+          <p>Use a private network tool such as Tailscale or ZeroTier. Install it on the study computer and approved devices, then open the study computer's private VPN address with port 8765.</p>
+          <span class="small">Best balance for small teams without public internet exposure.</span>
+        </div>
+        <div class="remote-option">
+          <span class="pill warn">public access</span>
+          <h3>HTTPS Tunnel</h3>
+          <p>Use Cloudflare Tunnel only with identity access controls, strong app passwords, backups, and audit review. This exposes the app beyond your LAN.</p>
+          <span class="small">Use only after your study approves remote access risk.</span>
+        </div>
+        <div class="remote-option">
+          <span class="pill bad">not suitable</span>
+          <h3>Google Drive / GitHub Pages</h3>
+          <p>They can store files or static pages, but they cannot run this Python app or safely manage the live SQLite clinical database.</p>
+          <span class="small">Use Google Drive only for encrypted backup copies. Use GitHub only for source code, never PHI or live trial data.</span>
+        </div>
+      </div>
+    </section>
+    <section class="panel">
+      <h2>Remote Setup Checklist</h2>
+      <div class="readiness-list">
+        ${[
+          "Change default admin password and create named users.",
+          "Use HTTPS/VPN for access outside the trusted Wi-Fi.",
+          "Keep the study computer powered on, backed up, and physically protected.",
+          "Create encrypted backups and test restore before real data entry.",
+          "Record remote access approval in the validation package."
+        ].map((item) => `<div class="readiness-item"><span class="pill warn">check</span><div><strong>${escapeHtml(item)}</strong></div></div>`).join("")}
+      </div>
+    </section>
+  `;
 }
 
 function participantsView() {

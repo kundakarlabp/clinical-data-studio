@@ -52,6 +52,8 @@ Implemented foundation:
 - Optional Windows EFS data-folder at-rest protection helper
 - Health endpoint and local LAN start helper
 - Installable Android/desktop PWA shell with offline fallback for app pages
+- Remote access guidance page for LAN, VPN overlay, HTTPS tunnel, and static/file-host limitations
+- Remote access helper script for LAN URL, Tailscale, and Cloudflare Tunnel checks
 - First-run administrator password setup
 - Login lockout after repeated failed attempts
 - Local CRF draft assistant from pasted text with optional structured OpenAI drafting when explicitly enabled
@@ -111,3 +113,17 @@ Do not send patient identifiers or PHI to external AI unless your study policy a
 Run the app on one study computer with `.\start.ps1`, then open the shown Wi-Fi URL on phones, tablets, or other computers. On Android Chrome, use **Add to Home screen** or the app's **Install App** prompt to create an app icon.
 
 The installed app shell can open while offline, but clinical data save/sync still requires connection to the study computer. For completely separate non-connected sites, use exports/imports or backups until offline sync is explicitly validated.
+
+## Remote Access
+
+For real study data, keep one central running app and database. This preserves audit trail order, record locking, user permissions, backups, and query review history.
+
+Recommended options:
+
+- Same Wi-Fi/LAN: simplest and safest for bedside or department use.
+- Private VPN overlay: use a tool such as Tailscale or ZeroTier so approved phones and computers can reach the study computer remotely without making the app public.
+- HTTPS tunnel or hosted server: use only with study approval, HTTPS, strong named users, backup drills, firewall review, and documented access review.
+
+Run `.\remote_access.ps1` after starting the app to print the LAN address and detect whether Tailscale or cloudflared is available on the study computer.
+
+Do not use GitHub Pages or Google Drive as the live clinical database host. GitHub Pages is for static site files, not this Python backend and SQLite database. Google Drive can store encrypted backup archives, but live SQLite databases are not safe to edit through file-sync storage from multiple users. Do not place PHI, identifiers, live exports, database files, or backup passphrases in a public or shared GitHub repository.

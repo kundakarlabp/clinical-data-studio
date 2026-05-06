@@ -71,6 +71,8 @@ From Settings, download the Validation Package ZIP before study launch and after
 
 The Audit page also provides a CSV export for monitor review or periodic access and data-change sign-off.
 
+The Dashboard includes a Study Readiness score. Resolve failed readiness items before real study use, and document any warning items in the validation execution record.
+
 ## Start At Login
 
 To install a Windows scheduled task for the current user:

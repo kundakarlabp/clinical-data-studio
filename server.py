@@ -209,6 +209,15 @@ def ai_status() -> dict:
     }
 
 
+def backup_files_for_study(study_id: int) -> list[dict]:
+    BACKUPS.mkdir(parents=True, exist_ok=True)
+    files = []
+    for item in sorted(BACKUPS.iterdir(), key=lambda path: path.stat().st_mtime, reverse=True):
+        if item.is_file() and item.name.startswith(f"study_{study_id}_") and item.suffix in (".sqlite3", ".cdsenc"):
+            files.append({"name": item.name, "size": item.stat().st_size, "created_at": int(item.stat().st_mtime), "encrypted": item.suffix == ".cdsenc"})
+    return files
+
+
 def setup_required(conn: sqlite3.Connection) -> bool:
     default_admin = row(conn, "SELECT password_hash FROM users WHERE username = 'admin' AND active = 1")
     return bool(default_admin and verify_password("admin123", default_admin["password_hash"]))
@@ -1746,6 +1755,11 @@ class App(BaseHTTPRequestHandler):
                 self.send_error_json("Validation evidence permission required", 403)
                 return
             return self.export_validation_package(conn, study_id)
+        if resource == "readiness" and method == "GET":
+            if not membership_has(membership, "review_data") and not membership_has(membership, "manage_study") and not membership_has(membership, "view_analysis"):
+                self.send_error_json("Readiness permission required", 403)
+                return
+            return self.send_json({"readiness": self.readiness_payload(conn, study_id, membership)})
         if resource == "quality" and method == "GET":
             return self.quality(conn, study_id, membership)
         if resource == "analysis" and method == "GET":
@@ -2801,7 +2815,151 @@ class App(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
 
-    def quality(self, conn, study_id: int, membership) -> None:
+    def readiness_payload(self, conn, study_id: int, membership) -> dict:
+        forms = rows(conn, "SELECT * FROM forms WHERE study_id = ?", (study_id,))
+        field_count = sum(len(load_json(form["schema_json"], {"fields": []}).get("fields", [])) for form in forms)
+        participants = row(conn, "SELECT COUNT(*) AS count FROM participants WHERE study_id = ?", (study_id,))["count"]
+        entries = row(conn, "SELECT COUNT(*) AS count FROM entries WHERE study_id = ?", (study_id,))["count"]
+        completed = row(conn, "SELECT COUNT(*) AS count FROM entries WHERE study_id = ? AND status = 'complete'", (study_id,))["count"]
+        locked = row(conn, "SELECT COUNT(*) AS count FROM entries WHERE study_id = ? AND locked_at IS NOT NULL", (study_id,))["count"]
+        open_queries = row(conn, "SELECT COUNT(*) AS count FROM queries WHERE study_id = ? AND status = 'open'", (study_id,))["count"]
+        memberships = row(conn, "SELECT COUNT(*) AS count FROM study_memberships WHERE study_id = ? AND active = 1", (study_id,))["count"]
+        non_admin_users = row(
+            conn,
+            """
+            SELECT COUNT(*) AS count
+            FROM study_memberships
+            JOIN users ON users.id = study_memberships.user_id
+            WHERE study_memberships.study_id = ? AND study_memberships.active = 1 AND users.username <> 'admin'
+            """,
+            (study_id,),
+        )["count"]
+        field_states = rows(conn, "SELECT state, COUNT(*) AS count FROM field_states JOIN entries ON entries.id = field_states.entry_id WHERE entries.study_id = ? GROUP BY state", (study_id,))
+        state_counts = {item["state"]: item["count"] for item in field_states}
+        audit_events = row(conn, "SELECT COUNT(*) AS count FROM audit_log WHERE entity_type IN ('study', 'form', 'entry', 'query', 'field_state', 'randomization', 'api_token', 'membership', 'data_group', 'backup')", ())["count"]
+        quality_count = len(self.quality_issues(conn, study_id, membership))
+        backups = backup_files_for_study(study_id)
+        encrypted_backups = [item for item in backups if item["encrypted"]]
+        latest_backup_at = backups[0]["created_at"] if backups else None
+        protection = data_protection_status()
+        ai = ai_status()
+
+        items = []
+
+        def add_item(key, label, status, detail, action, weight=1):
+            items.append({"key": key, "label": label, "status": status, "detail": detail, "action": action, "weight": weight})
+
+        add_item(
+            "admin_setup",
+            "Administrator setup",
+            "pass" if not setup_required(conn) else "fail",
+            "Default administrator password has been changed." if not setup_required(conn) else "Default admin password is still active.",
+            "Complete first-run setup or change the admin password.",
+            2,
+        )
+        add_item(
+            "crf_design",
+            "CRF design",
+            "pass" if forms and field_count else "fail",
+            f"{len(forms)} form(s), {field_count} field(s).",
+            "Build or import the study data dictionary before collecting data.",
+            2,
+        )
+        add_item(
+            "access_review",
+            "Access review",
+            "pass" if non_admin_users else ("warn" if memberships else "fail"),
+            f"{memberships} active membership(s), {non_admin_users} named non-admin user(s).",
+            "Create named users and avoid shared admin use for study work.",
+            2,
+        )
+        add_item(
+            "data_capture",
+            "Data capture",
+            "pass" if participants and entries else ("warn" if participants else "warn"),
+            f"{participants} participant(s), {entries} CRF entrie(s), {completed} complete.",
+            "Enter pilot records and verify the workflow on desktop and mobile.",
+        )
+        add_item(
+            "data_quality",
+            "Data quality",
+            "pass" if quality_count == 0 else "warn",
+            f"{quality_count} edit-check or missing-CRF issue(s).",
+            "Resolve quality issues or document acceptable deviations before export.",
+            2,
+        )
+        add_item(
+            "query_review",
+            "Query review",
+            "pass" if open_queries == 0 else "warn",
+            f"{open_queries} open querie(s).",
+            "Close or document open queries before analysis lock.",
+            2,
+        )
+        add_item(
+            "review_lock",
+            "Review controls",
+            "pass" if locked or state_counts.get("verified") or state_counts.get("frozen") else "warn",
+            f"{locked} locked CRF(s), {state_counts.get('verified', 0)} verified field(s), {state_counts.get('frozen', 0)} frozen field(s).",
+            "Use field verification/freeze and CRF locks for reviewed data.",
+        )
+        add_item(
+            "backup",
+            "Backups",
+            "pass" if encrypted_backups else ("warn" if backups else "fail"),
+            f"{len(backups)} backup(s), {len(encrypted_backups)} encrypted archive(s).",
+            "Create an encrypted backup and perform a restore drill.",
+            2,
+        )
+        add_item(
+            "at_rest_protection",
+            "At-rest protection",
+            "pass" if protection["data_folder_encrypted"] or encrypted_backups else "warn",
+            protection["note"],
+            "Enable Windows EFS for the data folder or rely on encrypted archives for backup copies.",
+        )
+        add_item(
+            "audit_trail",
+            "Audit trail",
+            "pass" if audit_events else "warn",
+            f"{audit_events} audit event(s) available for review.",
+            "Export and sign off audit review at study milestones.",
+        )
+        add_item(
+            "ai_policy",
+            "AI policy",
+            "warn" if ai["external_ai_enabled"] else "pass",
+            f"AI mode: {ai['provider']} / {ai['model']}.",
+            "Keep external AI disabled unless de-identification policy and approvals are in place.",
+        )
+
+        possible = sum(item["weight"] for item in items)
+        earned = sum(item["weight"] if item["status"] == "pass" else item["weight"] * 0.5 if item["status"] == "warn" else 0 for item in items)
+        score = round((earned / possible) * 100) if possible else 0
+        status = "ready" if score >= 85 and not any(item["status"] == "fail" for item in items) else "needs_review" if score >= 65 else "blocked"
+        blockers = [item for item in items if item["status"] == "fail"]
+        warnings = [item for item in items if item["status"] == "warn"]
+        next_actions = [item["action"] for item in blockers[:3]] or [item["action"] for item in warnings[:3]] or ["Continue routine backup, audit, and access review."]
+        return {
+            "score": score,
+            "status": status,
+            "generated_at": now(),
+            "items": items,
+            "blockers": blockers,
+            "warnings": warnings,
+            "next_actions": next_actions,
+            "metrics": {
+                "participants": participants,
+                "entries": entries,
+                "completed_entries": completed,
+                "completion_percent": round((completed / entries) * 100) if entries else 0,
+                "open_queries": open_queries,
+                "quality_issues": quality_count,
+                "latest_backup_at": latest_backup_at,
+            },
+        }
+
+    def quality_issues(self, conn, study_id: int, membership) -> list[dict]:
         forms = rows(conn, "SELECT * FROM forms WHERE study_id = ? ORDER BY id", (study_id,))
         mappings = rows(conn, "SELECT form_events.*, study_events.name AS event_name, study_events.code AS event_code FROM form_events JOIN study_events ON study_events.id = form_events.event_id WHERE form_events.study_id = ? AND form_events.required = 1", (study_id,))
         group_filter = ""
@@ -2863,7 +3021,10 @@ class App(BaseHTTPRequestHandler):
                             "message": "Expected baseline CRF has not been started",
                         }
                     )
-        self.send_json({"issues": issues})
+        return issues
+
+    def quality(self, conn, study_id: int, membership) -> None:
+        self.send_json({"issues": self.quality_issues(conn, study_id, membership)})
 
     def analysis(self, conn, study_id: int, membership) -> None:
         if membership.get("data_group_id"):
@@ -3175,11 +3336,7 @@ class App(BaseHTTPRequestHandler):
     def backups(self, conn, user, method, study_id, parts) -> None:
         BACKUPS.mkdir(parents=True, exist_ok=True)
         if method == "GET" and len(parts) == 4:
-            files = []
-            for item in sorted(BACKUPS.iterdir(), key=lambda path: path.stat().st_mtime, reverse=True):
-                if item.is_file() and item.name.startswith(f"study_{study_id}_") and item.suffix in (".sqlite3", ".cdsenc"):
-                    files.append({"name": item.name, "size": item.stat().st_size, "created_at": int(item.stat().st_mtime), "encrypted": item.suffix == ".cdsenc"})
-            self.send_json({"backups": files})
+            self.send_json({"backups": backup_files_for_study(study_id)})
             return
         if method == "POST" and len(parts) == 4:
             payload = self.body()

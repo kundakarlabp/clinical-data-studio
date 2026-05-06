@@ -369,6 +369,52 @@ th {
   gap: 8px;
 }
 
+.readiness-score {
+  align-items: center;
+  border-radius: 8px;
+  display: inline-flex;
+  font-size: 24px;
+  font-weight: 800;
+  min-height: 56px;
+  min-width: 86px;
+  justify-content: center;
+  padding: 6px 12px;
+}
+
+.readiness-score.ready {
+  background: #e8f5ee;
+  color: var(--ok);
+}
+
+.readiness-score.needs_review {
+  background: #fff4df;
+  color: var(--warning);
+}
+
+.readiness-score.blocked {
+  background: #fff0ed;
+  color: var(--danger);
+}
+
+.readiness-list {
+  display: grid;
+  gap: 10px;
+}
+
+.readiness-item {
+  align-items: start;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: auto 1fr;
+  padding: 10px;
+}
+
+.readiness-item p {
+  margin-bottom: 4px;
+}
+
 .field-editor {
   display: grid;
   grid-template-columns: 1fr 1fr 140px 88px 44px;

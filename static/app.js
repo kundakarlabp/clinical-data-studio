@@ -25,6 +25,7 @@ const state = {
   analysis: null,
   assistantSummary: null,
   assistDraft: null,
+  readiness: null,
   view: "dashboard",
   selectedParticipantId: 0,
   selectedEventId: Number(localStorage.getItem("cds_event_id") || 0),
@@ -91,7 +92,8 @@ async function loadStudy() {
   if (!state.studyId) return;
   const manageUsers = can("manage_users");
   const viewAnalysis = can("view_analysis") || can("review_data");
-  const [forms, events, formEvents, surveyLinks, invitations, reports, backups, participants, entries, queries, quality, analysis, assistantSummary, audit, groups, studyMembers, apiTokens, randomization, users] = await Promise.all([
+  const readinessAllowed = can("manage_study") || can("review_data") || can("view_analysis");
+  const [forms, events, formEvents, surveyLinks, invitations, reports, backups, participants, entries, queries, quality, analysis, assistantSummary, readiness, audit, groups, studyMembers, apiTokens, randomization, users] = await Promise.all([
     api(`/api/studies/${state.studyId}/forms`),
     api(`/api/studies/${state.studyId}/events`),
     api(`/api/studies/${state.studyId}/form-events`),
@@ -105,6 +107,7 @@ async function loadStudy() {
     api(`/api/studies/${state.studyId}/quality`),
     viewAnalysis ? api(`/api/studies/${state.studyId}/analysis`) : Promise.resolve({ participant_count: 0, entry_count: 0, completed_entry_count: 0, open_query_count: 0, field_summaries: [] }),
     viewAnalysis ? api(`/api/studies/${state.studyId}/assist/summary`) : Promise.resolve({ summary: null }),
+    readinessAllowed ? api(`/api/studies/${state.studyId}/readiness`) : Promise.resolve({ readiness: null }),
     can("review_data") ? api(`/api/studies/${state.studyId}/audit`) : Promise.resolve({ audit: [] }),
     api(`/api/studies/${state.studyId}/groups`),
     manageUsers ? api(`/api/studies/${state.studyId}/memberships`) : Promise.resolve({ memberships: [] }),
@@ -128,6 +131,7 @@ async function loadStudy() {
   state.quality = quality.issues;
   state.analysis = analysis;
   state.assistantSummary = assistantSummary.summary;
+  state.readiness = readiness.readiness;
   state.audit = audit.audit;
   state.groups = groups.groups;
   state.studyMembers = studyMembers.memberships;
@@ -251,6 +255,7 @@ function dashboardView() {
       ${metric("Open Queries", state.analysis?.open_query_count || 0, "Needs review")}
       ${metric("Quality Issues", state.quality?.length || 0, "Edit checks and missing CRFs")}
     </section>
+    ${state.readiness ? readinessPanel(state.readiness) : ""}
     <section class="panel">
       <h2>Today</h2>
       <div class="grid two">
@@ -261,6 +266,34 @@ function dashboardView() {
     <section class="panel">
       <h2>Recent Participants</h2>
       ${participantsTable(state.participants.slice(0, 6))}
+    </section>
+  `;
+}
+
+function readinessPanel(readiness) {
+  const visibleItems = readiness.items.filter((item) => item.status !== "pass").slice(0, 5);
+  const shown = visibleItems.length ? visibleItems : readiness.items.slice(0, 4);
+  return `
+    <section class="panel">
+      <div class="row">
+        <div>
+          <h2>Study Readiness</h2>
+          <p>${readiness.status === "ready" ? "Core launch and review controls look ready." : readiness.status === "needs_review" ? "Some items need review before formal use or export." : "Resolve blockers before real study use."}</p>
+        </div>
+        <span class="readiness-score ${readiness.status}">${readiness.score}%</span>
+      </div>
+      <div class="readiness-list">
+        ${shown.map((item) => `
+          <div class="readiness-item">
+            <span class="pill ${item.status === "pass" ? "ok" : item.status === "warn" ? "warn" : "bad"}">${item.status}</span>
+            <div>
+              <strong>${escapeHtml(item.label)}</strong>
+              <p>${escapeHtml(item.detail)}</p>
+              ${item.status === "pass" ? "" : `<span class="small">${escapeHtml(item.action)}</span>`}
+            </div>
+          </div>
+        `).join("")}
+      </div>
     </section>
   `;
 }

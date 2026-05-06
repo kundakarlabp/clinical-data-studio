@@ -82,6 +82,11 @@ class ApiSmokeTests(unittest.TestCase):
         backup = self.request_json(f"/api/studies/{study_id}/backups", "POST", {"passphrase": "LongLocalPassphrase123"}, token)["backup"]
         self.assertTrue(backup["encrypted"])
         self.assertTrue(backup["name"].endswith(".cdsenc"))
+        readiness = self.request_json(f"/api/studies/{study_id}/readiness", token=token)["readiness"]
+        self.assertIn(readiness["status"], {"ready", "needs_review", "blocked"})
+        self.assertIsInstance(readiness["score"], int)
+        self.assertTrue(any(item["key"] == "backup" for item in readiness["items"]))
+        self.assertTrue(readiness["next_actions"])
 
         backups = self.request_json(f"/api/studies/{study_id}/backups", token=token)["backups"]
         self.assertEqual(backups[0]["name"], backup["name"])

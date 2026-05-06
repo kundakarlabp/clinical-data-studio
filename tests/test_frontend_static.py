@@ -33,6 +33,8 @@ class FrontendStaticTests(unittest.TestCase):
         self.assertIn("/odm", app_js)
         self.assertIn("/stats-package", app_js)
         self.assertIn("/validation-package", app_js)
+        self.assertIn("/readiness", app_js)
+        self.assertIn("readiness-score", app_js)
         self.assertIn("/audit-export", app_js)
         self.assertIn("data-revoke-token", app_js)
         self.assertIn("type=\"file\"", app_js)

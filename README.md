@@ -38,6 +38,7 @@ Implemented foundation:
 - Repeat instances for repeatable CRFs
 - Participant registry and event-based CRF entry
 - Data queries and data quality dashboard
+- Smart study-readiness dashboard for launch blockers, quality risks, backups, access, audit, and AI policy
 - Audit trail for create/update/lock/unlock actions with CSV export
 - CSV data export and codebook export
 - Data dictionary CSV import

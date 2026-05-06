@@ -364,9 +364,30 @@ th {
 }
 
 .split-actions {
+  align-items: center;
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.connection {
+  align-items: center;
+  border-radius: 999px;
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 800;
+  min-height: 32px;
+  padding: 4px 10px;
+}
+
+.connection.online {
+  background: #e8f5ee;
+  color: var(--ok);
+}
+
+.connection.offline {
+  background: #fff0ed;
+  color: var(--danger);
 }
 
 .readiness-score {

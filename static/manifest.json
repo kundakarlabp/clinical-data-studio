@@ -2,8 +2,33 @@
   "name": "Clinical Data Studio",
   "short_name": "CDS",
   "start_url": "/",
+  "scope": "/",
   "display": "standalone",
+  "orientation": "any",
   "background_color": "#f7f8fb",
   "theme_color": "#0f766e",
-  "icons": []
+  "description": "Local-first clinical research data capture and review app.",
+  "categories": ["medical", "productivity"],
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Data Entry",
+      "short_name": "Entry",
+      "url": "/?view=data",
+      "description": "Open clinical data entry"
+    },
+    {
+      "name": "Dashboard",
+      "short_name": "Dashboard",
+      "url": "/",
+      "description": "Open the study dashboard"
+    }
+  ]
 }

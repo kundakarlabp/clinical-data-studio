@@ -31,6 +31,9 @@ const state = {
   selectedEventId: Number(localStorage.getItem("cds_event_id") || 0),
   editingFormId: 0,
   menuOpen: false,
+  online: navigator.onLine,
+  installPrompt: null,
+  standalone: window.matchMedia("(display-mode: standalone)").matches || navigator.standalone === true,
   error: "",
 };
 
@@ -203,6 +206,8 @@ function render() {
             </div>
           </div>
           <div class="split-actions">
+            ${state.installPrompt && !state.standalone ? `<button class="secondary" id="install-app">Install App</button>` : ""}
+            <span class="connection ${state.online ? "online" : "offline"}">${state.online ? "Online" : "Offline"}</span>
             <a href="/api/studies/${state.studyId}/export" target="_blank"><button class="secondary">Export CSV</button></a>
             <a href="/api/studies/${state.studyId}/codebook" target="_blank"><button class="secondary">Codebook</button></a>
             <button class="secondary" id="logout">Logout</button>
@@ -210,6 +215,7 @@ function render() {
         </header>
         <div class="content">
           ${state.user?.must_change_password ? `<div class="notice error">Default password is still active. Change it in Study Setup before real use.</div>` : ""}
+          ${state.online ? "" : `<div class="notice error">This device is offline. You can open installed pages, but clinical data saves require connection to the study computer.</div>`}
           ${state.error ? `<div class="notice error">${escapeHtml(state.error)}</div>` : ""}
           ${route()}
         </div>
@@ -1153,6 +1159,14 @@ function bindShell() {
       render();
     });
   });
+  document.querySelector("#install-app")?.addEventListener("click", async () => {
+    const prompt = state.installPrompt;
+    if (!prompt) return;
+    prompt.prompt();
+    await prompt.userChoice.catch(() => null);
+    state.installPrompt = null;
+    render();
+  });
   document.querySelector("#study-picker")?.addEventListener("change", async (event) => {
     state.studyId = Number(event.target.value);
     localStorage.setItem("cds_study_id", String(state.studyId));
@@ -1875,6 +1889,30 @@ function renderSetup() {
       state.error = error.message;
       renderSetup();
     }
+  });
+}
+
+function updateOnlineState() {
+  state.online = navigator.onLine;
+  if (state.user || state.setupRequired) render();
+}
+
+window.addEventListener("online", updateOnlineState);
+window.addEventListener("offline", updateOnlineState);
+window.addEventListener("beforeinstallprompt", (event) => {
+  event.preventDefault();
+  state.installPrompt = event;
+  if (state.user) render();
+});
+window.addEventListener("appinstalled", () => {
+  state.installPrompt = null;
+  state.standalone = true;
+  if (state.user) render();
+});
+
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/service-worker.js").catch(() => {});
   });
 }
 

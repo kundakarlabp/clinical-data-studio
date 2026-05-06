@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import base64
+from contextlib import closing
 import csv
 import hashlib
 import hmac
@@ -9,6 +10,7 @@ import json
 import mimetypes
 import os
 import platform
+import re
 import secrets
 import sqlite3
 import sys
@@ -21,6 +23,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from urllib.request import Request as UrlRequest, urlopen as urlopen_request
 from xml.etree import ElementTree
 
 
@@ -195,6 +198,17 @@ def data_protection_status() -> dict:
     }
 
 
+def ai_status() -> dict:
+    provider = os.environ.get("CDS_AI_PROVIDER", "local").strip().lower() or "local"
+    external_enabled = provider == "openai" and bool(os.environ.get("OPENAI_API_KEY", "").strip())
+    return {
+        "provider": provider if external_enabled else "local",
+        "external_ai_enabled": external_enabled,
+        "model": os.environ.get("CDS_AI_MODEL", "gpt-5-mini") if external_enabled else "local-rules",
+        "note": "External AI is disabled unless CDS_AI_PROVIDER=openai and OPENAI_API_KEY are configured.",
+    }
+
+
 def setup_required(conn: sqlite3.Connection) -> bool:
     default_admin = row(conn, "SELECT password_hash FROM users WHERE username = 'admin' AND active = 1")
     return bool(default_admin and verify_password("admin123", default_admin["password_hash"]))
@@ -286,7 +300,7 @@ def audit(conn: sqlite3.Connection, user_id: int | None, action: str, entity_typ
 
 
 def migrate() -> None:
-    with db() as conn:
+    with closing(db()) as conn, conn:
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -816,6 +830,135 @@ def evaluate_calculation(expression: str, values: dict) -> float:
     return eval_node(parsed)
 
 
+def field_options_from_label(label: str) -> tuple[str, list[str]]:
+    choices_match = re.search(r"\(([^()]{3,160})\)\s*$", label)
+    if not choices_match:
+        choices_match = re.search(r"\[([^\[\]]{3,160})\]\s*$", label)
+    if not choices_match:
+        return label, []
+    raw_choices = choices_match.group(1)
+    if not any(separator in raw_choices for separator in (",", "/", "|", ";")):
+        return label, []
+    clean_label = label[: choices_match.start()].strip(" -:\t") or label
+    choices = [part.strip() for part in re.split(r"[,/|;]", raw_choices) if part.strip()]
+    return clean_label, choices[:12]
+
+
+def draft_crf_schema_locally(text: str) -> tuple[dict, list[str]]:
+    warnings = []
+    fields = []
+    seen = set()
+    for line in text.splitlines():
+        label = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip(" -:\t")
+        if not label:
+            continue
+        required = "*" in label or " required" in label.lower()
+        label = label.replace("*", "").strip()
+        label, parsed_options = field_options_from_label(label)
+        lower = label.lower()
+        field_type = "text"
+        options = parsed_options
+        if any(word in lower for word in ("note", "comment", "description", "details", "history", "narrative")):
+            field_type = "textarea"
+        if any(word in lower for word in ("date", "day of", "visit day", "dob")):
+            field_type = "date"
+        if any(word in lower for word in ("age", "weight", "height", "score", "bp", "pressure", "dose", "rate", "count", "number", "value")):
+            field_type = "number"
+        if any(word in lower for word in ("upload", "attachment", "file", "image", "scan")):
+            field_type = "file"
+        if parsed_options:
+            field_type = "select"
+        elif lower.startswith(("any ", "was ", "were ", "is ", "are ", "has ", "have ", "did ")) or lower.endswith("?"):
+            field_type = "select"
+            options = ["No", "Yes"]
+        elif "sex" in lower or "gender" in lower:
+            field_type = "select"
+            options = ["Female", "Male", "Other", "Unknown"]
+        code = normalize_code(label)
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        field = {"code": code, "label": label, "type": field_type, "required": required}
+        if field_type in {"select", "checkbox"}:
+            field["options"] = options or ["No", "Yes"]
+        fields.append(field)
+        if len(fields) >= 80:
+            warnings.append("Draft limited to the first 80 detected fields.")
+            break
+    if not fields:
+        fields = [{"code": "notes", "label": "Notes", "type": "textarea", "required": False}]
+        warnings.append("No discrete field labels were detected; created a notes field.")
+    return normalize_schema({"fields": fields}), warnings
+
+
+def extract_openai_text(payload: dict) -> str:
+    if payload.get("output_text"):
+        return str(payload["output_text"])
+    parts = []
+    for item in payload.get("output", []):
+        for content in item.get("content", []):
+            if content.get("type") in {"output_text", "text"} and content.get("text"):
+                parts.append(str(content["text"]))
+    return "\n".join(parts)
+
+
+def draft_crf_schema_with_openai(text: str) -> dict:
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY is not configured")
+    model = os.environ.get("CDS_AI_MODEL", "gpt-5-mini").strip() or "gpt-5-mini"
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "fields": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "code": {"type": "string"},
+                        "label": {"type": "string"},
+                        "type": {"type": "string", "enum": ["text", "textarea", "number", "date", "select", "checkbox", "file"]},
+                        "required": {"type": "boolean"},
+                        "options": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["code", "label", "type", "required", "options"],
+                },
+            }
+        },
+        "required": ["fields"],
+    }
+    request_payload = {
+        "model": model,
+        "input": [
+            {
+                "role": "system",
+                "content": (
+                    "Draft a clinical CRF schema from the user's de-identified field list. "
+                    "Do not invent diagnosis-specific conclusions. Use short stable variable codes. "
+                    "Use select options only when choices are explicit or clearly yes/no."
+                ),
+            },
+            {"role": "user", "content": text[:12000]},
+        ],
+        "text": {"format": {"type": "json_schema", "name": "crf_schema", "strict": True, "schema": schema}},
+    }
+    request = UrlRequest(
+        "https://api.openai.com/v1/responses",
+        data=json.dumps(request_payload).encode("utf-8"),
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen_request(request, timeout=45) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    output_text = extract_openai_text(result)
+    if not output_text:
+        raise ValueError("AI response did not contain text output")
+    parsed = json.loads(output_text)
+    return normalize_schema(parsed)
+
+
 def user_membership(conn: sqlite3.Connection, user: dict, study_id: int) -> dict | None:
     if user.get("role") == "admin":
         membership = row(
@@ -943,7 +1086,7 @@ class App(BaseHTTPRequestHandler):
 
     def handle_api(self, method: str, path: str, query: dict[str, list[str]]) -> None:
         try:
-            with db() as conn:
+            with closing(db()) as conn, conn:
                 if path == "/api/login" and method == "POST":
                     return self.login(conn)
                 if path == "/api/logout" and method == "POST":
@@ -957,7 +1100,7 @@ class App(BaseHTTPRequestHandler):
                 if path == "/api/setup" and method == "POST":
                     return self.first_run_setup(conn)
                 if path == "/api/health" and method == "GET":
-                    return self.send_json({"ok": True, "app": "Clinical Data Studio", "database": DB_PATH.exists(), "data_protection": data_protection_status()})
+                    return self.send_json({"ok": True, "app": "Clinical Data Studio", "database": DB_PATH.exists(), "data_protection": data_protection_status(), "ai": ai_status()})
 
                 user = self.require_user(conn)
                 if not user:
@@ -1327,26 +1470,30 @@ class App(BaseHTTPRequestHandler):
         if not text:
             self.send_error_json("CRF text is required", 400)
             return
-        fields = []
-        for line in text.splitlines():
-            label = line.strip(" -:\t")
-            if not label:
-                continue
-            lower = label.lower()
-            field_type = "text"
-            if any(word in lower for word in ("date", "day")):
-                field_type = "date"
-            elif any(word in lower for word in ("age", "weight", "height", "score", "bp", "pressure", "dose")):
-                field_type = "number"
-            elif lower.startswith("any ") or lower.endswith("?"):
-                field_type = "select"
-            field = {"code": normalize_code(label), "label": label, "type": field_type, "required": False}
-            if field_type == "select":
-                field["options"] = ["No", "Yes"]
-            fields.append(field)
-            if len(fields) >= 40:
-                break
-        self.send_json({"schema": normalize_schema({"fields": fields or [{"code": "notes", "label": "Notes", "type": "textarea"}]})})
+        provider = os.environ.get("CDS_AI_PROVIDER", "local").strip().lower() or "local"
+        warnings = []
+        mode = "local"
+        if provider == "openai":
+            try:
+                schema = draft_crf_schema_with_openai(text)
+                mode = "openai"
+            except Exception as exc:
+                schema, warnings = draft_crf_schema_locally(text)
+                warnings.append(f"External AI drafting failed; local fallback used: {exc}")
+        else:
+            schema, warnings = draft_crf_schema_locally(text)
+        audit(conn, user["id"], "assist_crf", "ai", None, None, {"mode": mode, "field_count": len(schema["fields"]), "warning_count": len(warnings)})
+        self.send_json(
+            {
+                "schema": schema,
+                "assistant": {
+                    "mode": mode,
+                    "field_count": len(schema["fields"]),
+                    "warnings": warnings,
+                    "safety_note": "Review every AI/local draft field before using it for real study data. Do not paste identifiers or PHI into external AI unless your study policy permits it.",
+                },
+            }
+        )
 
     def create_study(self, conn: sqlite3.Connection, user: dict) -> None:
         payload = self.body()
@@ -2503,6 +2650,7 @@ class App(BaseHTTPRequestHandler):
             conn.execute("UPDATE api_tokens SET active = ? WHERE id = ?", (active, token_id))
             after = row(conn, "SELECT id, study_id, user_id, label, active, created_at, last_used_at FROM api_tokens WHERE id = ?", (token_id,))
             audit(conn, user["id"], "update", "api_token", token_id, before, after)
+            conn.commit()
             self.send_json({"token": after})
             return
         self.send_error_json("Unsupported API token operation", 405)
@@ -2623,6 +2771,7 @@ class App(BaseHTTPRequestHandler):
             "platform": platform.platform(),
             "database": str(DB_PATH),
             "data_folder": str(DATA),
+            "ai": ai_status(),
             "commit": os.environ.get("CDS_COMMIT", "record-current-git-commit-manually"),
         }
         checklist = (ROOT / "docs" / "SOP_VALIDATION_CHECKLIST.md").read_text(encoding="utf-8")

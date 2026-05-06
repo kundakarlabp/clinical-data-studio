@@ -52,7 +52,7 @@ Implemented foundation:
 - Health endpoint and local LAN start helper
 - First-run administrator password setup
 - Login lockout after repeated failed attempts
-- Local CRF draft assistant from pasted text
+- Local CRF draft assistant from pasted text with optional structured OpenAI drafting when explicitly enabled
 - Local analysis/review assistant summary
 - Record CSV import into participant CRFs
 - Entry history and field-state review visibility
@@ -91,3 +91,15 @@ Create an API token from Access -> API Tokens. Use `/api/redcap` with parameters
 - `format`: `json` or `csv`
 
 This is REDCap-style compatibility for local workflows, not an official REDCap API implementation.
+
+## Optional AI
+
+The CRF drafting assistant runs locally by default. To enable external structured AI drafting, set:
+
+```powershell
+$env:CDS_AI_PROVIDER = "openai"
+$env:CDS_AI_MODEL = "gpt-5-mini"
+$env:OPENAI_API_KEY = "your_api_key"
+```
+
+Do not send patient identifiers or PHI to external AI unless your study policy and data agreement allow it. AI drafts must be reviewed before use.

@@ -18,6 +18,8 @@ class FrontendStaticTests(unittest.TestCase):
     def test_frontend_uses_new_hardening_endpoints(self):
         app_js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
         self.assertIn("/assist/summary", app_js)
+        self.assertIn("assistDraft", app_js)
+        self.assertIn("external AI is used only when explicitly enabled", app_js)
         self.assertIn("encrypted-backup-form", app_js)
         self.assertIn("Create Encrypted Archive", app_js)
         self.assertIn("First Run Setup", app_js)

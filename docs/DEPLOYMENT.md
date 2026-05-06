@@ -105,6 +105,18 @@ Review API token usage in the study audit log. Revoke unused or exposed API toke
 
 The Reports page also provides ODM XML and R/SAS/SPSS/Stata package exports. Review exported syntax before formal analysis.
 
+## Optional AI Configuration
+
+The CRF assistant is local by default and does not require paid services. External OpenAI drafting can be enabled only when approved for your study:
+
+```powershell
+$env:CDS_AI_PROVIDER = "openai"
+$env:CDS_AI_MODEL = "gpt-5-mini"
+$env:OPENAI_API_KEY = "your_api_key"
+```
+
+Use de-identified prompts only unless your policy and agreement permit PHI. Review the returned schema before creating or changing CRFs.
+
 ## Validation Reminder
 
 This deployment guide supports a small local research workflow. A regulated clinical trial still needs documented validation, SOP approval, access review, backup restore drills, and audit review sign-off.

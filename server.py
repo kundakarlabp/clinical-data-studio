@@ -308,6 +308,33 @@ def audit(conn: sqlite3.Connection, user_id: int | None, action: str, entity_typ
     )
 
 
+STUDY_AUDIT_FILTER = """
+(
+    (audit_log.entity_type = 'study' AND audit_log.entity_id = ?)
+    OR (audit_log.entity_type IN ('backup', 'dictionary', 'records') AND audit_log.entity_id = ?)
+    OR (audit_log.entity_type = 'participant' AND audit_log.entity_id IN (SELECT id FROM participants WHERE study_id = ?))
+    OR (audit_log.entity_type IN ('entry', 'field_state', 'consent') AND audit_log.entity_id IN (SELECT id FROM entries WHERE study_id = ?))
+    OR (audit_log.entity_type = 'form' AND audit_log.entity_id IN (SELECT id FROM forms WHERE study_id = ?))
+    OR (audit_log.entity_type = 'event' AND audit_log.entity_id IN (SELECT id FROM study_events WHERE study_id = ?))
+    OR (audit_log.entity_type = 'form_event' AND audit_log.entity_id IN (SELECT id FROM form_events WHERE study_id = ?))
+    OR (audit_log.entity_type = 'query' AND audit_log.entity_id IN (SELECT id FROM queries WHERE study_id = ?))
+    OR (audit_log.entity_type = 'data_group' AND audit_log.entity_id IN (SELECT id FROM data_groups WHERE study_id = ?))
+    OR (audit_log.entity_type = 'membership' AND audit_log.entity_id IN (SELECT id FROM study_memberships WHERE study_id = ?))
+    OR (audit_log.entity_type = 'api_token' AND audit_log.entity_id IN (SELECT id FROM api_tokens WHERE study_id = ?))
+    OR (audit_log.entity_type = 'randomization_list' AND audit_log.entity_id IN (SELECT id FROM randomization_lists WHERE study_id = ?))
+    OR (audit_log.entity_type = 'randomization' AND audit_log.entity_id IN (SELECT id FROM randomization_allocations WHERE study_id = ?))
+    OR (audit_log.entity_type = 'survey_link' AND audit_log.entity_id IN (SELECT id FROM survey_links WHERE study_id = ?))
+    OR (audit_log.entity_type = 'survey_invitation' AND audit_log.entity_id IN (SELECT id FROM survey_invitations WHERE study_id = ?))
+    OR (audit_log.entity_type = 'report' AND audit_log.entity_id IN (SELECT id FROM reports WHERE study_id = ?))
+    OR (audit_log.entity_type = 'case_intake' AND audit_log.entity_id IN (SELECT id FROM case_intakes WHERE study_id = ?))
+)
+"""
+
+
+def study_audit_params(study_id: int) -> tuple[int, ...]:
+    return (study_id,) * STUDY_AUDIT_FILTER.count("?")
+
+
 def migrate() -> None:
     with closing(db()) as conn, conn:
         conn.executescript(
@@ -544,6 +571,35 @@ def migrate() -> None:
                 created_by INTEGER REFERENCES users(id),
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS case_intakes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+                participant_id INTEGER REFERENCES participants(id) ON DELETE SET NULL,
+                case_uid TEXT NOT NULL,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'draft',
+                source_text TEXT NOT NULL DEFAULT '',
+                extracted_json TEXT NOT NULL DEFAULT '{}',
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                created_by INTEGER REFERENCES users(id),
+                updated_by INTEGER REFERENCES users(id),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(study_id, case_uid)
+            );
+
+            CREATE TABLE IF NOT EXISTS case_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                case_id INTEGER NOT NULL REFERENCES case_intakes(id) ON DELETE CASCADE,
+                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+                size INTEGER NOT NULL DEFAULT 0,
+                data_base64 TEXT NOT NULL DEFAULT '',
+                created_by INTEGER REFERENCES users(id),
+                created_at INTEGER NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS api_tokens (
@@ -966,6 +1022,145 @@ def draft_crf_schema_with_openai(text: str) -> dict:
         raise ValueError("AI response did not contain text output")
     parsed = json.loads(output_text)
     return normalize_schema(parsed)
+
+
+def first_matching_line(text: str, labels: tuple[str, ...]) -> str:
+    for line in text.splitlines():
+        stripped = line.strip()
+        lower = stripped.lower()
+        for label in labels:
+            if lower.startswith(label):
+                return stripped.split(":", 1)[-1].strip() if ":" in stripped else stripped
+    return ""
+
+
+def matching_sentence(text: str, words: tuple[str, ...]) -> str:
+    parts = re.split(r"(?<=[.!?])\s+|\n+", text)
+    for part in parts:
+        clean = part.strip()
+        lower = clean.lower()
+        if clean and any(word in lower for word in words):
+            return clean[:600]
+    return ""
+
+
+def extract_age(text: str) -> str:
+    patterns = [
+        r"\bage\s*[:=]?\s*(\d{1,3})\b",
+        r"\b(\d{1,3})\s*(?:year|years|yr|yrs|y/o|yo)\s*(?:old)?\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def extract_sex(text: str) -> str:
+    lower = text.lower()
+    if re.search(r"\b(female|woman|girl|lady)\b", lower):
+        return "Female"
+    if re.search(r"\b(male|man|boy|gentleman)\b", lower):
+        return "Male"
+    return ""
+
+
+def extract_case_intelligence(text: str, title: str = "") -> dict:
+    clean = re.sub(r"\s+", " ", text).strip()
+    diagnosis = first_matching_line(text, ("diagnosis", "dx", "impression", "final diagnosis"))
+    if not diagnosis:
+        diagnosis = matching_sentence(text, ("diagnosed with", "diagnosis", "impression", "case of"))
+    presentation = first_matching_line(text, ("presentation", "presenting complaint", "chief complaint", "complaint"))
+    if not presentation:
+        presentation = matching_sentence(text, ("presented", "complaint", "symptom", "history of"))
+    investigations = first_matching_line(text, ("investigation", "investigations", "lab", "labs", "imaging", "ct", "mri"))
+    if not investigations:
+        investigations = matching_sentence(text, ("investigation", "laboratory", "imaging", "ct", "mri", "ultrasound", "x-ray", "biopsy"))
+    treatment = first_matching_line(text, ("treatment", "management", "intervention", "procedure", "surgery"))
+    if not treatment:
+        treatment = matching_sentence(text, ("treatment", "management", "intervention", "procedure", "treated", "started", "given", "surgery", "managed"))
+    outcome = first_matching_line(text, ("outcome", "follow up", "follow-up", "discharge", "result"))
+    if not outcome:
+        outcome = matching_sentence(text, ("outcome", "improved", "recovered", "died", "death", "discharged", "follow", "complication"))
+    dates = re.findall(r"\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{1,2}-\d{1,2})\b", text)
+    group_source = diagnosis or title or "Ungrouped case"
+    group_label = re.sub(r"\b\d{1,3}\b", "", group_source).strip(" .,:;-")[:80] or "Ungrouped case"
+    tags = []
+    for value in (diagnosis, treatment, outcome):
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9+-]{3,}", value):
+            normalized = token.lower()
+            if normalized not in tags and normalized not in {"with", "from", "treated", "patient", "case"}:
+                tags.append(normalized)
+    missing = []
+    for key, value in {
+        "age": extract_age(text),
+        "sex": extract_sex(text),
+        "diagnosis": diagnosis,
+        "presentation": presentation,
+        "investigations": investigations,
+        "treatment": treatment,
+        "outcome": outcome,
+    }.items():
+        if not value:
+            missing.append(key)
+    warnings = []
+    if re.search(r"\b[A-Z][a-z]+\s+[A-Z][a-z]+\b", text):
+        warnings.append("Possible patient/person name detected; de-identify before publication or external AI use.")
+    if re.search(r"\b\d{10,}\b", text):
+        warnings.append("Long number detected; check for phone, MRN, or identifier.")
+    return {
+        "demographics": {"age": extract_age(text), "sex": extract_sex(text)},
+        "clinical": {
+            "diagnosis": diagnosis,
+            "presentation": presentation,
+            "investigations": investigations,
+            "treatment": treatment,
+            "outcome": outcome,
+        },
+        "timeline": dates[:12],
+        "group_label": group_label,
+        "tags": tags[:12],
+        "missing_fields": missing,
+        "publication_notes": [
+            "Map the case against CARE case-report items.",
+            "For a case series, keep denominator, inclusion criteria, and follow-up consistent across cases.",
+            "Use source files only as internal evidence; publish de-identified summaries.",
+        ],
+        "warnings": warnings,
+        "source_excerpt": clean[:900],
+    }
+
+
+def case_series_summary(case_items: list[dict]) -> dict:
+    groups: dict[str, dict] = {}
+    missing_total = 0
+    warnings = 0
+    for item in case_items:
+        extracted = item.get("extracted") or {}
+        group = extracted.get("group_label") or "Ungrouped case"
+        bucket = groups.setdefault(group, {"group": group, "count": 0, "case_uids": [], "tags": []})
+        bucket["count"] += 1
+        bucket["case_uids"].append(item["case_uid"])
+        for tag in extracted.get("tags", []):
+            if tag not in bucket["tags"]:
+                bucket["tags"].append(tag)
+        missing_total += len(extracted.get("missing_fields", []))
+        warnings += len(extracted.get("warnings", []))
+    group_list = sorted(groups.values(), key=lambda value: (-value["count"], value["group"]))
+    return {
+        "case_count": len(case_items),
+        "group_count": len(group_list),
+        "groups": group_list,
+        "missing_field_count": missing_total,
+        "warning_count": warnings,
+        "draft_outline": [
+            "Title: concise diagnosis/intervention/outcome signal.",
+            "Background: why these cases are clinically useful.",
+            "Methods: retrospective source, inclusion criteria, dates, and de-identification process.",
+            "Results: demographics, presentation, investigations, treatment, outcome, follow-up.",
+            "Discussion: patterns, novelty, limitations, and lessons.",
+        ],
+    }
 
 
 def user_membership(conn: sqlite3.Connection, user: dict, study_id: int) -> dict | None:
@@ -1718,6 +1913,23 @@ class App(BaseHTTPRequestHandler):
                 self.send_error_json("Review permission required", 403)
                 return
             return self.entries(conn, user, method, study_id, parts, query, membership)
+        if resource == "case-intake":
+            if method == "GET":
+                if not (membership_has(membership, "enter_data") or membership_has(membership, "view_analysis") or membership_has(membership, "review_data")):
+                    self.send_error_json("Case intake permission required", 403)
+                    return
+            elif method == "POST":
+                if not membership_has(membership, "enter_data"):
+                    self.send_error_json("Data entry permission required", 403)
+                    return
+            elif method == "PATCH":
+                if not (membership_has(membership, "enter_data") or membership_has(membership, "review_data")):
+                    self.send_error_json("Case update permission required", 403)
+                    return
+            else:
+                self.send_error_json("Unsupported case intake operation", 405)
+                return
+            return self.case_intake(conn, user, method, study_id, parts, membership)
         if resource == "queries":
             if method != "GET" and not membership_has(membership, "review_data"):
                 self.send_error_json("Review permission required", 403)
@@ -1807,7 +2019,19 @@ class App(BaseHTTPRequestHandler):
             if not membership_has(membership, "review_data"):
                 self.send_error_json("Review permission required", 403)
                 return
-            return self.send_json({"audit": rows(conn, "SELECT audit_log.*, users.display_name FROM audit_log LEFT JOIN users ON users.id = audit_log.user_id WHERE entity_id IN (SELECT id FROM participants WHERE study_id = ?) OR entity_type = 'study' ORDER BY audit_log.id DESC LIMIT 250", (study_id,))})
+            audit_rows = rows(
+                conn,
+                f"""
+                SELECT audit_log.*, users.display_name
+                FROM audit_log
+                LEFT JOIN users ON users.id = audit_log.user_id
+                WHERE {STUDY_AUDIT_FILTER}
+                ORDER BY audit_log.id DESC
+                LIMIT 250
+                """,
+                study_audit_params(study_id),
+            )
+            return self.send_json({"audit": audit_rows})
         if resource == "audit-export" and method == "GET":
             if not membership_has(membership, "review_data"):
                 self.send_error_json("Review permission required", 403)
@@ -2473,6 +2697,162 @@ class App(BaseHTTPRequestHandler):
             return
         self.send_error_json("Unsupported entries operation", 405)
 
+    def case_payload(self, conn: sqlite3.Connection, case: dict) -> dict:
+        payload = dict(case)
+        payload["extracted"] = load_json(payload.pop("extracted_json", "{}"), {})
+        payload["tags"] = load_json(payload.pop("tags_json", "[]"), [])
+        payload["files"] = rows(conn, "SELECT id, name, content_type, size, created_at FROM case_files WHERE case_id = ? ORDER BY id", (case["id"],))
+        return payload
+
+    def case_rows(self, conn: sqlite3.Connection, study_id: int) -> list[dict]:
+        cases = rows(conn, "SELECT * FROM case_intakes WHERE study_id = ? ORDER BY updated_at DESC, id DESC", (study_id,))
+        return [self.case_payload(conn, item) for item in cases]
+
+    def save_case_files(self, conn: sqlite3.Connection, user_id: int, study_id: int, case_id: int, files: list) -> None:
+        if len(files) > 8:
+            raise ValueError("Upload at most 8 evidence files for one case")
+        total_size = 0
+        for item in files:
+            name = Path(str(item.get("name", "case_evidence"))).name[:160] or "case_evidence"
+            content_type = str(item.get("type") or item.get("content_type") or mimetypes.guess_type(name)[0] or "application/octet-stream")[:120]
+            data_base64 = str(item.get("data", ""))
+            if not data_base64:
+                continue
+            try:
+                decoded = base64.b64decode(data_base64, validate=True)
+            except Exception as exc:
+                raise ValueError(f"Evidence file {name} is not valid base64") from exc
+            size = int(item.get("size") or len(decoded))
+            if len(decoded) > 8 * 1024 * 1024:
+                raise ValueError(f"Evidence file {name} is larger than 8 MB")
+            total_size += len(decoded)
+            if total_size > 24 * 1024 * 1024:
+                raise ValueError("Total evidence upload for one case must stay under 24 MB")
+            conn.execute(
+                "INSERT INTO case_files(case_id, study_id, name, content_type, size, data_base64, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (case_id, study_id, name, content_type, size, data_base64, user_id, now()),
+            )
+
+    def case_intake(self, conn, user, method, study_id, parts, membership) -> None:
+        if method == "GET" and len(parts) == 4:
+            cases = self.case_rows(conn, study_id)
+            self.send_json({"cases": cases, "series": case_series_summary(cases)})
+            return
+        if method == "GET" and len(parts) == 5 and parts[4] == "export":
+            if not membership_has(membership, "export_data") and not membership_has(membership, "view_analysis"):
+                self.send_error_json("Export permission required", 403)
+                return
+            return self.export_case_intake_csv(conn, study_id)
+        if method == "GET" and len(parts) == 7 and parts[5] == "files":
+            case_id = int(parts[4])
+            file_id = int(parts[6])
+            file_row = row(conn, "SELECT * FROM case_files WHERE id = ? AND case_id = ? AND study_id = ?", (file_id, case_id, study_id))
+            if not file_row:
+                self.send_error_json("Case evidence file not found", 404)
+                return
+            content = base64.b64decode(file_row["data_base64"])
+            self.send_response(200)
+            self.send_header("content-type", file_row["content_type"])
+            self.send_header("content-disposition", f"attachment; filename={Path(file_row['name']).name}")
+            self.send_header("content-length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+            return
+        if method == "POST" and len(parts) == 4:
+            payload = self.body()
+            timestamp = now()
+            title = str(payload.get("title", "")).strip() or "Untitled Case"
+            source_text = str(payload.get("source_text") or payload.get("text") or "").strip()
+            files = payload.get("files") or []
+            if not source_text and not files:
+                self.send_error_json("Add typed/dictated text or at least one evidence file", 400)
+                return
+            case_uid_raw = str(payload.get("case_uid", "")).strip() or f"CASE-{timestamp}"
+            case_uid = re.sub(r"[^A-Za-z0-9_.-]+", "-", case_uid_raw).strip("-")[:60] or f"CASE-{timestamp}"
+            participant_id = int(payload.get("participant_id") or 0) or None
+            if participant_id and not row(conn, "SELECT id FROM participants WHERE id = ? AND study_id = ?", (participant_id, study_id)):
+                self.send_error_json("Linked participant not found", 404)
+                return
+            extracted = extract_case_intelligence(source_text, title)
+            status = str(payload.get("status", "draft")).strip().lower()
+            if status not in {"draft", "triaged", "ready", "excluded"}:
+                status = "draft"
+            cur = conn.execute(
+                """
+                INSERT INTO case_intakes(study_id, participant_id, case_uid, title, status, source_text, extracted_json, tags_json, created_by, updated_by, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (study_id, participant_id, case_uid, title, status, source_text, json.dumps(extracted), json.dumps(extracted["tags"]), user["id"], user["id"], timestamp, timestamp),
+            )
+            self.save_case_files(conn, user["id"], study_id, cur.lastrowid, files)
+            after = row(conn, "SELECT * FROM case_intakes WHERE id = ?", (cur.lastrowid,))
+            audit(conn, user["id"], "create", "case_intake", cur.lastrowid, None, {"case": after, "file_count": len(files), "group": extracted["group_label"]})
+            self.send_json({"case": self.case_payload(conn, after)}, 201)
+            return
+        if method == "PATCH" and len(parts) == 5:
+            case_id = int(parts[4])
+            before = row(conn, "SELECT * FROM case_intakes WHERE id = ? AND study_id = ?", (case_id, study_id))
+            if not before:
+                self.send_error_json("Case not found", 404)
+                return
+            payload = self.body()
+            title = str(payload.get("title", before["title"])).strip() or before["title"]
+            source_text = str(payload.get("source_text", before["source_text"])).strip()
+            status = str(payload.get("status", before["status"])).strip().lower()
+            if status not in {"draft", "triaged", "ready", "excluded"}:
+                status = before["status"]
+            extracted = extract_case_intelligence(source_text, title)
+            conn.execute(
+                "UPDATE case_intakes SET title = ?, status = ?, source_text = ?, extracted_json = ?, tags_json = ?, updated_by = ?, updated_at = ? WHERE id = ? AND study_id = ?",
+                (title, status, source_text, json.dumps(extracted), json.dumps(extracted["tags"]), user["id"], now(), case_id, study_id),
+            )
+            self.save_case_files(conn, user["id"], study_id, case_id, payload.get("files") or [])
+            after = row(conn, "SELECT * FROM case_intakes WHERE id = ?", (case_id,))
+            audit(conn, user["id"], "update", "case_intake", case_id, before, {"case": after, "group": extracted["group_label"]})
+            self.send_json({"case": self.case_payload(conn, after)})
+            return
+        self.send_error_json("Unsupported case intake operation", 405)
+
+    def export_case_intake_csv(self, conn, study_id: int) -> None:
+        cases = self.case_rows(conn, study_id)
+        fieldnames = ["case_uid", "title", "status", "group", "age", "sex", "diagnosis", "presentation", "investigations", "treatment", "outcome", "missing_fields", "warnings", "file_count", "updated_at"]
+        text_lines = []
+        class Sink:
+            def write(self, value):
+                text_lines.append(value)
+        writer = csv.DictWriter(Sink(), fieldnames=fieldnames)
+        writer.writeheader()
+        for item in cases:
+            extracted = item.get("extracted", {})
+            clinical = extracted.get("clinical", {})
+            demographics = extracted.get("demographics", {})
+            writer.writerow(
+                {
+                    "case_uid": item["case_uid"],
+                    "title": item["title"],
+                    "status": item["status"],
+                    "group": extracted.get("group_label", ""),
+                    "age": demographics.get("age", ""),
+                    "sex": demographics.get("sex", ""),
+                    "diagnosis": clinical.get("diagnosis", ""),
+                    "presentation": clinical.get("presentation", ""),
+                    "investigations": clinical.get("investigations", ""),
+                    "treatment": clinical.get("treatment", ""),
+                    "outcome": clinical.get("outcome", ""),
+                    "missing_fields": "; ".join(extracted.get("missing_fields", [])),
+                    "warnings": "; ".join(extracted.get("warnings", [])),
+                    "file_count": len(item.get("files", [])),
+                    "updated_at": item["updated_at"],
+                }
+            )
+        content = "".join(text_lines).encode("utf-8-sig")
+        self.send_response(200)
+        self.send_header("content-type", "text/csv; charset=utf-8")
+        self.send_header("content-disposition", "attachment; filename=case_intake_export.csv")
+        self.send_header("content-length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
     def queries(self, conn, user, method, study_id, parts, membership) -> None:
         if method == "GET":
             if membership.get("data_group_id"):
@@ -2836,7 +3216,7 @@ class App(BaseHTTPRequestHandler):
         )["count"]
         field_states = rows(conn, "SELECT state, COUNT(*) AS count FROM field_states JOIN entries ON entries.id = field_states.entry_id WHERE entries.study_id = ? GROUP BY state", (study_id,))
         state_counts = {item["state"]: item["count"] for item in field_states}
-        audit_events = row(conn, "SELECT COUNT(*) AS count FROM audit_log WHERE entity_type IN ('study', 'form', 'entry', 'query', 'field_state', 'randomization', 'api_token', 'membership', 'data_group', 'backup')", ())["count"]
+        audit_events = row(conn, f"SELECT COUNT(*) AS count FROM audit_log WHERE {STUDY_AUDIT_FILTER}", study_audit_params(study_id))["count"]
         quality_count = len(self.quality_issues(conn, study_id, membership))
         backups = backup_files_for_study(study_id)
         encrypted_backups = [item for item in backups if item["encrypted"]]
@@ -3211,17 +3591,16 @@ class App(BaseHTTPRequestHandler):
     def export_audit_csv(self, conn, study_id: int) -> None:
         audit_rows = rows(
             conn,
-            """
+            f"""
             SELECT audit_log.id, audit_log.created_at, users.username, users.display_name,
                    audit_log.action, audit_log.entity_type, audit_log.entity_id, audit_log.before_json, audit_log.after_json
             FROM audit_log
             LEFT JOIN users ON users.id = audit_log.user_id
-            WHERE audit_log.entity_id IN (SELECT id FROM participants WHERE study_id = ?)
-               OR audit_log.entity_type IN ('study', 'form', 'entry', 'query', 'field_state', 'randomization', 'api_token', 'membership', 'data_group')
+            WHERE {STUDY_AUDIT_FILTER}
             ORDER BY audit_log.id DESC
             LIMIT 5000
             """,
-            (study_id,),
+            study_audit_params(study_id),
         )
         fieldnames = ["id", "created_at", "username", "display_name", "action", "entity_type", "entity_id", "before_json", "after_json"]
         text_lines = []

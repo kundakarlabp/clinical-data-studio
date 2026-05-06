@@ -39,6 +39,18 @@ class CoreEdcTests(unittest.TestCase):
         self.assertEqual(fields["sex"]["options"], ["Female", "Male", "Unknown"])
         self.assertEqual(fields["any_adverse_event"]["options"], ["No", "Yes"])
 
+    def test_case_intelligence_extracts_publication_fields(self):
+        extracted = server.extract_case_intelligence(
+            "A 42 year old female presented with fever and cough. Diagnosis: severe influenza pneumonia. "
+            "CT chest showed bilateral infiltrates. Treatment: oseltamivir and oxygen. Outcome: improved and discharged.",
+            "Influenza pneumonia case",
+        )
+        self.assertEqual(extracted["demographics"]["age"], "42")
+        self.assertEqual(extracted["demographics"]["sex"], "Female")
+        self.assertIn("influenza", extracted["clinical"]["diagnosis"].lower())
+        self.assertIn("oseltamivir", extracted["clinical"]["treatment"].lower())
+        self.assertNotIn("outcome", extracted["missing_fields"])
+
     def test_migration_creates_database(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             original_data = server.DATA

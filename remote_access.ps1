@@ -4,7 +4,8 @@ Set-Location -LiteralPath $PSScriptRoot
 $port = if ($env:CDS_PORT) { $env:CDS_PORT } else { "8765" }
 
 Write-Host "Clinical Data Studio remote access helper"
-Write-Host "Best free path: private VPN access to this study computer."
+Write-Host "Easiest free path: run .\start_easy_remote.ps1 and share the HTTPS link it prints."
+Write-Host "More private path: private VPN access to this study computer."
 Write-Host ""
 Write-Host "1. Start the app first:"
 Write-Host "   .\start.ps1"

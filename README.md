@@ -118,6 +118,14 @@ The installed app shell can open while offline, but clinical data save/sync stil
 
 For real study data, keep one central running app and database. This preserves audit trail order, record locking, user permissions, backups, and query review history.
 
+Simplest free remote option:
+
+```powershell
+.\start_easy_remote.ps1
+```
+
+This starts the app on your computer and opens a free temporary Cloudflare Tunnel. Share the printed `https://*.trycloudflare.com` link only with approved users. Keep the PowerShell window open while users enter data.
+
 Recommended options:
 
 - Same Wi-Fi/LAN: simplest and safest for bedside or department use.

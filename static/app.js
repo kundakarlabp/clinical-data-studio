@@ -326,10 +326,15 @@ function remoteAccessView() {
       </div>
       <div class="remote-grid">
         <div class="remote-option recommended">
-          <span class="pill ok">recommended</span>
-          <h3>Same Wi-Fi / LAN</h3>
+          <span class="pill ok">easiest free</span>
+          <h3>One Remote Link</h3>
+          <p>Run <code>.\\start_easy_remote.ps1</code>. Share the printed <code>https://*.trycloudflare.com</code> link with approved users.</p>
+          <span class="small">No phone app install is needed. Keep the PowerShell window open during data entry.</span>
+        </div>
+        <div class="remote-option">
+          <span class="pill ok">same Wi-Fi</span>
+          <h3>LAN</h3>
           <p>Run <code>.\\start.ps1</code> on the study computer. Phones and other computers open the printed Wi-Fi address.</p>
-          <span class="small">Run <code>.\\remote_access.ps1</code> to list LAN, Tailscale, and tunnel options.</span>
           <code>${escapeHtml(lanUrl)}</code>
         </div>
         <div class="remote-option">
@@ -368,11 +373,12 @@ function remoteAccessView() {
       <h2>Best Free Route</h2>
       <div class="readiness-list">
         ${[
-          "Install Tailscale or ZeroTier on the study computer and approved user devices.",
-          "Start Clinical Data Studio on the study computer with .\\start.ps1.",
-          "Run .\\remote_access.ps1 and open the private VPN URL from each approved device.",
-          "Use Cloudflare Tunnel only if users cannot install a VPN app and access controls are approved.",
-          "Use Oracle Always Free only if you are ready to manage a Linux VM, backups, firewall, and updates."
+          "Run .\\start_easy_remote.ps1 on the study computer.",
+          "Copy the https://*.trycloudflare.com URL printed in PowerShell.",
+          "Send that URL only to approved users.",
+          "Keep PowerShell open until data entry is finished.",
+          "Use one named account per person; never share the admin account.",
+          "Create an encrypted backup after each data-entry session."
         ].map((item) => `<div class="readiness-item"><span class="pill ok">free</span><div><strong>${escapeHtml(item)}</strong></div></div>`).join("")}
       </div>
     </section>

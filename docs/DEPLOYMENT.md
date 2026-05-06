@@ -24,6 +24,14 @@ Remote clinical data entry needs one central app instance and one central databa
 
 For a fuller free setup guide, see [Free Remote Access Setup](FREE_REMOTE_ACCESS.md).
 
+Simplest free remote link:
+
+```powershell
+.\start_easy_remote.ps1
+```
+
+The script starts the app on the study computer, downloads/uses `cloudflared`, and runs a temporary free HTTPS tunnel. Share the printed `https://*.trycloudflare.com` link only with approved users. Keep the PowerShell window open while remote data entry is active.
+
 Preferred sequence:
 
 - Local LAN: keep the study computer powered on, run `.\start.ps1`, and use the printed Wi-Fi URL on approved devices.

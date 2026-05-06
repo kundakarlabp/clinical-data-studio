@@ -2,7 +2,21 @@
 
 This app needs one central running instance and one central database for real study data. Do not run separate live database copies on multiple computers.
 
-## Best Free Path For A Small Study
+## Easiest Free Path
+
+Use the one-command Cloudflare quick tunnel script:
+
+```powershell
+.\start_easy_remote.ps1
+```
+
+This starts Clinical Data Studio on your computer and prints a temporary `https://*.trycloudflare.com` link. Approved users can open that link from any phone or computer browser. They do not need to be on the same Wi-Fi and do not need to install an app.
+
+Use this when simplicity is more important than having a permanent custom URL. Keep the PowerShell window open while users enter data. The link changes when you restart the tunnel. Cloudflare describes quick tunnels as testing/development tunnels without production uptime guarantees, so this is the easy pilot route rather than a validated production hosting contract.
+
+Minimum rule for this easy mode: use only strong passwords and named users. Do not use the default admin password. For identifiable patient data or formal regulated trial work, use the more private Tailscale route or a Cloudflare account with Access controls instead of a quick temporary tunnel.
+
+## More Private Free Path
 
 Use a private VPN overlay such as Tailscale or ZeroTier.
 
@@ -41,7 +55,13 @@ Each user should log in with their own Clinical Data Studio account. Do not shar
 
 ## If Users Cannot Install A VPN App
 
-Use Cloudflare Tunnel only after study approval.
+Use the easy remote script first:
+
+```powershell
+.\start_easy_remote.ps1
+```
+
+For a more controlled Cloudflare setup, use Cloudflare Tunnel only after study approval.
 
 Cloudflare Tunnel can publish the local app through Cloudflare without opening an inbound port on your router. For real clinical data, pair it with Cloudflare Access or an equivalent identity gate. A quick temporary tunnel is useful for a demo, but it is not enough for PHI or real trial data.
 

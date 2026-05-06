@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Clinical Data Studio">
+  <rect width="512" height="512" rx="96" fill="#0f766e"/>
+  <rect x="118" y="84" width="276" height="344" rx="32" fill="#ffffff"/>
+  <rect x="154" y="138" width="204" height="30" rx="15" fill="#d8e0ea"/>
+  <rect x="154" y="202" width="204" height="24" rx="12" fill="#0f766e"/>
+  <rect x="154" y="256" width="148" height="24" rx="12" fill="#2563eb"/>
+  <rect x="154" y="310" width="176" height="24" rx="12" fill="#0f766e"/>
+  <path d="M256 380v-54M229 353h54" stroke="#b42318" stroke-width="24" stroke-linecap="round"/>
+</svg>

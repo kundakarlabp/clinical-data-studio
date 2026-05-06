@@ -12,6 +12,12 @@ Open `http://127.0.0.1:8765` on the host computer. Phones and tablets must be on
 
 On first launch, complete the administrator setup screen and store the password in your study operations records.
 
+## Install On Android Or Desktop
+
+Open the study Wi-Fi URL in Chrome or Edge and use **Install App** or **Add to Home screen**. This creates an app-like icon and standalone window. The installed shell can reopen offline and show guidance, but saving clinical data requires the device to reconnect to the study computer.
+
+For multiple users on disconnected computers or phones, use each disconnected device only for test/pilot workflows unless you have a validated sync process. For production data, prefer one reachable study computer on a trusted LAN, VPN, or approved hosting environment so audit trails and record locks stay centralized.
+
 ## Firewall
 
 If another device cannot open the app, allow Python through Windows Defender Firewall for private networks, or open TCP port `8765` only on the trusted local network.

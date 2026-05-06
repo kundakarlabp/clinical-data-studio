@@ -129,3 +129,9 @@ api(`/api/public/surveys/${encodeURIComponent(token)}`)
   .catch((error) => {
     app.innerHTML = `<section class="login"><div class="login-card"><h1>${escapeHtml(error.message)}</h1></div></section>`;
   });
+
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/service-worker.js").catch(() => {});
+  });
+}

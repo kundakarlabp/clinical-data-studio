@@ -51,6 +51,7 @@ Implemented foundation:
 - Optional passphrase-protected encrypted archive export
 - Optional Windows EFS data-folder at-rest protection helper
 - Health endpoint and local LAN start helper
+- Installable Android/desktop PWA shell with offline fallback for app pages
 - First-run administrator password setup
 - Login lockout after repeated failed attempts
 - Local CRF draft assistant from pasted text with optional structured OpenAI drafting when explicitly enabled
@@ -104,3 +105,9 @@ $env:OPENAI_API_KEY = "your_api_key"
 ```
 
 Do not send patient identifiers or PHI to external AI unless your study policy and data agreement allow it. AI drafts must be reviewed before use.
+
+## Android And Multi-Device Use
+
+Run the app on one study computer with `.\start.ps1`, then open the shown Wi-Fi URL on phones, tablets, or other computers. On Android Chrome, use **Add to Home screen** or the app's **Install App** prompt to create an app icon.
+
+The installed app shell can open while offline, but clinical data save/sync still requires connection to the study computer. For completely separate non-connected sites, use exports/imports or backups until offline sync is explicitly validated.

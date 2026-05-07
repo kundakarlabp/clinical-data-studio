@@ -1,0 +1,32 @@
+services:
+  app:
+    build: .
+    container_name: clinical-data-studio-local
+    environment:
+      CDS_ENV: production
+      CDS_HOST: 0.0.0.0
+      CDS_PORT: 8765
+      CDS_SECRET_KEY: local_docker_only_change_before_real_use_1234567890
+      CDS_DATABASE_BACKEND: sqlite
+      DATABASE_URL: sqlite:////app/data/clinical_data_studio.sqlite3
+      CDS_REQUIRE_HTTPS: "false"
+      CDS_PUBLIC_BASE_URL: http://127.0.0.1:8765
+      CDS_BACKUP_DIR: /app/backups
+      CDS_AI_PROVIDER: local
+      CDS_AI_ENABLED: "false"
+      CDS_AI_ALLOW_PHI: "false"
+      CDS_ADMIN_USERNAME: admin
+      CDS_ADMIN_PASSWORD: LocalDockerAdmin123
+      CDS_ADMIN_DISPLAY_NAME: Local Docker Admin
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - local_data:/app/data
+      - local_backups:/app/backups
+      - local_logs:/app/logs
+    restart: unless-stopped
+
+volumes:
+  local_data:
+  local_backups:
+  local_logs:

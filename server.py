@@ -4701,6 +4701,8 @@ def validate_startup() -> None:
             raise RuntimeError("Production startup refused: set CDS_SECRET_KEY to a long random value.")
         if not SETTINGS.admin_password or len(SETTINGS.admin_password) < PRODUCTION_ADMIN_PASSWORD_MIN_LENGTH or SETTINGS.admin_password == "admin123":
             raise RuntimeError("Production startup refused: set CDS_ADMIN_PASSWORD to a strong non-default value.")
+        if DATABASE_BACKEND == "postgres" and (not DATABASE_URL or "change_me" in DATABASE_URL.lower()):
+            raise RuntimeError("Production startup refused: set DATABASE_URL or POSTGRES_PASSWORD for PostgreSQL.")
         if HOST in {"0.0.0.0", "::"}:
             LOGGER.warning("Clinical Data Studio is bound to all network interfaces in production. Use HTTPS and a firewall.")
         if SETTINGS.require_https and SETTINGS.public_base_url and not SETTINGS.public_base_url.startswith("https://"):

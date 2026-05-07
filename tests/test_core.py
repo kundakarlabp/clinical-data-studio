@@ -87,6 +87,11 @@ class CoreEdcTests(unittest.TestCase):
             settings = config.load_settings()
         self.assertEqual(settings.host, "127.0.0.1")
 
+    def test_postgres_settings_derive_url_from_password(self):
+        with patch.dict("os.environ", {"CDS_DATABASE_BACKEND": "postgres", "POSTGRES_PASSWORD": "StrongDbPassword123", "DATABASE_URL": ""}, clear=False):
+            settings = config.load_settings()
+        self.assertEqual(settings.database_url, "postgresql://clinical:StrongDbPassword123@db:5432/clinical_data_studio")
+
     def test_production_startup_requires_secret_key(self):
         original_settings = server.SETTINGS
         original_host = server.HOST
@@ -98,6 +103,30 @@ class CoreEdcTests(unittest.TestCase):
         finally:
             server.SETTINGS = original_settings
             server.HOST = original_host
+
+    def test_production_startup_rejects_placeholder_postgres_url(self):
+        original_settings = server.SETTINGS
+        original_host = server.HOST
+        original_backend = server.DATABASE_BACKEND
+        original_url = server.DATABASE_URL
+        try:
+            server.SETTINGS = replace(
+                original_settings,
+                env="production",
+                secret_key="x" * 40,
+                admin_password="StrongAdminPassword123",
+                public_base_url="https://example.org",
+            )
+            server.HOST = "127.0.0.1"
+            server.DATABASE_BACKEND = "postgres"
+            server.DATABASE_URL = "postgresql://clinical:change_me@db:5432/clinical_data_studio"
+            with self.assertRaises(RuntimeError):
+                server.validate_startup()
+        finally:
+            server.SETTINGS = original_settings
+            server.HOST = original_host
+            server.DATABASE_BACKEND = original_backend
+            server.DATABASE_URL = original_url
 
     def test_external_ai_phi_gate_blocks_identifiers_by_default(self):
         original_settings = server.SETTINGS

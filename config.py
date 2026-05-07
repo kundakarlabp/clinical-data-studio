@@ -83,7 +83,9 @@ def load_settings() -> Settings:
     database_backend = os.environ.get("CDS_DATABASE_BACKEND", "sqlite").strip().lower() or "sqlite"
     database_url = os.environ.get("DATABASE_URL", "").strip()
     if database_backend == "postgres" and not database_url:
-        database_url = "postgresql://clinical:change_me@db:5432/clinical_data_studio"
+        postgres_password = os.environ.get("POSTGRES_PASSWORD", "").strip()
+        if postgres_password:
+            database_url = f"postgresql://clinical:{postgres_password}@db:5432/clinical_data_studio"
     if not database_url:
         database_url = f"sqlite:///{data_dir / 'clinical_data_studio.sqlite3'}"
     return Settings(

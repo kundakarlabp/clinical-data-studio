@@ -348,6 +348,17 @@ code {
   border-radius: 8px;
 }
 
+.log-view {
+  max-height: 320px;
+  overflow: auto;
+  background: #101820;
+  color: #d7e3ea;
+  border-radius: 8px;
+  padding: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;

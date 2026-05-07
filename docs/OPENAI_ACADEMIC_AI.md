@@ -12,6 +12,7 @@ In PowerShell before starting the app:
 
 ```powershell
 $env:CDS_AI_PROVIDER = "openai"
+$env:CDS_AI_ENABLED = "true"
 $env:OPENAI_API_KEY = "your_openai_api_key"
 $env:CDS_AI_MODEL = "gpt-5.2"
 .\start.ps1
@@ -25,6 +26,7 @@ Only enable this after confirming your privacy/ethics policy permits sending upl
 
 ```powershell
 $env:CDS_AI_PROVIDER = "openai"
+$env:CDS_AI_ENABLED = "true"
 $env:OPENAI_API_KEY = "your_openai_api_key"
 $env:CDS_AI_MODEL = "gpt-5.2"
 $env:CDS_AI_TRANSCRIBE_MODEL = "gpt-4o-transcribe"
@@ -33,6 +35,8 @@ $env:CDS_AI_MULTIMODAL = "1"
 ```
 
 When enabled, Academic AI can send uploaded images for vision review and transcribe uploaded audio before case analysis. Text files are included as text evidence. Unsupported files remain stored locally as source evidence.
+
+By default, `CDS_AI_ALLOW_PHI=false`. The server blocks obvious identifiers before external AI use. Keep it false unless your ethics and institutional policy explicitly approve sending PHI to an external AI service.
 
 ## What The Assistant Produces
 

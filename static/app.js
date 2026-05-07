@@ -28,6 +28,8 @@ const state = {
   assistantSummary: null,
   assistDraft: null,
   readiness: null,
+  adminStatus: null,
+  adminLogs: [],
   view: "dashboard",
   selectedParticipantId: 0,
   selectedEventId: Number(localStorage.getItem("cds_event_id") || 0),
@@ -98,7 +100,7 @@ async function loadStudy() {
   const manageUsers = can("manage_users");
   const viewAnalysis = can("view_analysis") || can("review_data");
   const readinessAllowed = can("manage_study") || can("review_data") || can("view_analysis");
-  const [forms, events, formEvents, surveyLinks, invitations, reports, caseIntake, backups, participants, entries, queries, quality, analysis, assistantSummary, readiness, audit, groups, studyMembers, apiTokens, randomization, users] = await Promise.all([
+  const [forms, events, formEvents, surveyLinks, invitations, reports, caseIntake, backups, participants, entries, queries, quality, analysis, assistantSummary, readiness, audit, groups, studyMembers, apiTokens, randomization, users, adminStatus, adminLogs] = await Promise.all([
     api(`/api/studies/${state.studyId}/forms`),
     api(`/api/studies/${state.studyId}/events`),
     api(`/api/studies/${state.studyId}/form-events`),
@@ -119,7 +121,9 @@ async function loadStudy() {
     manageUsers ? api(`/api/studies/${state.studyId}/memberships`) : Promise.resolve({ memberships: [] }),
     manageUsers ? api(`/api/studies/${state.studyId}/api-tokens`) : Promise.resolve({ tokens: [] }),
     can("manage_study") || can("review_data") ? api(`/api/studies/${state.studyId}/randomization`) : Promise.resolve({ lists: [], allocations: [] }),
-    state.user?.role === "admin" ? api("/api/users") : Promise.resolve({ users: [] }),
+    isSuperAdmin() ? api("/api/users") : Promise.resolve({ users: [] }),
+    isSuperAdmin() ? api("/api/admin/status") : Promise.resolve(null),
+    isSuperAdmin() ? api("/api/admin/logs") : Promise.resolve({ lines: [] }),
   ]);
   state.forms = forms.forms;
   state.events = events.events;
@@ -145,10 +149,16 @@ async function loadStudy() {
   state.apiTokens = apiTokens.tokens;
   state.randomization = randomization;
   state.users = users.users;
+  state.adminStatus = adminStatus;
+  state.adminLogs = adminLogs.lines || [];
+}
+
+function isSuperAdmin() {
+  return ["admin", "super_admin"].includes(state.user?.role);
 }
 
 function currentMembership() {
-  if (state.user?.role === "admin") return { role: "owner", data_group_id: null };
+  if (isSuperAdmin()) return { role: "owner", data_group_id: null };
   return state.memberships.find((item) => item.study_id === state.studyId) || null;
 }
 
@@ -156,10 +166,14 @@ function can(permission) {
   const role = currentMembership()?.role || "";
   const permissions = {
     admin: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis"],
+    super_admin: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis"],
     owner: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis"],
+    project_admin: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis"],
+    pi: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis"],
     data_entry: ["enter_data"],
     reviewer: ["review_data", "view_analysis"],
     analyst: ["export_data", "view_analysis"],
+    viewer: ["view_analysis"],
     read_only: ["view_analysis"],
   };
   return (permissions[role] || []).includes(permission);
@@ -214,8 +228,7 @@ function render() {
           <div class="split-actions">
             ${state.installPrompt && !state.standalone ? `<button class="secondary" id="install-app">Install App</button>` : ""}
             <span class="connection ${state.online ? "online" : "offline"}">${state.online ? "Online" : "Offline"}</span>
-            <a href="/api/studies/${state.studyId}/export" target="_blank"><button class="secondary">Export CSV</button></a>
-            <a href="/api/studies/${state.studyId}/codebook" target="_blank"><button class="secondary">Codebook</button></a>
+            ${can("export_data") ? `<button class="secondary" id="export-csv">Export CSV</button><button class="secondary" id="export-codebook">Codebook</button>` : ""}
             <button class="secondary" id="logout">Logout</button>
           </div>
         </header>
@@ -1220,19 +1233,21 @@ function auditView() {
 }
 
 function accessView() {
-  const roleOptions = ["owner", "data_entry", "reviewer", "analyst", "read_only"];
+  const roleOptions = ["project_admin", "pi", "data_entry", "reviewer", "analyst", "viewer"];
+  const globalRoleOptions = ["super_admin", "data_entry", "reviewer", "analyst", "viewer"];
+  const scopeOptions = ["metadata:read", "records:read", "records:write", "export:read", "randomization:write", "ai:use"];
   return `
     <section class="grid two">
       <section class="panel">
         <h2>Create User</h2>
-        ${state.user?.role === "admin" ? `
+        ${isSuperAdmin() ? `
           <form id="user-form" class="stack">
             <label>Username<input name="username" required placeholder="coordinator1" /></label>
             <label>Display name<input name="display_name" required placeholder="Coordinator One" /></label>
-            <label>Temporary password<input name="password" type="password" minlength="8" required /></label>
+            <label>Temporary password<input name="password" type="password" minlength="10" required /></label>
             <label>Global role
               <select name="role">
-                ${roleOptions.map((role) => `<option value="${role}">${role}</option>`).join("")}
+                ${globalRoleOptions.map((role) => `<option value="${role}">${role}</option>`).join("")}
               </select>
             </label>
             <button>Create User</button>
@@ -1300,17 +1315,23 @@ function accessView() {
           </select>
         </label>
         <label>Label<input name="label" required placeholder="Analysis script token" /></label>
+        <label class="full">Scopes
+          <select name="scopes" multiple size="6">
+            ${scopeOptions.map((scope) => `<option value="${scope}" selected>${scope}</option>`).join("")}
+          </select>
+        </label>
         <div class="full"><button>Create API Token</button></div>
       </form>
       <p class="small">The token is shown once after creation. Use endpoint /api/redcap with token, content, action, and format parameters.</p>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Label</th><th>User</th><th>Active</th><th>Last Used</th><th></th></tr></thead>
+          <thead><tr><th>Label</th><th>User</th><th>Scopes</th><th>Active</th><th>Last Used</th><th></th></tr></thead>
           <tbody>
             ${state.apiTokens.map((item) => `
               <tr>
                 <td>${escapeHtml(item.label)}</td>
                 <td>${escapeHtml(item.username)}</td>
+                <td><span class="small">${escapeHtml((item.scopes || []).join(", "))}</span></td>
                 <td>${item.active ? "Yes" : "No"}</td>
                 <td>${fmtTime(item.last_used_at)}</td>
                 <td>${item.active ? `<button class="secondary" data-revoke-token="${item.id}">Revoke</button>` : ""}</td>
@@ -1324,8 +1345,31 @@ function accessView() {
 }
 
 function settingsView() {
+  const health = state.adminStatus?.health;
   return `
+    ${isSuperAdmin() ? `
     <section class="panel">
+      <h2>System Status</h2>
+      <div class="grid three">
+        <div><span class="small">App</span><strong>${health?.ok ? "Running" : "Needs review"}</strong></div>
+        <div><span class="small">Mode</span><strong>${escapeHtml(health?.environment || "development")}</strong></div>
+        <div><span class="small">Database</span><strong>${escapeHtml(health?.database_backend || "")}</strong></div>
+        <div><span class="small">HTTPS</span><strong>${health?.https_detected ? "Detected" : "Not detected"}</strong></div>
+        <div><span class="small">AI</span><strong>${health?.ai?.external_ai_enabled ? "External enabled" : "Local/off"}</strong></div>
+        <div><span class="small">Latest backup</span><strong>${fmtTime(health?.backup?.latest_backup_at)}</strong></div>
+      </div>
+      <div class="split-actions">
+        <button class="secondary" id="admin-backup">Create System Backup</button>
+        <button class="secondary" id="refresh-admin">Refresh Status</button>
+      </div>
+    </section>
+    <section class="panel">
+      <h2>Deployment</h2>
+      <p class="small">Version ${escapeHtml(health?.version || "0.1")} · Commit ${escapeHtml(health?.commit || "unknown")} · Logs at ${escapeHtml(state.adminStatus?.logs?.path || "")}</p>
+      <pre class="log-view">${escapeHtml((state.adminLogs || []).slice(-80).join("\\n"))}</pre>
+    </section>
+    ` : ""}
+    ${isSuperAdmin() ? `<section class="panel">` : `<section class="panel hidden">`}
       <h2>Create Study</h2>
       <form id="study-form" class="form-grid">
         <label>Name<input name="name" required placeholder="My Clinical Study" /></label>
@@ -1348,7 +1392,7 @@ function settingsView() {
       <h2>Change Password</h2>
       <form id="password-form" class="form-grid">
         <label>Current password<input name="current_password" type="password" required /></label>
-        <label>New password<input name="new_password" type="password" minlength="8" required /></label>
+        <label>New password<input name="new_password" type="password" minlength="10" required /></label>
         <div class="full"><button>Update Password</button></div>
       </form>
     </section>
@@ -1388,12 +1432,19 @@ function bindShell() {
     localStorage.removeItem("cds_token");
     renderLogin();
   });
+  document.querySelector("#export-csv")?.addEventListener("click", () => downloadApi(`/api/studies/${state.studyId}/export${currentMembership()?.role === "analyst" ? "?deidentified=1" : ""}`, "clinical_data_export.csv"));
+  document.querySelector("#export-codebook")?.addEventListener("click", () => downloadApi(`/api/studies/${state.studyId}/codebook`, "clinical_data_codebook.csv"));
 }
 
 function bindRoute() {
   document.querySelector("#participant-form")?.addEventListener("submit", submitParticipant);
   document.querySelector("#study-form")?.addEventListener("submit", submitStudy);
   document.querySelector("#password-form")?.addEventListener("submit", submitPassword);
+  document.querySelector("#admin-backup")?.addEventListener("click", createSystemBackup);
+  document.querySelector("#refresh-admin")?.addEventListener("click", async () => {
+    await loadStudy();
+    render();
+  });
   document.querySelector("#user-form")?.addEventListener("submit", submitUser);
   document.querySelector("#group-form")?.addEventListener("submit", submitGroup);
   document.querySelector("#membership-form")?.addEventListener("submit", submitMembership);
@@ -1517,6 +1568,18 @@ async function submitPassword(event) {
   }
 }
 
+async function createSystemBackup() {
+  try {
+    await api("/api/admin/backup", { method: "POST", body: "{}" });
+    await loadStudy();
+    state.error = "System backup created.";
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
 async function submitUser(event) {
   event.preventDefault();
   const data = Object.fromEntries(new FormData(event.target));
@@ -1568,11 +1631,12 @@ async function submitMembership(event) {
 
 async function submitApiToken(event) {
   event.preventDefault();
-  const data = Object.fromEntries(new FormData(event.target));
+  const formData = new FormData(event.target);
+  const data = Object.fromEntries(formData);
   try {
     const result = await api(`/api/studies/${state.studyId}/api-tokens`, {
       method: "POST",
-      body: JSON.stringify({ user_id: Number(data.user_id), label: data.label }),
+      body: JSON.stringify({ user_id: Number(data.user_id), label: data.label, scopes: formData.getAll("scopes") }),
     });
     alert(`API token. Store it now, it will not be shown again:\\n${result.token}`);
     await loadStudy();

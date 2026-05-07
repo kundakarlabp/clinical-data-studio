@@ -1,7 +1,10 @@
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
+import config
 import server
 
 
@@ -78,6 +81,33 @@ class CoreEdcTests(unittest.TestCase):
             finally:
                 server.DATA = original_data
                 server.DB_PATH = original_db
+
+    def test_development_settings_do_not_bind_publicly(self):
+        with patch.dict("os.environ", {"CDS_ENV": "development", "CDS_HOST": "0.0.0.0"}, clear=False):
+            settings = config.load_settings()
+        self.assertEqual(settings.host, "127.0.0.1")
+
+    def test_production_startup_requires_secret_key(self):
+        original_settings = server.SETTINGS
+        original_host = server.HOST
+        try:
+            server.SETTINGS = replace(original_settings, env="production", secret_key="", admin_password="StrongAdminPassword123")
+            server.HOST = "127.0.0.1"
+            with self.assertRaises(RuntimeError):
+                server.validate_startup()
+        finally:
+            server.SETTINGS = original_settings
+            server.HOST = original_host
+
+    def test_external_ai_phi_gate_blocks_identifiers_by_default(self):
+        original_settings = server.SETTINGS
+        try:
+            server.SETTINGS = replace(original_settings, ai_provider="openai", ai_enabled=True, ai_allow_phi=False)
+            with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}, clear=False):
+                with self.assertRaises(ValueError):
+                    server.assert_external_ai_safe("Patient name: John Doe\nPhone: 9999999999")
+        finally:
+            server.SETTINGS = original_settings
 
 
 if __name__ == "__main__":

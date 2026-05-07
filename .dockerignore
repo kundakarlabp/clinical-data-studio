@@ -1,0 +1,16 @@
+.git
+data
+backups
+logs
+uploads
+exports
+__pycache__
+*.pyc
+*.sqlite3
+*.db
+*.dump
+*.cdsenc
+.env
+.env.*
+!.env.example
+node_modules

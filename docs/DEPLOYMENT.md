@@ -154,6 +154,7 @@ The CRF assistant is local by default and does not require paid services. Extern
 
 ```powershell
 $env:CDS_AI_PROVIDER = "openai"
+$env:CDS_AI_ENABLED = "true"
 $env:CDS_AI_MODEL = "gpt-5-mini"
 $env:OPENAI_API_KEY = "your_api_key"
 ```

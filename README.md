@@ -104,6 +104,7 @@ The CRF drafting assistant runs locally by default. To enable external structure
 
 ```powershell
 $env:CDS_AI_PROVIDER = "openai"
+$env:CDS_AI_ENABLED = "true"
 $env:CDS_AI_MODEL = "gpt-5-mini"
 $env:OPENAI_API_KEY = "your_api_key"
 ```

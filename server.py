@@ -7,12 +7,15 @@ import csv
 import hashlib
 import hmac
 import json
+import logging
 import mimetypes
 import os
 import platform
 import re
 import secrets
+import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -27,14 +30,19 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request as UrlRequest, urlopen as urlopen_request
 from xml.etree import ElementTree
 
+from config import load_settings
+from storage import connect_database, migrate_postgres
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
-DATA = ROOT / "data"
-BACKUPS = DATA / "backups"
-DB_PATH = DATA / "clinical_data_studio.sqlite3"
-HOST = "0.0.0.0"
-PORT = int(os.environ.get("CDS_PORT", "8765"))
+SETTINGS = load_settings()
+DATA = SETTINGS.data_dir
+BACKUPS = SETTINGS.backup_dir
+DB_PATH = SETTINGS.sqlite_path
+DATABASE_BACKEND = SETTINGS.database_backend
+DATABASE_URL = SETTINGS.database_url
+HOST = SETTINGS.host
+PORT = SETTINGS.port
 PBKDF2_ROUNDS = 260_000
 DEFAULT_OPENAI_MODEL = "gpt-5.2"
 DEFAULT_TRANSCRIBE_MODEL = "gpt-4o-transcribe"
@@ -49,7 +57,18 @@ CALC_OPERATORS = {
 FILE_ATTRIBUTE_ENCRYPTED = 0x4000
 
 ROLE_PERMISSIONS = {
+    "super_admin": {
+        "system_admin",
+        "manage_users",
+        "manage_study",
+        "manage_forms",
+        "enter_data",
+        "review_data",
+        "export_data",
+        "view_analysis",
+    },
     "admin": {
+        "system_admin",
         "manage_users",
         "manage_study",
         "manage_forms",
@@ -67,11 +86,59 @@ ROLE_PERMISSIONS = {
         "export_data",
         "view_analysis",
     },
+    "project_admin": {
+        "manage_users",
+        "manage_study",
+        "manage_forms",
+        "enter_data",
+        "review_data",
+        "export_data",
+        "view_analysis",
+    },
+    "pi": {
+        "manage_users",
+        "manage_study",
+        "manage_forms",
+        "enter_data",
+        "review_data",
+        "export_data",
+        "view_analysis",
+    },
     "data_entry": {"enter_data"},
     "reviewer": {"review_data", "view_analysis"},
     "analyst": {"export_data", "view_analysis"},
+    "viewer": {"view_analysis"},
     "read_only": {"view_analysis"},
 }
+SUPERUSER_ROLES = {"admin", "super_admin"}
+PROJECT_ADMIN_ROLES = {"owner", "project_admin", "pi"}
+PASSWORD_MIN_LENGTH = 10
+PRODUCTION_ADMIN_PASSWORD_MIN_LENGTH = 12
+API_TOKEN_SCOPES = {
+    "metadata:read",
+    "records:read",
+    "records:write",
+    "export:read",
+    "randomization:write",
+    "ai:use",
+}
+DEFAULT_API_TOKEN_SCOPES = sorted(API_TOKEN_SCOPES)
+PHI_PATTERNS = [
+    ("email", re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)),
+    ("phone", re.compile(r"(?:\+?\d[\s-]?){10,14}")),
+    ("aadhaar_like", re.compile(r"\b\d{4}[\s-]?\d{4}[\s-]?\d{4}\b")),
+    ("identifier_label", re.compile(r"\b(?:mrd|mrn|uhid|aadhaar|aadhar|hospital\s*number|phone|mobile|email|address)\b\s*[:#-]", re.IGNORECASE)),
+    ("patient_name_label", re.compile(r"\b(?:patient\s*name|name)\b\s*[:#-]\s*[A-Za-z][A-Za-z .'-]{2,}", re.IGNORECASE)),
+]
+
+SETTINGS.log_dir.mkdir(parents=True, exist_ok=True)
+LOG_FILE = SETTINGS.log_dir / "clinical-data-studio.log"
+logging.basicConfig(
+    level=getattr(logging, SETTINGS.log_level, logging.INFO),
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler()],
+)
+LOGGER = logging.getLogger("clinical-data-studio")
 
 
 def now() -> int:
@@ -79,12 +146,9 @@ def now() -> int:
 
 
 def db() -> sqlite3.Connection:
-    DATA.mkdir(exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    DATA.mkdir(parents=True, exist_ok=True)
+    BACKUPS.mkdir(parents=True, exist_ok=True)
+    return connect_database(DATABASE_BACKEND, DB_PATH, DATABASE_URL)
 
 
 def encode_password(password: str) -> str:
@@ -202,16 +266,182 @@ def data_protection_status() -> dict:
 
 
 def ai_status() -> dict:
-    provider = os.environ.get("CDS_AI_PROVIDER", "local").strip().lower() or "local"
-    external_enabled = provider == "openai" and bool(os.environ.get("OPENAI_API_KEY", "").strip())
+    provider = SETTINGS.ai_provider
+    ai_enabled = SETTINGS.ai_enabled
+    external_enabled = ai_enabled and provider == "openai" and bool(os.environ.get("OPENAI_API_KEY", "").strip())
     multimodal_enabled = external_enabled and os.environ.get("CDS_AI_MULTIMODAL", "").strip().lower() in {"1", "true", "yes", "on"}
     return {
         "provider": provider if external_enabled else "local",
+        "ai_enabled": ai_enabled,
         "external_ai_enabled": external_enabled,
         "model": os.environ.get("CDS_AI_MODEL", DEFAULT_OPENAI_MODEL) if external_enabled else "local-rules",
         "transcribe_model": os.environ.get("CDS_AI_TRANSCRIBE_MODEL", DEFAULT_TRANSCRIBE_MODEL) if external_enabled else "local-rules",
         "multimodal_enabled": multimodal_enabled,
-        "note": "External AI is disabled unless CDS_AI_PROVIDER=openai and OPENAI_API_KEY are configured. Uploaded evidence files are sent only when CDS_AI_MULTIMODAL=1.",
+        "phi_allowed": SETTINGS.ai_allow_phi,
+        "note": "External AI is disabled unless CDS_AI_ENABLED=true, CDS_AI_PROVIDER=openai, and OPENAI_API_KEY are configured. Uploaded evidence files are sent only when CDS_AI_MULTIMODAL=1.",
+    }
+
+
+def is_super_admin(user: dict | None) -> bool:
+    return bool(user and user.get("role") in SUPERUSER_ROLES)
+
+
+def safe_role(role: str) -> str:
+    return (role or "").strip().lower()
+
+
+def parse_token_scopes(value: str | None) -> set[str]:
+    scopes = set(load_json(value, []))
+    return {scope for scope in scopes if scope in API_TOKEN_SCOPES}
+
+
+def token_has_scope(token_row: dict, scope: str) -> bool:
+    return scope in parse_token_scopes(token_row.get("scopes_json"))
+
+
+def phi_findings(text: str) -> list[str]:
+    findings = []
+    for label, pattern in PHI_PATTERNS:
+        if pattern.search(text):
+            findings.append(label)
+    return sorted(set(findings))
+
+
+def deidentify_for_ai(text: str, replacement: str = "Study participant") -> str:
+    cleaned = text
+    cleaned = PHI_PATTERNS[0][1].sub("[email removed]", cleaned)
+    cleaned = PHI_PATTERNS[1][1].sub("[phone removed]", cleaned)
+    cleaned = PHI_PATTERNS[2][1].sub("[identifier removed]", cleaned)
+    cleaned = re.sub(r"\b(patient\s*name|name)\b\s*[:#-]\s*[^\n,;]+", f"Patient name: {replacement}", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(address)\b\s*[:#-]\s*[^\n]+", "Address: [removed]", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(mrd|mrn|uhid|aadhaar|aadhar|hospital\s*number)\b\s*[:#-]\s*[^\s,;]+", r"\1: [removed]", cleaned, flags=re.IGNORECASE)
+    return cleaned
+
+
+def assert_external_ai_safe(text: str) -> None:
+    status = ai_status()
+    if not status["external_ai_enabled"] or status["phi_allowed"]:
+        return
+    findings = phi_findings(text)
+    if findings:
+        raise ValueError(
+            "External AI is blocked because the case text appears to contain identifiers: "
+            + ", ".join(findings)
+            + ". Remove identifiers or keep CDS_AI_ALLOW_PHI=false and use local AI only."
+        )
+
+
+def git_commit() -> str:
+    configured = os.environ.get("CDS_COMMIT", "").strip()
+    if configured:
+        return configured
+    try:
+        result = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, capture_output=True, text=True, timeout=5, check=True)
+        return result.stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+def database_status() -> dict:
+    try:
+        with closing(db()) as conn:
+            user_count = row(conn, "SELECT COUNT(*) AS count FROM users")
+            return {"ok": True, "backend": DATABASE_BACKEND, "user_count": user_count["count"] if user_count else 0}
+    except Exception as exc:
+        return {"ok": False, "backend": DATABASE_BACKEND, "error": str(exc)}
+
+
+def latest_backup_time() -> int | None:
+    if not BACKUPS.exists():
+        return None
+    files = [item for item in BACKUPS.iterdir() if item.is_file()]
+    if not files:
+        return None
+    return int(max(item.stat().st_mtime for item in files))
+
+
+def backup_name(prefix: str = "system") -> str:
+    return f"{prefix}_{time.strftime('%Y%m%d_%H%M%S', time.localtime())}"
+
+
+def create_database_backup(passphrase: str = "", study_id: int | None = None) -> dict:
+    BACKUPS.mkdir(parents=True, exist_ok=True)
+    prefix = f"study_{study_id}" if study_id else "system"
+    stem = backup_name(prefix)
+    if DATABASE_BACKEND == "postgres":
+        dump_target = BACKUPS / f"{stem}.dump"
+        command = ["pg_dump", "--format=custom", "--file", str(dump_target), DATABASE_URL]
+        subprocess.run(command, check=True, capture_output=True, text=True, timeout=300)
+        if passphrase:
+            encrypted = BACKUPS / f"{stem}.cdsenc"
+            encrypted.write_bytes(encrypted_archive_bytes(dump_target.read_bytes(), passphrase))
+            dump_target.unlink(missing_ok=True)
+            target = encrypted
+        else:
+            target = dump_target
+        return {"name": target.name, "size": target.stat().st_size, "created_at": int(target.stat().st_mtime), "encrypted": target.suffix == ".cdsenc", "backend": "postgres"}
+    with closing(db()) as conn:
+        plain_target = BACKUPS / f"{stem}.sqlite3"
+        write_sqlite_backup(conn, plain_target)
+    if passphrase:
+        encrypted = BACKUPS / f"{stem}.cdsenc"
+        encrypted.write_bytes(encrypted_archive_bytes(plain_target.read_bytes(), passphrase))
+        plain_target.unlink(missing_ok=True)
+        target = encrypted
+    else:
+        target = plain_target
+    return {"name": target.name, "size": target.stat().st_size, "created_at": int(target.stat().st_mtime), "encrypted": target.suffix == ".cdsenc", "backend": "sqlite"}
+
+
+def restore_database_backup(backup_file: Path, passphrase: str = "") -> dict:
+    target = backup_file.resolve()
+    backup_root = BACKUPS.resolve()
+    if not str(target).startswith(str(backup_root)) or not target.exists() or not target.is_file():
+        raise ValueError("Backup file not found inside configured backup directory")
+    cleanup_target = None
+    restore_target = target
+    if target.suffix == ".cdsenc":
+        if not passphrase:
+            raise ValueError("Encrypted backup passphrase is required")
+        with tempfile.NamedTemporaryFile(delete=False, dir=BACKUPS, suffix=".dump" if DATABASE_BACKEND == "postgres" else ".sqlite3") as temporary:
+            temporary.write(decrypted_archive_bytes(target.read_bytes(), passphrase))
+            cleanup_target = Path(temporary.name)
+            restore_target = cleanup_target
+    try:
+        if DATABASE_BACKEND == "postgres":
+            subprocess.run(["pg_restore", "--clean", "--if-exists", "--no-owner", "--dbname", DATABASE_URL, str(restore_target)], check=True, capture_output=True, text=True, timeout=300)
+        else:
+            source = sqlite3.connect(restore_target)
+            try:
+                with closing(db()) as conn:
+                    source.backup(conn)
+            finally:
+                source.close()
+    finally:
+        if cleanup_target:
+            cleanup_target.unlink(missing_ok=True)
+    return {"restored": target.name, "backend": DATABASE_BACKEND}
+
+
+def health_payload() -> dict:
+    db_status = database_status()
+    return {
+        "ok": db_status["ok"],
+        "app": "Clinical Data Studio",
+        "version": os.environ.get("CDS_VERSION", "0.1"),
+        "commit": git_commit(),
+        "environment": SETTINGS.env,
+        "database": db_status,
+        "database_backend": DATABASE_BACKEND,
+        "migration_status": "ok" if db_status["ok"] else "error",
+        "public_base_url": SETTINGS.public_base_url,
+        "host": HOST,
+        "port": PORT,
+        "require_https": SETTINGS.require_https,
+        "https_detected": SETTINGS.public_base_url.startswith("https://"),
+        "data_protection": data_protection_status(),
+        "ai": ai_status(),
+        "backup": {"directory": str(BACKUPS), "latest_backup_at": latest_backup_time()},
     }
 
 
@@ -219,7 +449,7 @@ def backup_files_for_study(study_id: int) -> list[dict]:
     BACKUPS.mkdir(parents=True, exist_ok=True)
     files = []
     for item in sorted(BACKUPS.iterdir(), key=lambda path: path.stat().st_mtime, reverse=True):
-        if item.is_file() and item.name.startswith(f"study_{study_id}_") and item.suffix in (".sqlite3", ".cdsenc"):
+        if item.is_file() and item.name.startswith(f"study_{study_id}_") and item.suffix in (".sqlite3", ".cdsenc", ".dump"):
             files.append({"name": item.name, "size": item.stat().st_size, "created_at": int(item.stat().st_mtime), "encrypted": item.suffix == ".cdsenc"})
     return files
 
@@ -247,16 +477,28 @@ def load_json(value: str | None, fallback):
         return fallback
 
 
+def postgres_column_definition(definition: str) -> str:
+    cleaned = definition.replace("INTEGER", "BIGINT").replace("REFERENCES", "REFERENCES")
+    cleaned = re.sub(r"\s+ON\s+DELETE\s+SET\s+NULL", "", cleaned, flags=re.IGNORECASE)
+    return cleaned
+
+
 def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    if getattr(conn, "backend", "sqlite") == "postgres":
+        return conn.table_columns(table)
     return {dict(row)["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
 
 def add_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
-    if column not in table_columns(conn, table):
+    if getattr(conn, "backend", "sqlite") == "postgres":
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {postgres_column_definition(definition)}")
+    elif column not in table_columns(conn, table):
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def migrate_entries_unique_key(conn: sqlite3.Connection) -> None:
+    if getattr(conn, "backend", "sqlite") == "postgres":
+        return
     schema = row(conn, "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'entries'")
     if not schema or "UNIQUE(participant_id, form_id, event_name)" not in schema["sql"]:
         return
@@ -296,11 +538,23 @@ def migrate_entries_unique_key(conn: sqlite3.Connection) -> None:
     )
 
 
-def audit(conn: sqlite3.Connection, user_id: int | None, action: str, entity_type: str, entity_id: int | None, before=None, after=None) -> None:
+def audit(
+    conn: sqlite3.Connection,
+    user_id: int | None,
+    action: str,
+    entity_type: str,
+    entity_id: int | None,
+    before=None,
+    after=None,
+    study_id: int | None = None,
+    ip_address: str = "",
+    user_agent: str = "",
+    request_id: str = "",
+) -> None:
     conn.execute(
         """
-        INSERT INTO audit_log(user_id, action, entity_type, entity_id, before_json, after_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO audit_log(user_id, action, entity_type, entity_id, before_json, after_json, created_at, study_id, ip_address, user_agent, request_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             user_id,
@@ -310,12 +564,18 @@ def audit(conn: sqlite3.Connection, user_id: int | None, action: str, entity_typ
             json.dumps(before, sort_keys=True) if before is not None else None,
             json.dumps(after, sort_keys=True) if after is not None else None,
             now(),
+            study_id,
+            ip_address[:120],
+            user_agent[:240],
+            request_id[:80],
         ),
     )
 
 
 STUDY_AUDIT_FILTER = """
 (
+    audit_log.study_id = ?
+    OR
     (audit_log.entity_type = 'study' AND audit_log.entity_id = ?)
     OR (audit_log.entity_type IN ('backup', 'dictionary', 'records') AND audit_log.entity_id = ?)
     OR (audit_log.entity_type = 'participant' AND audit_log.entity_id IN (SELECT id FROM participants WHERE study_id = ?))
@@ -344,6 +604,18 @@ def study_audit_params(study_id: int) -> tuple[int, ...]:
 
 def migrate() -> None:
     with closing(db()) as conn, conn:
+        if getattr(conn, "backend", "sqlite") == "postgres":
+            migrate_postgres(conn)
+            add_column(conn, "api_tokens", "scopes_json", "TEXT NOT NULL DEFAULT '[]'")
+            add_column(conn, "audit_log", "study_id", "BIGINT")
+            add_column(conn, "audit_log", "ip_address", "TEXT NOT NULL DEFAULT ''")
+            add_column(conn, "audit_log", "user_agent", "TEXT NOT NULL DEFAULT ''")
+            add_column(conn, "audit_log", "request_id", "TEXT NOT NULL DEFAULT ''")
+            add_column(conn, "forms", "active", "INTEGER NOT NULL DEFAULT 1")
+            add_column(conn, "survey_links", "expires_at", "BIGINT")
+            add_column(conn, "survey_links", "one_time", "INTEGER NOT NULL DEFAULT 0")
+            seed_initial_data(conn)
+            return
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -665,26 +937,63 @@ def migrate() -> None:
         add_column(conn, "users", "must_change_password", "INTEGER NOT NULL DEFAULT 0")
         add_column(conn, "users", "failed_login_count", "INTEGER NOT NULL DEFAULT 0")
         add_column(conn, "users", "locked_until", "INTEGER NOT NULL DEFAULT 0")
+        add_column(conn, "api_tokens", "scopes_json", "TEXT NOT NULL DEFAULT '[]'")
+        add_column(conn, "audit_log", "study_id", "INTEGER")
+        add_column(conn, "audit_log", "ip_address", "TEXT NOT NULL DEFAULT ''")
+        add_column(conn, "audit_log", "user_agent", "TEXT NOT NULL DEFAULT ''")
+        add_column(conn, "audit_log", "request_id", "TEXT NOT NULL DEFAULT ''")
+        add_column(conn, "forms", "active", "INTEGER NOT NULL DEFAULT 1")
+        add_column(conn, "survey_links", "expires_at", "INTEGER")
+        add_column(conn, "survey_links", "one_time", "INTEGER NOT NULL DEFAULT 0")
         migrate_entries_unique_key(conn)
-        if not row(conn, "SELECT id FROM users WHERE username = ?", ("admin",)):
-            user = {
-                "username": "admin",
-                "display_name": "Administrator",
-                "role": "admin",
-                "created_at": now(),
-            }
-            conn.execute(
-                "INSERT INTO users(username, password_hash, display_name, role, must_change_password, created_at) VALUES (?, ?, ?, ?, 1, ?)",
-                ("admin", encode_password("admin123"), user["display_name"], user["role"], user["created_at"]),
-            )
-            audit(conn, None, "seed", "user", 1, None, user)
-        default_admin = row(conn, "SELECT id, password_hash FROM users WHERE username = 'admin'")
-        if default_admin and verify_password("admin123", default_admin["password_hash"]):
-            conn.execute("UPDATE users SET must_change_password = 1 WHERE id = ?", (default_admin["id"],))
-        if not row(conn, "SELECT id FROM studies LIMIT 1"):
-            seed_study(conn)
-        seed_admin_memberships(conn)
-        seed_baseline_events(conn)
+        seed_initial_data(conn)
+        add_production_indexes(conn)
+
+
+def seed_initial_data(conn) -> None:
+    if not row(conn, "SELECT id FROM users LIMIT 1"):
+        production = SETTINGS.production
+        admin_password = SETTINGS.admin_password if production else (SETTINGS.admin_password or "admin123")
+        if production and (not admin_password or len(admin_password) < PRODUCTION_ADMIN_PASSWORD_MIN_LENGTH or admin_password == "admin123"):
+            raise RuntimeError("Production startup requires CDS_ADMIN_PASSWORD with at least 12 characters and not the default password.")
+        user = {
+            "username": SETTINGS.admin_username if production else "admin",
+            "display_name": SETTINGS.admin_display_name if production else "Administrator",
+            "role": "super_admin" if production else "admin",
+            "created_at": now(),
+        }
+        conn.execute(
+            "INSERT INTO users(username, password_hash, display_name, role, must_change_password, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (user["username"], encode_password(admin_password), user["display_name"], user["role"], 0 if production else 1, user["created_at"]),
+        )
+        audit(conn, None, "seed", "user", 1, None, user)
+    default_admin = row(conn, "SELECT id, password_hash FROM users WHERE username = 'admin'")
+    if default_admin and verify_password("admin123", default_admin["password_hash"]):
+        conn.execute("UPDATE users SET must_change_password = 1 WHERE id = ?", (default_admin["id"],))
+    if not row(conn, "SELECT id FROM studies LIMIT 1"):
+        seed_study(conn)
+    seed_admin_memberships(conn)
+    seed_baseline_events(conn)
+
+
+def add_production_indexes(conn) -> None:
+    statements = [
+        "CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at)",
+        "CREATE INDEX IF NOT EXISTS idx_study_memberships_study_id ON study_memberships(study_id)",
+        "CREATE INDEX IF NOT EXISTS idx_study_memberships_user_id ON study_memberships(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_participants_study_id ON participants(study_id)",
+        "CREATE INDEX IF NOT EXISTS idx_entries_study_id ON entries(study_id)",
+        "CREATE INDEX IF NOT EXISTS idx_entries_participant_id ON entries(participant_id)",
+        "CREATE INDEX IF NOT EXISTS idx_entries_form_id ON entries(form_id)",
+        "CREATE INDEX IF NOT EXISTS idx_audit_log_user_id ON audit_log(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON audit_log(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_audit_log_entity ON audit_log(entity_type, entity_id)",
+        "CREATE INDEX IF NOT EXISTS idx_api_tokens_study_id ON api_tokens(study_id)",
+        "CREATE INDEX IF NOT EXISTS idx_api_tokens_token_hash ON api_tokens(token_hash)",
+    ]
+    for statement in statements:
+        conn.execute(statement)
 
 
 def seed_study(conn: sqlite3.Connection) -> None:
@@ -727,7 +1036,7 @@ def seed_study(conn: sqlite3.Connection) -> None:
 
 
 def seed_admin_memberships(conn: sqlite3.Connection) -> None:
-    admin_users = rows(conn, "SELECT id FROM users WHERE role = 'admin' AND active = 1")
+    admin_users = rows(conn, "SELECT id FROM users WHERE role IN ('admin', 'super_admin') AND active = 1")
     studies = rows(conn, "SELECT id FROM studies")
     timestamp = now()
     for study in studies:
@@ -1451,12 +1760,15 @@ def local_academic_case_review(case_item: dict, all_cases: list[dict], question:
 def build_openai_case_content(conn: sqlite3.Connection, study_id: int, case_item: dict, all_cases: list[dict], question: str) -> tuple[list[dict], list[str], int]:
     status = ai_status()
     evidence_notes = []
+    source_text = str(case_item.get("source_text", ""))
+    assert_external_ai_safe(source_text + "\n" + question)
+    ai_source_text = deidentify_for_ai(source_text, str(case_item.get("case_uid") or "Study participant")) if not status["phi_allowed"] else source_text
     case_context = {
         "case": {
             "case_uid": case_item.get("case_uid"),
             "title": case_item.get("title"),
             "status": case_item.get("status"),
-            "source_text": str(case_item.get("source_text", ""))[:18000],
+            "source_text": ai_source_text[:18000],
             "local_extraction": case_item.get("extracted", {}),
         },
         "series_summary": case_series_summary(all_cases),
@@ -1474,14 +1786,18 @@ def build_openai_case_content(conn: sqlite3.Connection, study_id: int, case_item
             continue
         if (content_type.startswith("text/") or Path(name).suffix.lower() in {".txt", ".csv"}) and status["multimodal_enabled"]:
             text = decoded.decode("utf-8", errors="replace")[:10000]
-            content_parts.append({"type": "input_text", "text": f"Evidence text file {name}:\n{text}"})
-            evidence_notes.append(f"{name}: text evidence included.")
+            assert_external_ai_safe(text)
+            safe_text = deidentify_for_ai(text, str(case_item.get("case_uid") or "Study participant")) if not status["phi_allowed"] else text
+            content_parts.append({"type": "input_text", "text": f"Evidence text file {name}:\n{safe_text}"})
+            evidence_notes.append(f"{name}: text evidence included after identifier safety check.")
         elif content_type.startswith("image/") and status["multimodal_enabled"] and len(decoded) <= 8 * 1024 * 1024:
             content_parts.append({"type": "input_image", "image_url": f"data:{content_type};base64,{file_row['data_base64']}"})
             evidence_notes.append(f"{name}: image sent for AI vision review.")
         elif content_type.startswith("audio/") and status["multimodal_enabled"] and len(decoded) <= 24 * 1024 * 1024:
             transcript = openai_transcribe_audio(name, content_type, decoded)
-            content_parts.append({"type": "input_text", "text": f"Audio transcript from {name}:\n{transcript[:12000]}"})
+            assert_external_ai_safe(transcript)
+            safe_transcript = deidentify_for_ai(transcript, str(case_item.get("case_uid") or "Study participant")) if not status["phi_allowed"] else transcript
+            content_parts.append({"type": "input_text", "text": f"Audio transcript from {name}:\n{safe_transcript[:12000]}"})
             evidence_notes.append(f"{name}: audio transcribed and included.")
         elif not status["multimodal_enabled"] and (content_type.startswith(("image/", "audio/", "text/")) or Path(name).suffix.lower() in {".txt", ".csv"}):
             evidence_notes.append(f"{name}: stored locally but not sent because CDS_AI_MULTIMODAL is not enabled.")
@@ -1507,7 +1823,7 @@ def openai_academic_case_review(conn: sqlite3.Connection, study_id: int, case_it
 
 
 def user_membership(conn: sqlite3.Connection, user: dict, study_id: int) -> dict | None:
-    if user.get("role") == "admin":
+    if is_super_admin(user):
         membership = row(
             conn,
             """
@@ -1546,7 +1862,10 @@ class App(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path.startswith("/api/"):
+        if parsed.path == "/healthz":
+            payload = health_payload()
+            self.send_json(payload, 200 if payload["ok"] else 503)
+        elif parsed.path.startswith("/api/"):
             self.handle_api("GET", parsed.path, parse_qs(parsed.query))
         else:
             self.serve_static(parsed.path)
@@ -1592,6 +1911,13 @@ class App(BaseHTTPRequestHandler):
 
     def send_error_json(self, message: str, status: int = 400) -> None:
         self.send_json({"error": message}, status)
+
+    def audit_context(self) -> dict:
+        return {
+            "ip_address": self.client_address[0] if self.client_address else "",
+            "user_agent": self.headers.get("user-agent", ""),
+            "request_id": self.headers.get("x-request-id", ""),
+        }
 
     def serve_static(self, path: str) -> None:
         if path in ("", "/"):
@@ -1647,7 +1973,8 @@ class App(BaseHTTPRequestHandler):
                 if path == "/api/setup" and method == "POST":
                     return self.first_run_setup(conn)
                 if path == "/api/health" and method == "GET":
-                    return self.send_json({"ok": True, "app": "Clinical Data Studio", "database": DB_PATH.exists(), "data_protection": data_protection_status(), "ai": ai_status()})
+                    payload = health_payload()
+                    return self.send_json(payload, 200 if payload["ok"] else 503)
 
                 user = self.require_user(conn)
                 if not user:
@@ -1677,10 +2004,12 @@ class App(BaseHTTPRequestHandler):
                     return self.create_study(conn, user)
                 if path == "/api/users":
                     return self.users(conn, user, method)
+                if path.startswith("/api/admin"):
+                    return self.admin_routes(conn, user, method, path)
                 if path.startswith("/api/studies/"):
                     return self.study_routes(conn, user, method, path, query)
                 if path == "/api/audit" and method == "GET":
-                    if user.get("role") != "admin":
+                    if not is_super_admin(user):
                         self.send_error_json("Admin permission required", 403)
                         return
                     return self.send_json({"audit": rows(conn, "SELECT audit_log.*, users.display_name FROM audit_log LEFT JOIN users ON users.id = audit_log.user_id ORDER BY audit_log.id DESC LIMIT 250")})
@@ -1707,14 +2036,14 @@ class App(BaseHTTPRequestHandler):
                 failed = int(user.get("failed_login_count") or 0) + 1
                 locked_until = now() + 15 * 60 if failed >= 5 else 0
                 conn.execute("UPDATE users SET failed_login_count = ?, locked_until = ? WHERE id = ?", (failed, locked_until, user["id"]))
-                audit(conn, user["id"], "failed_login", "user", user["id"], None, {"failed_login_count": failed, "locked": bool(locked_until)})
+                audit(conn, user["id"], "failed_login", "user", user["id"], None, {"failed_login_count": failed, "locked": bool(locked_until)}, **self.audit_context())
                 conn.commit()
             self.send_error_json("Invalid username or password", 401)
             return
         token = secrets.token_urlsafe(32)
         conn.execute("UPDATE users SET failed_login_count = 0, locked_until = 0 WHERE id = ?", (user["id"],))
         conn.execute("INSERT INTO sessions(token, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)", (token, user["id"], now() + 60 * 60 * 24 * 14, now()))
-        audit(conn, user["id"], "login", "session", None, None, {"username": username})
+        audit(conn, user["id"], "login", "session", None, None, {"username": username}, **self.audit_context())
         conn.commit()
         self.send_json({"token": token, "user": {"id": user["id"], "username": user["username"], "display_name": user["display_name"], "role": user["role"], "must_change_password": user.get("must_change_password", 0)}})
 
@@ -1752,7 +2081,9 @@ class App(BaseHTTPRequestHandler):
         header = self.headers.get("authorization", "")
         token = header.removeprefix("Bearer ").strip() if header.startswith("Bearer ") else ""
         if token:
+            session = row(conn, "SELECT user_id FROM sessions WHERE token = ?", (token,))
             conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+            audit(conn, session["user_id"] if session else None, "logout", "session", None, None, {"logged_out": bool(session)}, **self.audit_context())
         self.send_json({"ok": True})
 
     def user_from_api_token(self, conn: sqlite3.Connection, raw_token: str) -> tuple[dict, dict] | tuple[None, None]:
@@ -1766,6 +2097,12 @@ class App(BaseHTTPRequestHandler):
             return None, None
         conn.execute("UPDATE api_tokens SET last_used_at = ? WHERE id = ?", (now(), token_row["id"]))
         return user, token_row
+
+    def require_token_scope(self, token_row: dict, scope: str) -> bool:
+        if token_has_scope(token_row, scope):
+            return True
+        self.send_error_json(f"API token scope required: {scope}", 403)
+        return False
 
     def redcap_api(self, conn: sqlite3.Connection, method: str, query: dict[str, list[str]]) -> None:
         if method not in {"GET", "POST"}:
@@ -1791,27 +2128,41 @@ class App(BaseHTTPRequestHandler):
         if content in {"version", "api_version"}:
             return self.send_redcap_payload({"api_version": "local-redcap-style-v1", "application": "Clinical Data Studio"}, output_format)
         if content in {"project", "project_info"}:
+            if not self.require_token_scope(token_row, "metadata:read"):
+                return
             payload = row(conn, "SELECT * FROM studies WHERE id = ?", (study_id,))
             return self.send_redcap_payload(payload, output_format)
         if content in {"metadata", "data_dictionary"}:
+            if not self.require_token_scope(token_row, "metadata:read"):
+                return
             payload = self.metadata_payload(conn, study_id)["data_dictionary"]
             return self.send_redcap_payload(payload, output_format)
         if content in {"instrument", "instruments"}:
+            if not self.require_token_scope(token_row, "metadata:read"):
+                return
             payload = self.metadata_payload(conn, study_id)["instruments"]
             return self.send_redcap_payload(payload, output_format)
         if content in {"event", "events"}:
+            if not self.require_token_scope(token_row, "metadata:read"):
+                return
             payload = rows(conn, "SELECT name AS event_name, code AS unique_event_name, arm_name, day_offset FROM study_events WHERE study_id = ? ORDER BY display_order", (study_id,))
             return self.send_redcap_payload(payload, output_format)
         if content in {"arm", "arms"}:
+            if not self.require_token_scope(token_row, "metadata:read"):
+                return
             payload = self.arm_payload(conn, study_id)
             return self.send_redcap_payload(payload, output_format)
         if content in {"dag", "dags", "data_access_group", "data_access_groups"}:
+            if not self.require_token_scope(token_row, "metadata:read"):
+                return
             if not membership_has(membership, "manage_users"):
                 self.send_error_json("User management permission required", 403)
                 return
             payload = rows(conn, "SELECT code AS unique_group_name, name AS data_access_group_name FROM data_groups WHERE study_id = ? ORDER BY name", (study_id,))
             return self.send_redcap_payload(payload, output_format)
         if content in {"user", "users", "user_rights"}:
+            if not self.require_token_scope(token_row, "metadata:read"):
+                return
             if not membership_has(membership, "manage_users"):
                 self.send_error_json("User management permission required", 403)
                 return
@@ -1819,6 +2170,8 @@ class App(BaseHTTPRequestHandler):
             return self.send_redcap_payload(payload, output_format)
         if content in {"record", "records"}:
             if action == "import":
+                if not self.require_token_scope(token_row, "records:write"):
+                    return
                 if not membership_has(membership, "enter_data"):
                     self.send_error_json("Data entry permission required", 403)
                     return
@@ -1827,6 +2180,8 @@ class App(BaseHTTPRequestHandler):
                     records = json.loads(str(values.get("records", "[]")))
                     csv_text = self.records_json_to_csv(records)
                 return self.import_records_from_csv(conn, user, study_id, membership, csv_text)
+            if not self.require_token_scope(token_row, "records:read"):
+                return
             if not membership_has(membership, "export_data") and not membership_has(membership, "view_analysis"):
                 self.send_error_json("Export permission required", 403)
                 return
@@ -1834,8 +2189,12 @@ class App(BaseHTTPRequestHandler):
             return self.send_redcap_payload(payload, output_format, self.record_fieldnames(conn, study_id))
         if content == "randomization":
             if action != "allocate":
+                if not self.require_token_scope(token_row, "metadata:read"):
+                    return
                 payload = rows(conn, "SELECT * FROM randomization_lists WHERE study_id = ? AND active = 1", (study_id,))
                 return self.send_redcap_payload(payload, output_format)
+            if not self.require_token_scope(token_row, "randomization:write"):
+                return
             participant_uid = str(values.get("study_uid", "")).strip()
             list_id = int(values.get("list_id") or 0)
             participant = row(conn, "SELECT id FROM participants WHERE study_id = ? AND study_uid = ?", (study_id, participant_uid))
@@ -1951,7 +2310,7 @@ class App(BaseHTTPRequestHandler):
         return payload
 
     def visible_studies(self, conn: sqlite3.Connection, user: dict) -> list[dict]:
-        if user.get("role") == "admin":
+        if is_super_admin(user):
             return rows(conn, "SELECT * FROM studies ORDER BY updated_at DESC")
         return rows(
             conn,
@@ -1966,7 +2325,7 @@ class App(BaseHTTPRequestHandler):
         )
 
     def users(self, conn: sqlite3.Connection, user: dict, method: str) -> None:
-        if user.get("role") != "admin":
+        if not is_super_admin(user):
             self.send_error_json("Admin permission required", 403)
             return
         if method == "GET":
@@ -1979,15 +2338,15 @@ class App(BaseHTTPRequestHandler):
             display_name = str(payload.get("display_name", "")).strip() or username
             password = str(payload.get("password", "")).strip()
             role_name = str(payload.get("role", "data_entry")).strip()
-            if not username or len(password) < 8:
-                self.send_error_json("Username and password with at least 8 characters are required", 400)
+            if not username or len(password) < PASSWORD_MIN_LENGTH:
+                self.send_error_json(f"Username and password with at least {PASSWORD_MIN_LENGTH} characters are required", 400)
                 return
             if role_name not in ROLE_PERMISSIONS:
                 self.send_error_json("Unsupported role", 400)
                 return
             timestamp = now()
             cur = conn.execute(
-                "INSERT INTO users(username, password_hash, display_name, role, active, created_at) VALUES (?, ?, ?, ?, 1, ?)",
+                "INSERT INTO users(username, password_hash, display_name, role, active, must_change_password, created_at) VALUES (?, ?, ?, ?, 1, 1, ?)",
                 (username, encode_password(password), display_name, role_name, timestamp),
             )
             after = row(conn, "SELECT id, username, display_name, role, active, must_change_password, created_at FROM users WHERE id = ?", (cur.lastrowid,))
@@ -1995,6 +2354,92 @@ class App(BaseHTTPRequestHandler):
             self.send_json({"user": after}, 201)
             return
         self.send_error_json("Unsupported user operation", 405)
+
+    def admin_routes(self, conn: sqlite3.Connection, user: dict, method: str, path: str) -> None:
+        if not is_super_admin(user):
+            self.send_error_json("System admin permission required", 403)
+            return
+        parts = path.strip("/").split("/")
+        if path == "/api/admin/status" and method == "GET":
+            disk = shutil.disk_usage(ROOT)
+            self.send_json(
+                {
+                    "health": health_payload(),
+                    "disk": {"total": disk.total, "used": disk.used, "free": disk.free},
+                    "logs": {"path": str(LOG_FILE), "exists": LOG_FILE.exists()},
+                    "backups": {"directory": str(BACKUPS), "latest_backup_at": latest_backup_time()},
+                    "settings": {
+                        "environment": SETTINGS.env,
+                        "database_backend": DATABASE_BACKEND,
+                        "require_https": SETTINGS.require_https,
+                        "public_base_url": SETTINGS.public_base_url,
+                        "ai": ai_status(),
+                    },
+                }
+            )
+            return
+        if path == "/api/admin/logs" and method == "GET":
+            lines = []
+            if LOG_FILE.exists():
+                lines = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()[-500:]
+            self.send_json({"lines": [self.sanitize_log_line(item) for item in lines]})
+            return
+        if path == "/api/admin/backups" and method == "GET":
+            BACKUPS.mkdir(parents=True, exist_ok=True)
+            files = []
+            for item in sorted(BACKUPS.iterdir(), key=lambda path: path.stat().st_mtime, reverse=True):
+                if item.is_file() and item.suffix in {".sqlite3", ".cdsenc", ".dump", ".gz"}:
+                    files.append({"name": item.name, "size": item.stat().st_size, "created_at": int(item.stat().st_mtime), "encrypted": item.suffix == ".cdsenc"})
+            self.send_json({"backups": files})
+            return
+        if path == "/api/admin/backup" and method == "POST":
+            payload = self.body()
+            conn.commit()
+            backup = create_database_backup(str(payload.get("passphrase", "")) or SETTINGS.backup_passphrase)
+            audit(conn, user["id"], "create_encrypted" if backup["encrypted"] else "create", "backup", None, None, backup, **self.audit_context())
+            self.send_json({"backup": backup}, 201)
+            return
+        if len(parts) == 5 and parts[:3] == ["api", "admin", "users"] and parts[4] == "reset-password" and method == "POST":
+            target_user_id = int(parts[3])
+            payload = self.body()
+            password = str(payload.get("password", ""))
+            if len(password) < PASSWORD_MIN_LENGTH:
+                self.send_error_json(f"Temporary password must be at least {PASSWORD_MIN_LENGTH} characters", 400)
+                return
+            before = row(conn, "SELECT id, username, display_name, role, active, must_change_password FROM users WHERE id = ?", (target_user_id,))
+            if not before:
+                self.send_error_json("User not found", 404)
+                return
+            conn.execute("UPDATE users SET password_hash = ?, must_change_password = 1, failed_login_count = 0, locked_until = 0 WHERE id = ?", (encode_password(password), target_user_id))
+            after = row(conn, "SELECT id, username, display_name, role, active, must_change_password FROM users WHERE id = ?", (target_user_id,))
+            audit(conn, user["id"], "admin_reset_password", "user", target_user_id, before, after, **self.audit_context())
+            self.send_json({"user": after})
+            return
+        if len(parts) == 4 and parts[:3] == ["api", "admin", "users"] and method == "PATCH":
+            target_user_id = int(parts[3])
+            before = row(conn, "SELECT id, username, display_name, role, active, must_change_password FROM users WHERE id = ?", (target_user_id,))
+            if not before:
+                self.send_error_json("User not found", 404)
+                return
+            payload = self.body()
+            role_name = safe_role(str(payload.get("role", before["role"])))
+            if role_name not in ROLE_PERMISSIONS:
+                self.send_error_json("Unsupported role", 400)
+                return
+            active = 1 if payload.get("active", bool(before["active"])) else 0
+            must_change = 1 if payload.get("must_change_password", bool(before["must_change_password"])) else 0
+            display_name = str(payload.get("display_name", before["display_name"])).strip() or before["display_name"]
+            conn.execute("UPDATE users SET display_name = ?, role = ?, active = ?, must_change_password = ? WHERE id = ?", (display_name, role_name, active, must_change, target_user_id))
+            after = row(conn, "SELECT id, username, display_name, role, active, must_change_password FROM users WHERE id = ?", (target_user_id,))
+            audit(conn, user["id"], "update", "user", target_user_id, before, after, **self.audit_context())
+            self.send_json({"user": after})
+            return
+        self.send_error_json("Unknown admin route", 404)
+
+    def sanitize_log_line(self, line: str) -> str:
+        cleaned = re.sub(r"(password|passphrase|token|api[_-]?key|secret)=\S+", r"\1=[redacted]", line, flags=re.IGNORECASE)
+        cleaned = re.sub(r"Bearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [redacted]", cleaned)
+        return cleaned[:1000]
 
     def change_password(self, conn: sqlite3.Connection, user: dict) -> None:
         payload = self.body()
@@ -2004,8 +2449,8 @@ class App(BaseHTTPRequestHandler):
         if not stored or not verify_password(current_password, stored["password_hash"]):
             self.send_error_json("Current password is incorrect", 403)
             return
-        if len(new_password) < 8:
-            self.send_error_json("New password must be at least 8 characters", 400)
+        if len(new_password) < PASSWORD_MIN_LENGTH:
+            self.send_error_json(f"New password must be at least {PASSWORD_MIN_LENGTH} characters", 400)
             return
         conn.execute("UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?", (encode_password(new_password), user["id"]))
         audit(conn, user["id"], "change_password", "user", user["id"], None, {"user_id": user["id"]})
@@ -2017,10 +2462,11 @@ class App(BaseHTTPRequestHandler):
         if not text:
             self.send_error_json("CRF text is required", 400)
             return
-        provider = os.environ.get("CDS_AI_PROVIDER", "local").strip().lower() or "local"
+        status = ai_status()
         warnings = []
         mode = "local"
-        if provider == "openai":
+        if status["external_ai_enabled"]:
+            assert_external_ai_safe(text)
             try:
                 schema = draft_crf_schema_with_openai(text)
                 mode = "openai"
@@ -2043,6 +2489,9 @@ class App(BaseHTTPRequestHandler):
         )
 
     def create_study(self, conn: sqlite3.Connection, user: dict) -> None:
+        if not is_super_admin(user):
+            self.send_error_json("System admin permission required", 403)
+            return
         payload = self.body()
         timestamp = now()
         cur = conn.execute(
@@ -2089,6 +2538,9 @@ class App(BaseHTTPRequestHandler):
         )
         if not survey:
             self.send_error_json("Survey link not found", 404)
+            return
+        if survey.get("expires_at") and int(survey["expires_at"]) < now():
+            self.send_error_json("Survey link has expired", 410)
             return
         schema = load_json(survey["schema_json"], {"fields": []})
         if method == "GET":
@@ -2186,6 +2638,9 @@ class App(BaseHTTPRequestHandler):
                     (participant["id"], timestamp, timestamp, invitation["id"]),
                 )
                 audit(conn, None, "complete", "survey_invitation", invitation["id"], invitation, {"participant_id": participant["id"], "entry_id": entry_id})
+        if survey.get("one_time"):
+            conn.execute("UPDATE survey_links SET enabled = 0, updated_at = ? WHERE id = ?", (timestamp, survey["id"]))
+            audit(conn, None, "disable_after_use", "survey_link", survey["id"], survey, {"entry_id": entry_id})
         conn.commit()
         self.send_json({"ok": True, "participant_id": participant["id"], "entry_id": entry_id}, 201)
 
@@ -2345,22 +2800,26 @@ class App(BaseHTTPRequestHandler):
             if not membership_has(membership, "export_data"):
                 self.send_error_json("Export permission required", 403)
                 return
-            return self.export_csv(conn, study_id, membership)
+            audit(conn, user["id"], "export", "records", study_id, None, {"deidentified": membership.get("role") == "analyst"}, study_id=study_id, **self.audit_context())
+            return self.export_csv(conn, study_id, membership, query)
         if resource == "odm" and method == "GET":
             if not membership_has(membership, "export_data"):
                 self.send_error_json("Export permission required", 403)
                 return
+            audit(conn, user["id"], "export", "odm", study_id, None, {"format": "odm"}, study_id=study_id, **self.audit_context())
             return self.export_odm(conn, study_id)
         if resource == "stats-package" and method == "GET":
             if not membership_has(membership, "export_data"):
                 self.send_error_json("Export permission required", 403)
                 return
             package = (query.get("type") or ["r"])[0].lower()
+            audit(conn, user["id"], "export", "stats_package", study_id, None, {"type": package, "deidentified": membership.get("role") == "analyst"}, study_id=study_id, **self.audit_context())
             return self.export_stats_package(conn, study_id, membership, package)
         if resource == "codebook" and method == "GET":
             if not membership_has(membership, "export_data"):
                 self.send_error_json("Export permission required", 403)
                 return
+            audit(conn, user["id"], "export", "codebook", study_id, None, {"format": "csv"}, study_id=study_id, **self.audit_context())
             return self.export_codebook(conn, study_id)
         if resource == "audit" and method == "GET":
             if not membership_has(membership, "review_data"):
@@ -2383,6 +2842,7 @@ class App(BaseHTTPRequestHandler):
             if not membership_has(membership, "review_data"):
                 self.send_error_json("Review permission required", 403)
                 return
+            audit(conn, user["id"], "export", "audit", study_id, None, {"format": "csv"}, study_id=study_id, **self.audit_context())
             return self.export_audit_csv(conn, study_id)
         self.send_error_json("Unknown study route", 404)
 
@@ -2537,8 +2997,8 @@ class App(BaseHTTPRequestHandler):
             timestamp = now()
             cur = conn.execute(
                 """
-                INSERT INTO survey_links(study_id, form_id, event_id, token, title, enabled, consent_required, consent_text, created_by, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO survey_links(study_id, form_id, event_id, token, title, enabled, expires_at, one_time, consent_required, consent_text, created_by, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     study_id,
@@ -2547,6 +3007,8 @@ class App(BaseHTTPRequestHandler):
                     secrets.token_urlsafe(24),
                     str(payload.get("title", form["name"])).strip() or form["name"],
                     1,
+                    int(payload["expires_at"]) if payload.get("expires_at") else None,
+                    1 if payload.get("one_time") else 0,
                     1 if payload.get("consent_required") else 0,
                     str(payload.get("consent_text", "")).strip(),
                     user["id"],
@@ -2567,10 +3029,12 @@ class App(BaseHTTPRequestHandler):
                 return
             payload = self.body()
             conn.execute(
-                "UPDATE survey_links SET title = ?, enabled = ?, consent_required = ?, consent_text = ?, updated_at = ? WHERE id = ?",
+                "UPDATE survey_links SET title = ?, enabled = ?, expires_at = ?, one_time = ?, consent_required = ?, consent_text = ?, updated_at = ? WHERE id = ?",
                 (
                     str(payload.get("title", before["title"])).strip() or before["title"],
                     1 if payload.get("enabled", bool(before["enabled"])) else 0,
+                    int(payload["expires_at"]) if payload.get("expires_at") else None,
+                    1 if payload.get("one_time", bool(before.get("one_time", 0))) else 0,
                     1 if payload.get("consent_required", bool(before["consent_required"])) else 0,
                     str(payload.get("consent_text", before["consent_text"])).strip(),
                     now(),
@@ -3397,7 +3861,7 @@ class App(BaseHTTPRequestHandler):
                 conn,
                 """
                 SELECT api_tokens.id, api_tokens.study_id, api_tokens.user_id, api_tokens.label, api_tokens.active,
-                       api_tokens.created_at, api_tokens.last_used_at, users.username, users.display_name
+                       api_tokens.scopes_json, api_tokens.created_at, api_tokens.last_used_at, users.username, users.display_name
                 FROM api_tokens
                 JOIN users ON users.id = api_tokens.user_id
                 WHERE api_tokens.study_id = ?
@@ -3405,6 +3869,8 @@ class App(BaseHTTPRequestHandler):
                 """,
                 (study_id,),
             )
+            for token_row in token_rows:
+                token_row["scopes"] = sorted(parse_token_scopes(token_row.pop("scopes_json", "[]")))
             self.send_json({"tokens": token_rows})
             return
         if method == "POST":
@@ -3414,27 +3880,47 @@ class App(BaseHTTPRequestHandler):
                 self.send_error_json("User not found", 404)
                 return
             label = str(payload.get("label", "API token")).strip() or "API token"
+            scopes = payload.get("scopes") or DEFAULT_API_TOKEN_SCOPES
+            if isinstance(scopes, str):
+                scopes = [part.strip() for part in scopes.replace(",", " ").split() if part.strip()]
+            scopes = sorted({scope for scope in scopes if scope in API_TOKEN_SCOPES})
+            if not scopes:
+                self.send_error_json("At least one valid API token scope is required", 400)
+                return
             raw_token = f"cds_{secrets.token_urlsafe(32)}"
             timestamp = now()
             cur = conn.execute(
-                "INSERT INTO api_tokens(study_id, user_id, token_hash, label, active, created_at) VALUES (?, ?, ?, ?, 1, ?)",
-                (study_id, user_id, token_digest(raw_token), label, timestamp),
+                "INSERT INTO api_tokens(study_id, user_id, token_hash, label, scopes_json, active, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)",
+                (study_id, user_id, token_digest(raw_token), label, json.dumps(scopes), timestamp),
             )
-            after = row(conn, "SELECT id, study_id, user_id, label, active, created_at, last_used_at FROM api_tokens WHERE id = ?", (cur.lastrowid,))
+            after = row(conn, "SELECT id, study_id, user_id, label, scopes_json, active, created_at, last_used_at FROM api_tokens WHERE id = ?", (cur.lastrowid,))
+            after["scopes"] = sorted(parse_token_scopes(after.pop("scopes_json", "[]")))
             audit(conn, user["id"], "create", "api_token", cur.lastrowid, None, after)
             conn.commit()
             self.send_json({"token": raw_token, "record": after}, 201)
             return
         if method == "PATCH" and len(parts) == 5:
             token_id = int(parts[4])
-            before = row(conn, "SELECT id, study_id, user_id, label, active, created_at, last_used_at FROM api_tokens WHERE id = ? AND study_id = ?", (token_id, study_id))
+            before = row(conn, "SELECT id, study_id, user_id, label, scopes_json, active, created_at, last_used_at FROM api_tokens WHERE id = ? AND study_id = ?", (token_id, study_id))
             if not before:
                 self.send_error_json("API token not found", 404)
                 return
             payload = self.body()
             active = 1 if payload.get("active", bool(before["active"])) else 0
-            conn.execute("UPDATE api_tokens SET active = ? WHERE id = ?", (active, token_id))
-            after = row(conn, "SELECT id, study_id, user_id, label, active, created_at, last_used_at FROM api_tokens WHERE id = ?", (token_id,))
+            scopes = before["scopes_json"]
+            if "scopes" in payload:
+                requested = payload.get("scopes") or []
+                if isinstance(requested, str):
+                    requested = [part.strip() for part in requested.replace(",", " ").split() if part.strip()]
+                normalized = sorted({scope for scope in requested if scope in API_TOKEN_SCOPES})
+                if not normalized:
+                    self.send_error_json("At least one valid API token scope is required", 400)
+                    return
+                scopes = json.dumps(normalized)
+            conn.execute("UPDATE api_tokens SET active = ?, scopes_json = ? WHERE id = ?", (active, scopes, token_id))
+            after = row(conn, "SELECT id, study_id, user_id, label, scopes_json, active, created_at, last_used_at FROM api_tokens WHERE id = ?", (token_id,))
+            before["scopes"] = sorted(parse_token_scopes(before.pop("scopes_json", "[]")))
+            after["scopes"] = sorted(parse_token_scopes(after.pop("scopes_json", "[]")))
             audit(conn, user["id"], "update", "api_token", token_id, before, after)
             conn.commit()
             self.send_json({"token": after})
@@ -3905,10 +4391,16 @@ class App(BaseHTTPRequestHandler):
             }
         )
 
-    def export_csv(self, conn, study_id: int, membership) -> None:
-        return self.export_entries_csv(conn, study_id, membership, {}, "clinical_data_export.csv")
+    def export_csv(self, conn, study_id: int, membership, query: dict[str, list[str]] | None = None) -> None:
+        deidentified = membership.get("role") == "analyst"
+        if query:
+            value = (query.get("deidentified") or query.get("deidentified_export") or [""])[0].strip().lower()
+            deidentified = deidentified or value in {"1", "true", "yes", "on"}
+        filename = "clinical_data_deidentified_export.csv" if deidentified else "clinical_data_export.csv"
+        return self.export_entries_csv(conn, study_id, membership, {"deidentified": deidentified}, filename)
 
     def record_payload(self, conn, study_id: int, membership, filters: dict) -> list[dict]:
+        deidentified = bool(filters.get("deidentified")) or membership.get("role") == "analyst"
         forms = rows(conn, "SELECT * FROM forms WHERE study_id = ? ORDER BY id", (study_id,))
         field_codes = []
         for form in forms:
@@ -3943,11 +4435,13 @@ class App(BaseHTTPRequestHandler):
             ORDER BY participants.study_uid, study_events.display_order, forms.id
         """
         payload = []
+        export_ids: dict[int, str] = {}
         for entry in rows(conn, sql, tuple(params)):
             data = load_json(entry["data_json"], {})
+            export_ids.setdefault(entry["participant_id"], f"EXP{len(export_ids) + 1:05d}")
             record = {
-                "study_uid": entry["study_uid"],
-                "initials": entry["initials"],
+                "study_uid": export_ids[entry["participant_id"]] if deidentified else entry["study_uid"],
+                "initials": "" if deidentified else entry["initials"],
                 "participant_status": entry["participant_status"],
                 "event_name": entry.get("mapped_event_name") or entry["event_name"],
                 "event_code": entry.get("event_code") or entry["event_name"],
@@ -3958,7 +4452,8 @@ class App(BaseHTTPRequestHandler):
             }
             for code in field_codes:
                 prefix, field_code = code.split("__", 1)
-                record[code] = data.get(field_code, "") if prefix == entry["form_code"] else ""
+                value = data.get(field_code, "") if prefix == entry["form_code"] else ""
+                record[code] = deidentify_for_ai(str(value), record["study_uid"]) if deidentified and isinstance(value, str) else value
             payload.append(record)
         return payload
 
@@ -3976,6 +4471,7 @@ class App(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("content-type", "text/csv; charset=utf-8")
         self.send_header("content-disposition", f"attachment; filename={filename}")
+        self.send_header("x-cds-deidentified-export", "1" if filters.get("deidentified") or membership.get("role") == "analyst" else "0")
         self.send_header("content-length", str(len(content)))
         self.end_headers()
         self.wfile.write(content)
@@ -4111,30 +4607,15 @@ class App(BaseHTTPRequestHandler):
             return
         if method == "POST" and len(parts) == 4:
             payload = self.body()
-            timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
             conn.commit()
-            passphrase = str(payload.get("passphrase", ""))
-            if passphrase:
-                target = BACKUPS / f"study_{study_id}_{timestamp}.cdsenc"
-                with tempfile.NamedTemporaryFile(delete=False, dir=BACKUPS, suffix=".sqlite3") as temporary:
-                    plain_target = Path(temporary.name)
-                try:
-                    write_sqlite_backup(conn, plain_target)
-                    target.write_bytes(encrypted_archive_bytes(plain_target.read_bytes(), passphrase))
-                finally:
-                    if plain_target.exists():
-                        plain_target.unlink()
-                audit(conn, user["id"], "create_encrypted", "backup", study_id, None, {"filename": target.name})
-                self.send_json({"backup": {"name": target.name, "size": target.stat().st_size, "created_at": int(target.stat().st_mtime), "encrypted": True}}, 201)
-                return
-            target = BACKUPS / f"study_{study_id}_{timestamp}.sqlite3"
-            write_sqlite_backup(conn, target)
-            audit(conn, user["id"], "create", "backup", study_id, None, {"filename": target.name})
-            self.send_json({"backup": {"name": target.name, "size": target.stat().st_size, "created_at": int(target.stat().st_mtime), "encrypted": False}}, 201)
+            passphrase = str(payload.get("passphrase", "")) or SETTINGS.backup_passphrase
+            backup = create_database_backup(passphrase, study_id)
+            audit(conn, user["id"], "create_encrypted" if backup["encrypted"] else "create", "backup", study_id, None, {"filename": backup["name"], "backend": backup["backend"]}, study_id=study_id, **self.audit_context())
+            self.send_json({"backup": backup}, 201)
             return
         if method == "GET" and len(parts) == 5:
             filename = Path(parts[4]).name
-            if not filename.startswith(f"study_{study_id}_") or not (filename.endswith(".sqlite3") or filename.endswith(".cdsenc")):
+            if not filename.startswith(f"study_{study_id}_") or not (filename.endswith(".sqlite3") or filename.endswith(".cdsenc") or filename.endswith(".dump")):
                 self.send_error_json("Backup not found", 404)
                 return
             target = (BACKUPS / filename).resolve()
@@ -4152,35 +4633,16 @@ class App(BaseHTTPRequestHandler):
         if method == "POST" and len(parts) == 6 and parts[5] == "restore":
             payload = self.body()
             filename = Path(parts[4]).name
-            if not filename.startswith(f"study_{study_id}_") or not (filename.endswith(".sqlite3") or filename.endswith(".cdsenc")):
+            if not filename.startswith(f"study_{study_id}_") or not (filename.endswith(".sqlite3") or filename.endswith(".cdsenc") or filename.endswith(".dump")):
                 self.send_error_json("Backup not found", 404)
                 return
             target = (BACKUPS / filename).resolve()
             if not str(target).startswith(str(BACKUPS.resolve())) or not target.exists():
                 self.send_error_json("Backup not found", 404)
                 return
-            restore_target = target
-            cleanup_target = None
-            if filename.endswith(".cdsenc"):
-                passphrase = str(payload.get("passphrase", ""))
-                if not passphrase:
-                    self.send_error_json("Encrypted backup passphrase is required", 400)
-                    return
-                with tempfile.NamedTemporaryFile(delete=False, dir=BACKUPS, suffix=".sqlite3") as temporary:
-                    temporary.write(decrypted_archive_bytes(target.read_bytes(), passphrase))
-                    cleanup_target = Path(temporary.name)
-                    restore_target = cleanup_target
-            try:
-                source = sqlite3.connect(restore_target)
-                try:
-                    source.backup(conn)
-                finally:
-                    source.close()
-            finally:
-                if cleanup_target and cleanup_target.exists():
-                    cleanup_target.unlink()
-            audit(conn, user["id"], "restore", "backup", study_id, None, {"filename": filename})
-            self.send_json({"restored": filename})
+            result = restore_database_backup(target, str(payload.get("passphrase", "")) or SETTINGS.backup_passphrase)
+            audit(conn, user["id"], "restore", "backup", study_id, None, {"filename": filename, "backend": result["backend"]}, study_id=study_id, **self.audit_context())
+            self.send_json(result)
             return
         self.send_error_json("Unsupported backup operation", 405)
 
@@ -4233,11 +4695,96 @@ class App(BaseHTTPRequestHandler):
         self.wfile.write(content)
 
 
+def validate_startup() -> None:
+    if SETTINGS.production:
+        if not SETTINGS.secret_key or len(SETTINGS.secret_key) < 32 or SETTINGS.secret_key in {"change-me", "please-change-me"}:
+            raise RuntimeError("Production startup refused: set CDS_SECRET_KEY to a long random value.")
+        if not SETTINGS.admin_password or len(SETTINGS.admin_password) < PRODUCTION_ADMIN_PASSWORD_MIN_LENGTH or SETTINGS.admin_password == "admin123":
+            raise RuntimeError("Production startup refused: set CDS_ADMIN_PASSWORD to a strong non-default value.")
+        if HOST in {"0.0.0.0", "::"}:
+            LOGGER.warning("Clinical Data Studio is bound to all network interfaces in production. Use HTTPS and a firewall.")
+        if SETTINGS.require_https and SETTINGS.public_base_url and not SETTINGS.public_base_url.startswith("https://"):
+            raise RuntimeError("Production startup refused: CDS_REQUIRE_HTTPS=true but CDS_PUBLIC_BASE_URL is not HTTPS.")
+    elif HOST in {"0.0.0.0", "::"}:
+        raise RuntimeError("Development startup refused: public binding is allowed only with CDS_ENV=production.")
+
+
+def create_admin_from_env() -> dict:
+    password = SETTINGS.admin_password
+    if len(password) < PRODUCTION_ADMIN_PASSWORD_MIN_LENGTH:
+        raise RuntimeError("CDS_ADMIN_PASSWORD must be at least 12 characters for create-admin.")
+    force_reset = os.environ.get("CDS_FORCE_ADMIN_RESET", "").strip().lower() in {"1", "true", "yes", "on"}
+    with closing(db()) as conn, conn:
+        migrate()
+        existing = row(conn, "SELECT id, username, display_name, role, active, must_change_password FROM users WHERE username = ?", (SETTINGS.admin_username,))
+        timestamp = now()
+        if existing:
+            if not force_reset:
+                return existing
+            conn.execute(
+                "UPDATE users SET password_hash = ?, display_name = ?, role = 'super_admin', active = 1, must_change_password = 0 WHERE id = ?",
+                (encode_password(password), SETTINGS.admin_display_name, existing["id"]),
+            )
+            after = row(conn, "SELECT id, username, display_name, role, active, must_change_password FROM users WHERE id = ?", (existing["id"],))
+            audit(conn, None, "create_admin", "user", existing["id"], existing, after)
+            return after
+        cur = conn.execute(
+            "INSERT INTO users(username, password_hash, display_name, role, active, must_change_password, created_at) VALUES (?, ?, ?, 'super_admin', 1, 0, ?)",
+            (SETTINGS.admin_username, encode_password(password), SETTINGS.admin_display_name, timestamp),
+        )
+        after = row(conn, "SELECT id, username, display_name, role, active, must_change_password FROM users WHERE id = ?", (cur.lastrowid,))
+        audit(conn, None, "create_admin", "user", cur.lastrowid, None, after)
+        return after
+
+
+def cli_restore(path_arg: str) -> dict:
+    backup_path = Path(path_arg)
+    if not backup_path.is_absolute():
+        backup_path = BACKUPS / backup_path
+    return restore_database_backup(backup_path, SETTINGS.backup_passphrase)
+
+
+def handle_cli(argv: list[str]) -> bool:
+    if len(argv) <= 1:
+        return False
+    command = argv[1].strip().lower()
+    if command == "migrate":
+        validate_startup()
+        migrate()
+        print("Migrations complete.")
+        return True
+    if command == "create-admin":
+        user = create_admin_from_env()
+        print(json.dumps({"created_or_updated": user}, indent=2))
+        return True
+    if command == "healthcheck":
+        payload = health_payload()
+        print(json.dumps(payload, indent=2))
+        raise SystemExit(0 if payload["ok"] else 1)
+    if command == "backup":
+        backup = create_database_backup(SETTINGS.backup_passphrase)
+        print(json.dumps({"backup": backup}, indent=2))
+        return True
+    if command == "restore":
+        if len(argv) < 3:
+            raise SystemExit("Usage: python server.py restore <backup_file>")
+        result = cli_restore(argv[2])
+        print(json.dumps(result, indent=2))
+        return True
+    return False
+
+
 def main() -> None:
+    if handle_cli(sys.argv):
+        return
+    validate_startup()
     migrate()
     server = ThreadingHTTPServer((HOST, PORT), App)
-    print(f"Clinical Data Studio running at http://127.0.0.1:{PORT}")
-    print("Use this computer's Wi-Fi IP address from phones on the same network.")
+    scheme = "https" if SETTINGS.require_https and SETTINGS.public_base_url.startswith("https://") else "http"
+    display_host = HOST if HOST not in {"0.0.0.0", "::"} else "your-server-ip"
+    LOGGER.info("Clinical Data Studio running at %s://%s:%s", scheme, display_host, PORT)
+    if HOST in {"0.0.0.0", "::"}:
+        LOGGER.warning("Public network binding is enabled. Keep HTTPS, backups, firewall, and named user accounts active.")
     server.serve_forever()
 
 

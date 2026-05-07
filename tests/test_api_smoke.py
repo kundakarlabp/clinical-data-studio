@@ -59,6 +59,9 @@ class ApiSmokeTests(unittest.TestCase):
     def test_health_login_summary_and_encrypted_backup(self):
         health = self.request_json("/api/health")
         self.assertTrue(health["ok"])
+        healthz = self.request_json("/healthz")
+        self.assertTrue(healthz["ok"])
+        self.assertEqual(healthz["database_backend"], "sqlite")
         self.assertIn("data_folder_encrypted", health["data_protection"])
         self.assertFalse(health["ai"]["external_ai_enabled"])
 
@@ -98,6 +101,18 @@ class ApiSmokeTests(unittest.TestCase):
             token,
         )
         self.assertEqual(restored["restored"], backup["name"])
+
+    def test_admin_status_and_system_backup(self):
+        login = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})
+        token = login["token"]
+        status = self.request_json("/api/admin/status", token=token)
+        self.assertTrue(status["health"]["ok"])
+        self.assertEqual(status["settings"]["database_backend"], "sqlite")
+        logs = self.request_json("/api/admin/logs", token=token)
+        self.assertIn("lines", logs)
+        backup = self.request_json("/api/admin/backup", "POST", {"passphrase": "LongLocalPassphrase123"}, token)["backup"]
+        self.assertTrue(backup["encrypted"])
+        self.assertTrue(backup["name"].startswith("system_"))
 
     def test_short_archive_passphrase_is_rejected(self):
         token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]
@@ -353,6 +368,73 @@ class ApiSmokeTests(unittest.TestCase):
             denied.close()
         else:
             self.fail("Revoked token should be rejected")
+
+    def test_rbac_and_api_token_scope_enforcement(self):
+        admin_login = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})
+        admin_token = admin_login["token"]
+        study_id = self.request_json("/api/studies", token=admin_token)["studies"][0]["id"]
+        data_user = self.request_json(
+            "/api/users",
+            "POST",
+            {"username": "entry.user", "display_name": "Entry User", "password": "Temporary12345", "role": "data_entry"},
+            admin_token,
+        )["user"]
+        analyst_user = self.request_json(
+            "/api/users",
+            "POST",
+            {"username": "analyst.user", "display_name": "Analyst User", "password": "Temporary12345", "role": "analyst"},
+            admin_token,
+        )["user"]
+        self.request_json(f"/api/studies/{study_id}/memberships", "POST", {"user_id": data_user["id"], "role": "data_entry", "active": True}, admin_token)
+        self.request_json(f"/api/studies/{study_id}/memberships", "POST", {"user_id": analyst_user["id"], "role": "analyst", "active": True}, admin_token)
+
+        entry_token = self.request_json("/api/login", "POST", {"username": "entry.user", "password": "Temporary12345"})["token"]
+        created = self.request_json(
+            f"/api/studies/{study_id}/participants",
+            "POST",
+            {"study_uid": "RBAC001", "initials": "RB", "status": "enrolled"},
+            entry_token,
+        )["participant"]
+        self.assertEqual(created["study_uid"], "RBAC001")
+        form_id = self.request_json(f"/api/studies/{study_id}/forms", token=entry_token)["forms"][0]["id"]
+        self.request_json(
+            f"/api/studies/{study_id}/entries",
+            "POST",
+            {
+                "participant_id": created["id"],
+                "form_id": form_id,
+                "status": "complete",
+                "data": {"age": "44", "sex": "Male", "consent_date": "2026-05-07", "diagnosis": "RBAC test"},
+            },
+            entry_token,
+        )
+        with self.assertRaises(HTTPError) as export_denied:
+            self.request_raw(f"/api/studies/{study_id}/export", token=entry_token)
+        self.assertEqual(export_denied.exception.code, 403)
+        export_denied.exception.close()
+
+        analyst_token = self.request_json("/api/login", "POST", {"username": "analyst.user", "password": "Temporary12345"})["token"]
+        with self.assertRaises(HTTPError) as edit_denied:
+            self.request_json(f"/api/studies/{study_id}/participants", "POST", {"study_uid": "RBAC002"}, analyst_token)
+        self.assertEqual(edit_denied.exception.code, 403)
+        edit_denied.exception.close()
+        status, content_type, body = self.request_raw(f"/api/studies/{study_id}/export", token=analyst_token)
+        self.assertEqual(status, 200)
+        self.assertIn("text/csv", content_type)
+        self.assertIn(b"EXP00001", body)
+
+        scoped_token = self.request_json(
+            f"/api/studies/{study_id}/api-tokens",
+            "POST",
+            {"user_id": admin_login["user"]["id"], "label": "metadata only", "scopes": ["metadata:read"]},
+            admin_token,
+        )["token"]
+        metadata = self.request_json(f"/api/redcap?token={scoped_token}&content=metadata&format=json")
+        self.assertTrue(metadata)
+        with self.assertRaises(HTTPError) as scoped_denied:
+            self.request_json(f"/api/redcap?token={scoped_token}&content=record&format=json")
+        self.assertEqual(scoped_denied.exception.code, 403)
+        scoped_denied.exception.close()
 
 
 if __name__ == "__main__":

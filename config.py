@@ -48,6 +48,8 @@ class Settings:
     public_base_url: str
     data_dir: Path
     backup_dir: Path
+    upload_dir: Path
+    max_upload_mb: int
     backup_passphrase: str
     ai_provider: str
     ai_enabled: bool
@@ -99,6 +101,8 @@ def load_settings() -> Settings:
         public_base_url=os.environ.get("CDS_PUBLIC_BASE_URL", "").strip(),
         data_dir=data_dir,
         backup_dir=backup_dir,
+        upload_dir=env_path("CDS_UPLOAD_DIR", ROOT / "uploads"),
+        max_upload_mb=int(os.environ.get("CDS_MAX_UPLOAD_MB", "24")),
         backup_passphrase=os.environ.get("CDS_BACKUP_PASSPHRASE", "").strip(),
         ai_provider=os.environ.get("CDS_AI_PROVIDER", "local").strip().lower() or "local",
         ai_enabled=env_bool("CDS_AI_ENABLED", False),
@@ -109,4 +113,3 @@ def load_settings() -> Settings:
         admin_password=os.environ.get("CDS_ADMIN_PASSWORD", "").strip(),
         admin_display_name=os.environ.get("CDS_ADMIN_DISPLAY_NAME", "Administrator").strip() or "Administrator",
     )
-

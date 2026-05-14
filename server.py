@@ -38,6 +38,7 @@ STATIC = ROOT / "static"
 SETTINGS = load_settings()
 DATA = SETTINGS.data_dir
 BACKUPS = SETTINGS.backup_dir
+UPLOADS = SETTINGS.upload_dir
 DB_PATH = SETTINGS.sqlite_path
 DATABASE_BACKEND = SETTINGS.database_backend
 DATABASE_URL = SETTINGS.database_url
@@ -150,6 +151,7 @@ def now() -> int:
 def db() -> sqlite3.Connection:
     DATA.mkdir(parents=True, exist_ok=True)
     BACKUPS.mkdir(parents=True, exist_ok=True)
+    UPLOADS.mkdir(parents=True, exist_ok=True)
     return connect_database(DATABASE_BACKEND, DB_PATH, DATABASE_URL)
 
 
@@ -465,6 +467,46 @@ def backup_files_for_study(study_id: int) -> list[dict]:
     return files
 
 
+def allowed_evidence_content_type(content_type: str, filename: str) -> bool:
+    suffix = Path(filename).suffix.lower()
+    return (
+        content_type.startswith("image/")
+        or content_type.startswith("audio/")
+        or content_type in {"application/pdf", "text/plain", "text/csv", "application/csv"}
+        or suffix in {".pdf", ".txt", ".csv"}
+    )
+
+
+def case_upload_dir(study_id: int, case_id: int) -> Path:
+    target = UPLOADS / "studies" / str(study_id) / "cases" / str(case_id)
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def stored_case_file_path(study_id: int, case_id: int, stored_filename: str) -> Path:
+    target = (UPLOADS / "studies" / str(study_id) / "cases" / str(case_id) / stored_filename).resolve()
+    root = (UPLOADS / "studies" / str(study_id) / "cases" / str(case_id)).resolve()
+    if not str(target).startswith(str(root)) or not target.exists():
+        raise FileNotFoundError("Case evidence file not found on disk")
+    return target
+
+
+def case_file_content(file_row: dict) -> bytes:
+    if file_row.get("data_base64"):
+        return base64.b64decode(file_row["data_base64"], validate=True)
+    stored_filename = file_row.get("stored_filename", "")
+    if not stored_filename:
+        raise FileNotFoundError("Case evidence file is missing stored filename")
+    return stored_case_file_path(file_row["study_id"], file_row["case_id"], stored_filename).read_bytes()
+
+
+def stored_case_filename(original_name: str) -> str:
+    suffix = Path(original_name).suffix.lower()
+    if suffix and not re.match(r"^\.[a-z0-9]{1,12}$", suffix):
+        suffix = ""
+    return f"{now()}_{secrets.token_hex(12)}{suffix}"
+
+
 def setup_required(conn: sqlite3.Connection) -> bool:
     default_admin = row(conn, "SELECT password_hash FROM users WHERE username = 'admin' AND active = 1")
     return bool(default_admin and verify_password("admin123", default_admin["password_hash"]))
@@ -627,6 +669,9 @@ def migrate() -> None:
             add_column(conn, "survey_links", "expires_at", "BIGINT")
             add_column(conn, "survey_links", "one_time", "INTEGER NOT NULL DEFAULT 0")
             add_column(conn, "academic_cv_items", "active", "INTEGER NOT NULL DEFAULT 1")
+            add_column(conn, "case_files", "original_filename", "TEXT NOT NULL DEFAULT ''")
+            add_column(conn, "case_files", "stored_filename", "TEXT NOT NULL DEFAULT ''")
+            add_column(conn, "case_files", "sha256", "TEXT NOT NULL DEFAULT ''")
             seed_initial_data(conn)
             return
         conn.executescript(
@@ -887,8 +932,11 @@ def migrate() -> None:
                 case_id INTEGER NOT NULL REFERENCES case_intakes(id) ON DELETE CASCADE,
                 study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
                 name TEXT NOT NULL,
+                original_filename TEXT NOT NULL DEFAULT '',
+                stored_filename TEXT NOT NULL DEFAULT '',
                 content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
                 size INTEGER NOT NULL DEFAULT 0,
+                sha256 TEXT NOT NULL DEFAULT '',
                 data_base64 TEXT NOT NULL DEFAULT '',
                 created_by INTEGER REFERENCES users(id),
                 created_at INTEGER NOT NULL
@@ -978,6 +1026,9 @@ def migrate() -> None:
         add_column(conn, "survey_links", "expires_at", "INTEGER")
         add_column(conn, "survey_links", "one_time", "INTEGER NOT NULL DEFAULT 0")
         add_column(conn, "academic_cv_items", "active", "INTEGER NOT NULL DEFAULT 1")
+        add_column(conn, "case_files", "original_filename", "TEXT NOT NULL DEFAULT ''")
+        add_column(conn, "case_files", "stored_filename", "TEXT NOT NULL DEFAULT ''")
+        add_column(conn, "case_files", "sha256", "TEXT NOT NULL DEFAULT ''")
         migrate_entries_unique_key(conn)
         seed_initial_data(conn)
         add_production_indexes(conn)
@@ -1925,9 +1976,9 @@ def build_openai_case_content(conn: sqlite3.Connection, study_id: int, case_item
         name = file_row["name"]
         content_type = file_row["content_type"] or mimetypes.guess_type(name)[0] or "application/octet-stream"
         try:
-            decoded = base64.b64decode(file_row["data_base64"], validate=True)
+            decoded = case_file_content(file_row)
         except Exception:
-            evidence_notes.append(f"{name}: could not decode stored evidence.")
+            evidence_notes.append(f"{name}: could not read stored evidence.")
             continue
         if (content_type.startswith("text/") or Path(name).suffix.lower() in {".txt", ".csv"}) and status["multimodal_enabled"]:
             text = decoded.decode("utf-8", errors="replace")[:10000]
@@ -1936,7 +1987,8 @@ def build_openai_case_content(conn: sqlite3.Connection, study_id: int, case_item
             content_parts.append({"type": "input_text", "text": f"Evidence text file {name}:\n{safe_text}"})
             evidence_notes.append(f"{name}: text evidence included after identifier safety check.")
         elif content_type.startswith("image/") and status["multimodal_enabled"] and len(decoded) <= 8 * 1024 * 1024:
-            content_parts.append({"type": "input_image", "image_url": f"data:{content_type};base64,{file_row['data_base64']}"})
+            image_base64 = base64.b64encode(decoded).decode("ascii")
+            content_parts.append({"type": "input_image", "image_url": f"data:{content_type};base64,{image_base64}"})
             evidence_notes.append(f"{name}: image sent for AI vision review.")
         elif content_type.startswith("audio/") and status["multimodal_enabled"] and len(decoded) <= 24 * 1024 * 1024:
             transcript = openai_transcribe_audio(name, content_type, decoded)
@@ -3683,7 +3735,16 @@ class App(BaseHTTPRequestHandler):
         payload = dict(case)
         payload["extracted"] = load_json(payload.pop("extracted_json", "{}"), {})
         payload["tags"] = load_json(payload.pop("tags_json", "[]"), [])
-        payload["files"] = rows(conn, "SELECT id, name, content_type, size, created_at FROM case_files WHERE case_id = ? ORDER BY id", (case["id"],))
+        payload["files"] = rows(
+            conn,
+            """
+            SELECT id, name, original_filename, content_type, size, sha256, created_at
+            FROM case_files
+            WHERE case_id = ?
+            ORDER BY id
+            """,
+            (case["id"],),
+        )
         reviews = rows(
             conn,
             "SELECT id, user_prompt, mode, response_json, file_count, created_by, created_at FROM case_ai_reviews WHERE case_id = ? ORDER BY id DESC LIMIT 5",
@@ -3703,25 +3764,49 @@ class App(BaseHTTPRequestHandler):
         if len(files) > 8:
             raise ValueError("Upload at most 8 evidence files for one case")
         total_size = 0
+        max_file_bytes = SETTINGS.max_upload_mb * 1024 * 1024
+        max_total_bytes = max_file_bytes * 3
         for item in files:
             name = Path(str(item.get("name", "case_evidence"))).name[:160] or "case_evidence"
             content_type = str(item.get("type") or item.get("content_type") or mimetypes.guess_type(name)[0] or "application/octet-stream")[:120]
             data_base64 = str(item.get("data", ""))
             if not data_base64:
                 continue
+            if not allowed_evidence_content_type(content_type, name):
+                raise ValueError(f"Evidence file {name} type is not allowed")
             try:
                 decoded = base64.b64decode(data_base64, validate=True)
             except Exception as exc:
                 raise ValueError(f"Evidence file {name} is not valid base64") from exc
-            size = int(item.get("size") or len(decoded))
-            if len(decoded) > 8 * 1024 * 1024:
-                raise ValueError(f"Evidence file {name} is larger than 8 MB")
+            size = len(decoded)
+            if len(decoded) > max_file_bytes:
+                raise ValueError(f"Evidence file {name} is larger than {SETTINGS.max_upload_mb} MB")
             total_size += len(decoded)
-            if total_size > 24 * 1024 * 1024:
-                raise ValueError("Total evidence upload for one case must stay under 24 MB")
-            conn.execute(
-                "INSERT INTO case_files(case_id, study_id, name, content_type, size, data_base64, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (case_id, study_id, name, content_type, size, data_base64, user_id, now()),
+            if total_size > max_total_bytes:
+                raise ValueError(f"Total evidence upload for one case must stay under {SETTINGS.max_upload_mb * 3} MB")
+            sha256 = hashlib.sha256(decoded).hexdigest()
+            stored_filename = stored_case_filename(name)
+            stored_path = case_upload_dir(study_id, case_id) / stored_filename
+            stored_path.write_bytes(decoded)
+            cur = conn.execute(
+                """
+                INSERT INTO case_files(
+                    case_id, study_id, name, original_filename, stored_filename,
+                    content_type, size, sha256, data_base64, created_by, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
+                """,
+                (case_id, study_id, name, name, stored_filename, content_type, size, sha256, user_id, now()),
+            )
+            audit(
+                conn,
+                user_id,
+                "upload",
+                "case_file",
+                cur.lastrowid,
+                None,
+                {"case_id": case_id, "name": name, "content_type": content_type, "size": size, "sha256": sha256},
+                study_id=study_id,
             )
 
     def case_intake(self, conn, user, method, study_id, parts, membership) -> None:
@@ -3741,9 +3826,15 @@ class App(BaseHTTPRequestHandler):
             if not file_row:
                 self.send_error_json("Case evidence file not found", 404)
                 return
-            content = base64.b64decode(file_row["data_base64"])
+            try:
+                content = case_file_content(file_row)
+            except Exception:
+                self.send_error_json("Case evidence file content is unavailable", 404)
+                return
+            audit(conn, user["id"], "download", "case_file", file_id, None, {"case_id": case_id, "name": file_row["name"]}, study_id=study_id, **self.audit_context())
+            conn.commit()
             self.send_response(200)
-            self.send_header("content-type", file_row["content_type"])
+            self.send_header("content-type", file_row["content_type"] or "application/octet-stream")
             self.send_header("content-disposition", f"attachment; filename={Path(file_row['name']).name}")
             self.send_header("content-length", str(len(content)))
             self.end_headers()

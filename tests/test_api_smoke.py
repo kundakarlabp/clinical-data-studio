@@ -17,9 +17,11 @@ class ApiSmokeTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.original_data = server.DATA
         self.original_backups = server.BACKUPS
+        self.original_uploads = server.UPLOADS
         self.original_db = server.DB_PATH
         server.DATA = Path(self.tmp.name)
         server.BACKUPS = server.DATA / "backups"
+        server.UPLOADS = server.DATA / "uploads"
         server.DB_PATH = server.DATA / "smoke.sqlite3"
         server.migrate()
         with closing(server.db()) as conn, conn:
@@ -35,6 +37,7 @@ class ApiSmokeTests(unittest.TestCase):
         self.thread.join(timeout=5)
         server.DATA = self.original_data
         server.BACKUPS = self.original_backups
+        server.UPLOADS = self.original_uploads
         server.DB_PATH = self.original_db
         self.tmp.cleanup()
 
@@ -240,6 +243,12 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertEqual(created["case_uid"], "CASE-RETRO-001")
         self.assertEqual(created["extracted"]["demographics"]["age"], "42")
         self.assertTrue(created["files"])
+        self.assertEqual(created["files"][0]["sha256"], "627a6c2140448938132bb2441d164fb27a07312738406eed9a76bd31b61a0f8f")
+        with closing(server.db()) as conn:
+            file_record = server.row(conn, "SELECT * FROM case_files WHERE id = ?", (created["files"][0]["id"],))
+            self.assertTrue(file_record["stored_filename"])
+            self.assertFalse(file_record["data_base64"])
+            self.assertTrue((server.UPLOADS / "studies" / str(study_id) / "cases" / str(created["id"]) / file_record["stored_filename"]).exists())
         _, file_type, file_body = self.request_raw(f"/api/studies/{study_id}/case-intake/{created['id']}/files/{created['files'][0]['id']}", token=token)
         self.assertIn("text/plain", file_type)
         self.assertEqual(file_body, b"case note")

@@ -156,9 +156,30 @@ class CoreEdcTests(unittest.TestCase):
             server.SETTINGS = replace(original_settings, ai_provider="openai", ai_enabled=True, ai_allow_phi=False)
             with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}, clear=False):
                 with self.assertRaises(ValueError):
-                    server.assert_external_ai_safe("Patient name: John Doe\nPhone: 9999999999")
+                    server.assert_external_ai_safe("Patient name: John Doe\nPhone: 9999999999\nDOB: 01/02/1960")
         finally:
             server.SETTINGS = original_settings
+
+    def test_ai_safety_deidentifies_common_identifiers(self):
+        text = "Patient name: John Doe\nPhone: 9999999999\nEmail: john@example.com\nDOB: 01/02/1960\nUHID: ABC123"
+        cleaned = server.deidentify_for_ai(text, "CASE-001")
+        self.assertIn("Patient name: CASE-001", cleaned)
+        self.assertIn("[phone removed]", cleaned)
+        self.assertIn("[email removed]", cleaned)
+        self.assertIn("DOB: [removed]", cleaned)
+        self.assertIn("UHID: [removed]", cleaned)
+
+    def test_ai_status_defaults_to_local_without_key(self):
+        original_settings = server.SETTINGS
+        try:
+            server.SETTINGS = replace(original_settings, ai_provider="openai", ai_enabled=True, ai_allow_phi=False, ai_multimodal=True)
+            with patch.dict("os.environ", {"OPENAI_API_KEY": ""}, clear=False):
+                status = server.ai_status()
+        finally:
+            server.SETTINGS = original_settings
+        self.assertEqual(status["provider"], "local")
+        self.assertFalse(status["external_ai_enabled"])
+        self.assertFalse(status["multimodal_enabled"])
 
 
 if __name__ == "__main__":

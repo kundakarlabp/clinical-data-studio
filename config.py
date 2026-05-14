@@ -54,6 +54,11 @@ class Settings:
     ai_provider: str
     ai_enabled: bool
     ai_allow_phi: bool
+    ai_multimodal: bool
+    ai_model: str
+    ai_transcribe_model: str
+    ai_max_file_mb: int
+    ai_monthly_budget_limit: str
     log_level: str
     log_dir: Path
     admin_username: str
@@ -107,6 +112,11 @@ def load_settings() -> Settings:
         ai_provider=os.environ.get("CDS_AI_PROVIDER", "local").strip().lower() or "local",
         ai_enabled=env_bool("CDS_AI_ENABLED", False),
         ai_allow_phi=env_bool("CDS_AI_ALLOW_PHI", False),
+        ai_multimodal=env_bool("CDS_AI_MULTIMODAL", False),
+        ai_model=os.environ.get("CDS_AI_MODEL", "gpt-5.2").strip() or "gpt-5.2",
+        ai_transcribe_model=os.environ.get("CDS_AI_TRANSCRIBE_MODEL", "gpt-4o-transcribe").strip() or "gpt-4o-transcribe",
+        ai_max_file_mb=int(os.environ.get("CDS_AI_MAX_FILE_MB", "8")),
+        ai_monthly_budget_limit=os.environ.get("CDS_AI_MONTHLY_BUDGET_LIMIT", "").strip(),
         log_level=os.environ.get("CDS_LOG_LEVEL", "INFO").strip().upper() or "INFO",
         log_dir=env_path("CDS_LOG_DIR", ROOT / "logs"),
         admin_username=os.environ.get("CDS_ADMIN_USERNAME", "admin").strip() or "admin",

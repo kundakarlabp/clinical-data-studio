@@ -30,6 +30,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request as UrlRequest, urlopen as urlopen_request
 from xml.etree import ElementTree
 
+from ai.safety import ai_status_payload, assert_external_ai_safe as assert_ai_text_safe, deidentify_for_ai as deidentify_text_for_ai, phi_findings as detect_phi_findings
 from config import load_settings
 from storage import connect_database, migrate_postgres
 
@@ -126,14 +127,6 @@ API_TOKEN_SCOPES = {
     "ai:use",
 }
 DEFAULT_API_TOKEN_SCOPES = sorted(API_TOKEN_SCOPES)
-PHI_PATTERNS = [
-    ("email", re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)),
-    ("phone", re.compile(r"(?:\+?\d[\s-]?){10,14}")),
-    ("aadhaar_like", re.compile(r"\b\d{4}[\s-]?\d{4}[\s-]?\d{4}\b")),
-    ("identifier_label", re.compile(r"\b(?:mrd|mrn|uhid|aadhaar|aadhar|hospital\s*number|phone|mobile|email|address)\b\s*[:#-]", re.IGNORECASE)),
-    ("patient_name_label", re.compile(r"\b(?:patient\s*name|name)\b\s*[:#-]\s*[A-Za-z][A-Za-z .'-]{2,}", re.IGNORECASE)),
-]
-
 SETTINGS.log_dir.mkdir(parents=True, exist_ok=True)
 LOG_FILE = SETTINGS.log_dir / "clinical-data-studio.log"
 logging.basicConfig(
@@ -279,20 +272,7 @@ def data_protection_status() -> dict:
 
 
 def ai_status() -> dict:
-    provider = SETTINGS.ai_provider
-    ai_enabled = SETTINGS.ai_enabled
-    external_enabled = ai_enabled and provider == "openai" and bool(os.environ.get("OPENAI_API_KEY", "").strip())
-    multimodal_enabled = external_enabled and os.environ.get("CDS_AI_MULTIMODAL", "").strip().lower() in {"1", "true", "yes", "on"}
-    return {
-        "provider": provider if external_enabled else "local",
-        "ai_enabled": ai_enabled,
-        "external_ai_enabled": external_enabled,
-        "model": os.environ.get("CDS_AI_MODEL", DEFAULT_OPENAI_MODEL) if external_enabled else "local-rules",
-        "transcribe_model": os.environ.get("CDS_AI_TRANSCRIBE_MODEL", DEFAULT_TRANSCRIBE_MODEL) if external_enabled else "local-rules",
-        "multimodal_enabled": multimodal_enabled,
-        "phi_allowed": SETTINGS.ai_allow_phi,
-        "note": "External AI is disabled unless CDS_AI_ENABLED=true, CDS_AI_PROVIDER=openai, and OPENAI_API_KEY are configured. Uploaded evidence files are sent only when CDS_AI_MULTIMODAL=1.",
-    }
+    return ai_status_payload(SETTINGS, os.environ, DEFAULT_OPENAI_MODEL, DEFAULT_TRANSCRIBE_MODEL)
 
 
 def is_super_admin(user: dict | None) -> bool:
@@ -313,35 +293,15 @@ def token_has_scope(token_row: dict, scope: str) -> bool:
 
 
 def phi_findings(text: str) -> list[str]:
-    findings = []
-    for label, pattern in PHI_PATTERNS:
-        if pattern.search(text):
-            findings.append(label)
-    return sorted(set(findings))
+    return detect_phi_findings(text)
 
 
 def deidentify_for_ai(text: str, replacement: str = "Study participant") -> str:
-    cleaned = text
-    cleaned = PHI_PATTERNS[0][1].sub("[email removed]", cleaned)
-    cleaned = PHI_PATTERNS[1][1].sub("[phone removed]", cleaned)
-    cleaned = PHI_PATTERNS[2][1].sub("[identifier removed]", cleaned)
-    cleaned = re.sub(r"\b(patient\s*name|name)\b\s*[:#-]\s*[^\n,;]+", f"Patient name: {replacement}", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\b(address)\b\s*[:#-]\s*[^\n]+", "Address: [removed]", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\b(mrd|mrn|uhid|aadhaar|aadhar|hospital\s*number)\b\s*[:#-]\s*[^\s,;]+", r"\1: [removed]", cleaned, flags=re.IGNORECASE)
-    return cleaned
+    return deidentify_text_for_ai(text, replacement)
 
 
 def assert_external_ai_safe(text: str) -> None:
-    status = ai_status()
-    if not status["external_ai_enabled"] or status["phi_allowed"]:
-        return
-    findings = phi_findings(text)
-    if findings:
-        raise ValueError(
-            "External AI is blocked because the case text appears to contain identifiers: "
-            + ", ".join(findings)
-            + ". Remove identifiers or keep CDS_AI_ALLOW_PHI=false and use local AI only."
-        )
+    assert_ai_text_safe(text, ai_status())
 
 
 def git_commit() -> str:
@@ -1384,7 +1344,7 @@ def draft_crf_schema_with_openai(text: str) -> dict:
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise ValueError("OPENAI_API_KEY is not configured")
-    model = os.environ.get("CDS_AI_MODEL", DEFAULT_OPENAI_MODEL).strip() or DEFAULT_OPENAI_MODEL
+    model = SETTINGS.ai_model or DEFAULT_OPENAI_MODEL
     schema = {
         "type": "object",
         "additionalProperties": False,
@@ -1449,7 +1409,7 @@ def openai_response_json(system_prompt: str, content_parts: list[dict], schema_n
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise ValueError("OPENAI_API_KEY is not configured")
-    model = os.environ.get("CDS_AI_MODEL", DEFAULT_OPENAI_MODEL).strip() or DEFAULT_OPENAI_MODEL
+    model = SETTINGS.ai_model or DEFAULT_OPENAI_MODEL
     request_payload = {
         "model": model,
         "input": [
@@ -1479,7 +1439,7 @@ def openai_transcribe_audio(filename: str, content_type: str, content: bytes) ->
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise ValueError("OPENAI_API_KEY is not configured")
-    model = os.environ.get("CDS_AI_TRANSCRIBE_MODEL", DEFAULT_TRANSCRIBE_MODEL).strip() or DEFAULT_TRANSCRIBE_MODEL
+    model = SETTINGS.ai_transcribe_model or DEFAULT_TRANSCRIBE_MODEL
     boundary = f"----cds{secrets.token_hex(16)}"
     chunks: list[bytes] = []
 
@@ -1986,11 +1946,11 @@ def build_openai_case_content(conn: sqlite3.Connection, study_id: int, case_item
             safe_text = deidentify_for_ai(text, str(case_item.get("case_uid") or "Study participant")) if not status["phi_allowed"] else text
             content_parts.append({"type": "input_text", "text": f"Evidence text file {name}:\n{safe_text}"})
             evidence_notes.append(f"{name}: text evidence included after identifier safety check.")
-        elif content_type.startswith("image/") and status["multimodal_enabled"] and len(decoded) <= 8 * 1024 * 1024:
+        elif content_type.startswith("image/") and status["multimodal_enabled"] and len(decoded) <= status["max_file_mb"] * 1024 * 1024:
             image_base64 = base64.b64encode(decoded).decode("ascii")
             content_parts.append({"type": "input_image", "image_url": f"data:{content_type};base64,{image_base64}"})
             evidence_notes.append(f"{name}: image sent for AI vision review.")
-        elif content_type.startswith("audio/") and status["multimodal_enabled"] and len(decoded) <= 24 * 1024 * 1024:
+        elif content_type.startswith("audio/") and status["multimodal_enabled"] and len(decoded) <= status["max_file_mb"] * 1024 * 1024:
             transcript = openai_transcribe_audio(name, content_type, decoded)
             assert_external_ai_safe(transcript)
             safe_transcript = deidentify_for_ai(transcript, str(case_item.get("case_uid") or "Study participant")) if not status["phi_allowed"] else transcript

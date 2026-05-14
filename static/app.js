@@ -15,6 +15,7 @@ const state = {
   surveyLinks: [],
   invitations: [],
   reports: [],
+  academic: { metrics: {}, opportunities: [], cv_items: [], guidance: [] },
   caseIntake: { cases: [], series: null },
   caseAiReview: null,
   backups: [],
@@ -100,13 +101,14 @@ async function loadStudy() {
   const manageUsers = can("manage_users");
   const viewAnalysis = can("view_analysis") || can("review_data");
   const readinessAllowed = can("manage_study") || can("review_data") || can("view_analysis");
-  const [forms, events, formEvents, surveyLinks, invitations, reports, caseIntake, backups, participants, entries, queries, quality, analysis, assistantSummary, readiness, audit, groups, studyMembers, apiTokens, randomization, users, adminStatus, adminLogs] = await Promise.all([
+  const [forms, events, formEvents, surveyLinks, invitations, reports, academic, caseIntake, backups, participants, entries, queries, quality, analysis, assistantSummary, readiness, audit, groups, studyMembers, apiTokens, randomization, users, adminStatus, adminLogs] = await Promise.all([
     api(`/api/studies/${state.studyId}/forms`),
     api(`/api/studies/${state.studyId}/events`),
     api(`/api/studies/${state.studyId}/form-events`),
     can("manage_forms") ? api(`/api/studies/${state.studyId}/surveys`) : Promise.resolve({ surveys: [] }),
     can("manage_forms") ? api(`/api/studies/${state.studyId}/invitations`) : Promise.resolve({ invitations: [] }),
     viewAnalysis ? api(`/api/studies/${state.studyId}/reports`) : Promise.resolve({ reports: [] }),
+    viewAnalysis ? api(`/api/studies/${state.studyId}/academic`) : Promise.resolve({ academic: { metrics: {}, opportunities: [], cv_items: [], guidance: [] } }),
     (can("enter_data") || can("view_analysis") || can("review_data")) ? api(`/api/studies/${state.studyId}/case-intake`) : Promise.resolve({ cases: [], series: null }),
     can("manage_study") ? api(`/api/studies/${state.studyId}/backups`) : Promise.resolve({ backups: [] }),
     api(`/api/studies/${state.studyId}/participants`),
@@ -131,6 +133,7 @@ async function loadStudy() {
   state.surveyLinks = surveyLinks.surveys;
   state.invitations = invitations.invitations;
   state.reports = reports.reports;
+  state.academic = academic.academic;
   state.caseIntake = caseIntake;
   state.backups = backups.backups;
   if (!state.selectedEventId && state.events[0]) state.selectedEventId = state.events[0].id;
@@ -209,6 +212,7 @@ function render() {
           ${(can("enter_data") || can("view_analysis") || can("review_data")) ? navButton("case-intake", "Case Intake") : ""}
           ${navButton("analysis", "Analysis")}
           ${can("view_analysis") || can("export_data") ? navButton("reports", "Reports") : ""}
+          ${can("view_analysis") || can("export_data") ? navButton("academic", "Academic CV") : ""}
           ${can("manage_study") ? navButton("backups", "Backups") : ""}
           ${navButton("audit", "Audit Trail")}
           ${can("manage_users") ? navButton("access", "Access") : ""}
@@ -263,6 +267,7 @@ function route() {
   if (state.view === "case-intake") return caseIntakeView();
   if (state.view === "analysis") return analysisView();
   if (state.view === "reports") return reportsView();
+  if (state.view === "academic") return academicView();
   if (state.view === "backups") return backupsView();
   if (state.view === "audit") return auditView();
   if (state.view === "access") return accessView();
@@ -1161,6 +1166,108 @@ function reportsView() {
   `;
 }
 
+function academicView() {
+  const academic = state.academic || { metrics: {}, opportunities: [], cv_items: [], guidance: [] };
+  const metrics = academic.metrics || {};
+  const opportunities = academic.opportunities || [];
+  const cvItems = academic.cv_items || [];
+  return `
+    <section class="metrics-grid">
+      ${metric("Captured Cases", metrics.case_count || 0, "Messy evidence organized")}
+      ${metric("Opportunities", metrics.opportunity_count || 0, "Case report/series leads")}
+      ${metric("CV Items", metrics.cv_item_count || 0, "Academic outputs tracked")}
+      ${metric("AI Reviews", metrics.ai_review_count || 0, "Audited academic AI reviews")}
+    </section>
+    <section class="panel">
+      <div class="row">
+        <div>
+          <h2>Academic Workbench</h2>
+          <p>Turn unstructured cases into publication leads, track academic output, and export a CV-ready portfolio.</p>
+        </div>
+        <div class="split-actions">
+          <button class="secondary" id="academic-export-md">Export Portfolio</button>
+          <button class="secondary" id="academic-export-csv">Export CV CSV</button>
+        </div>
+      </div>
+      <div class="grid two">
+        <div class="notice">AI mode: ${escapeHtml(academic.ai?.provider || "local")} / ${escapeHtml(academic.ai?.model || "local-rules")}. ${academic.ai?.external_ai_enabled ? "External OpenAI enabled." : "External AI off or local fallback active."}</div>
+        <div class="notice">${escapeHtml((academic.guidance || []).join(" "))}</div>
+      </div>
+    </section>
+    <section class="panel">
+      <h2>Publication Opportunities</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Topic</th><th>Type</th><th>Potential</th><th>Cases</th><th>Next Actions</th></tr></thead>
+          <tbody>
+            ${opportunities.map((item) => `
+              <tr>
+                <td><strong>${escapeHtml(item.group)}</strong><br><span class="small">${escapeHtml(item.rationale)}</span></td>
+                <td>${escapeHtml(item.suggested_article_type)}</td>
+                <td><span class="pill ${item.publication_potential === "high" ? "ok" : item.publication_potential === "moderate" ? "warn" : ""}">${escapeHtml(item.publication_potential)}</span></td>
+                <td>${escapeHtml((item.case_uids || []).join(", "))}</td>
+                <td>
+                  ${(item.next_actions || []).slice(0, 3).map((action) => `<div class="small">${escapeHtml(action)}</div>`).join("")}
+                  ${(item.missing_items || []).length ? `<div class="small">Missing: ${escapeHtml(item.missing_items.join(", "))}</div>` : ""}
+                  ${(item.literature_search_terms || []).length ? `<div class="small">Search: ${escapeHtml(item.literature_search_terms.join(", "))}</div>` : ""}
+                </td>
+              </tr>
+            `).join("") || `<tr><td colspan="5">Add cases in Case Intake to generate publication opportunities.</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+    </section>
+    <section class="panel">
+      <h2>Add CV / Publication Item</h2>
+      <form id="academic-cv-form" class="form-grid">
+        <label>Type
+          <select name="item_type">
+            ${["publication", "case_report", "case_series", "abstract", "poster", "presentation", "audit", "protocol", "dataset", "grant", "award", "teaching"].map((value) => `<option value="${value}">${escapeHtml(value.replaceAll("_", " "))}</option>`).join("")}
+          </select>
+        </label>
+        <label>Title<input name="title" required placeholder="Oseltamivir case series abstract" /></label>
+        <label>Your role<input name="role" placeholder="First author / corresponding author / presenter" /></label>
+        <label>Status
+          <select name="status">
+            ${["planned", "drafting", "submitted", "accepted", "published", "presented", "completed"].map((value) => `<option value="${value}">${escapeHtml(value)}</option>`).join("")}
+          </select>
+        </label>
+        <label>Date<input name="item_date" type="date" /></label>
+        <label>Linked case
+          <select name="linked_case_id">
+            <option value="">Not linked</option>
+            ${(state.caseIntake?.cases || []).map((item) => `<option value="${item.id}">${escapeHtml(item.case_uid)} - ${escapeHtml(item.title)}</option>`).join("")}
+          </select>
+        </label>
+        <label class="full">Citation / conference / journal<textarea name="citation" placeholder="Journal, conference, DOI, PMID, or citation text"></textarea></label>
+        <label class="full">Notes<textarea name="notes" placeholder="Action items, co-authors, ethics status, target journal, reviewer comments"></textarea></label>
+        <div class="full"><button>Save CV Item</button></div>
+      </form>
+    </section>
+    <section class="panel">
+      <h2>CV Timeline</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Item</th><th>Role</th><th>Status</th><th>Date</th><th>Linked Case</th><th>Notes</th></tr></thead>
+          <tbody>
+            ${cvItems.map((item) => `
+              <tr>
+                <td><strong>${escapeHtml(item.title)}</strong><br><span class="small">${escapeHtml(item.item_type)}</span>${item.citation ? `<br><span class="small">${escapeHtml(item.citation)}</span>` : ""}</td>
+                <td>${escapeHtml(item.role || "")}</td>
+                <td><span class="pill">${escapeHtml(item.status)}</span></td>
+                <td>${escapeHtml(item.item_date || "")}</td>
+                <td>${escapeHtml(item.linked_case_uid || "")}</td>
+                <td>${escapeHtml(item.notes || "")}<br><span class="small">${escapeHtml(item.updated_by_name || "")} ${fmtTime(item.updated_at)}</span></td>
+              </tr>
+            `).join("") || `<tr><td colspan="6">No CV items yet.</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+      <label>Portfolio Markdown<textarea readonly>${escapeHtml(academic.cv_markdown || "")}</textarea></label>
+    </section>
+  `;
+}
+
 function reportFilterText(filters) {
   const parts = [];
   if (filters.participant_status) parts.push(`participant: ${filters.participant_status}`);
@@ -1458,6 +1565,9 @@ function bindRoute() {
   document.querySelector("#invitation-form")?.addEventListener("submit", submitInvitation);
   document.querySelectorAll("[data-invitation-action]").forEach((button) => button.addEventListener("click", () => updateInvitation(button.dataset.invitationId, button.dataset.invitationAction)));
   document.querySelector("#report-form")?.addEventListener("submit", submitReport);
+  document.querySelector("#academic-cv-form")?.addEventListener("submit", submitAcademicCvItem);
+  document.querySelector("#academic-export-md")?.addEventListener("click", () => downloadApi(`/api/studies/${state.studyId}/academic/export?format=md`, "academic_portfolio.md"));
+  document.querySelector("#academic-export-csv")?.addEventListener("click", () => downloadApi(`/api/studies/${state.studyId}/academic/export?format=csv`, "academic_cv_tracker.csv"));
   document.querySelector("#case-intake-form")?.addEventListener("submit", submitCaseIntake);
   document.querySelector("#case-dictate")?.addEventListener("click", startCaseDictation);
   document.querySelector("#case-export")?.addEventListener("click", () => downloadApi(`/api/studies/${state.studyId}/case-intake/export`, "case_intake_export.csv"));
@@ -1811,6 +1921,33 @@ async function submitReport(event) {
       method: "POST",
       body: JSON.stringify({ name: data.name, description: data.description || "", filters }),
     });
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function submitAcademicCvItem(event) {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(event.target));
+  try {
+    await api(`/api/studies/${state.studyId}/academic/cv-items`, {
+      method: "POST",
+      body: JSON.stringify({
+        item_type: data.item_type,
+        title: data.title,
+        role: data.role || "",
+        status: data.status,
+        item_date: data.item_date || "",
+        citation: data.citation || "",
+        notes: data.notes || "",
+        linked_case_id: data.linked_case_id ? Number(data.linked_case_id) : null,
+      }),
+    });
+    event.target.reset();
+    state.error = "Academic CV item saved.";
     await loadStudy();
     render();
   } catch (error) {

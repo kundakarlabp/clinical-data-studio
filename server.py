@@ -592,6 +592,7 @@ STUDY_AUDIT_FILTER = """
     OR (audit_log.entity_type = 'survey_link' AND audit_log.entity_id IN (SELECT id FROM survey_links WHERE study_id = ?))
     OR (audit_log.entity_type = 'survey_invitation' AND audit_log.entity_id IN (SELECT id FROM survey_invitations WHERE study_id = ?))
     OR (audit_log.entity_type = 'report' AND audit_log.entity_id IN (SELECT id FROM reports WHERE study_id = ?))
+    OR (audit_log.entity_type = 'academic_cv_item' AND audit_log.entity_id IN (SELECT id FROM academic_cv_items WHERE study_id = ?))
     OR (audit_log.entity_type = 'case_intake' AND audit_log.entity_id IN (SELECT id FROM case_intakes WHERE study_id = ?))
     OR (audit_log.entity_type = 'case_ai_review' AND audit_log.entity_id IN (SELECT id FROM case_ai_reviews WHERE study_id = ?))
 )
@@ -614,6 +615,7 @@ def migrate() -> None:
             add_column(conn, "forms", "active", "INTEGER NOT NULL DEFAULT 1")
             add_column(conn, "survey_links", "expires_at", "BIGINT")
             add_column(conn, "survey_links", "one_time", "INTEGER NOT NULL DEFAULT 0")
+            add_column(conn, "academic_cv_items", "active", "INTEGER NOT NULL DEFAULT 1")
             seed_initial_data(conn)
             return
         conn.executescript(
@@ -893,6 +895,25 @@ def migrate() -> None:
                 created_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS academic_cv_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+                item_type TEXT NOT NULL DEFAULT 'publication',
+                title TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'planned',
+                item_date TEXT NOT NULL DEFAULT '',
+                citation TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                linked_case_id INTEGER REFERENCES case_intakes(id) ON DELETE SET NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                active INTEGER NOT NULL DEFAULT 1,
+                created_by INTEGER REFERENCES users(id),
+                updated_by INTEGER REFERENCES users(id),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS api_tokens (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
@@ -945,6 +966,7 @@ def migrate() -> None:
         add_column(conn, "forms", "active", "INTEGER NOT NULL DEFAULT 1")
         add_column(conn, "survey_links", "expires_at", "INTEGER")
         add_column(conn, "survey_links", "one_time", "INTEGER NOT NULL DEFAULT 0")
+        add_column(conn, "academic_cv_items", "active", "INTEGER NOT NULL DEFAULT 1")
         migrate_entries_unique_key(conn)
         seed_initial_data(conn)
         add_production_indexes(conn)
@@ -989,6 +1011,7 @@ def add_production_indexes(conn) -> None:
         "CREATE INDEX IF NOT EXISTS idx_audit_log_user_id ON audit_log(user_id)",
         "CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON audit_log(created_at)",
         "CREATE INDEX IF NOT EXISTS idx_audit_log_entity ON audit_log(entity_type, entity_id)",
+        "CREATE INDEX IF NOT EXISTS idx_academic_cv_items_study_id ON academic_cv_items(study_id)",
         "CREATE INDEX IF NOT EXISTS idx_api_tokens_study_id ON api_tokens(study_id)",
         "CREATE INDEX IF NOT EXISTS idx_api_tokens_token_hash ON api_tokens(token_hash)",
     ]
@@ -1609,6 +1632,117 @@ def case_series_summary(case_items: list[dict]) -> dict:
             "Discussion: patterns, novelty, limitations, and lessons.",
         ],
     }
+
+
+def publication_opportunities(case_items: list[dict]) -> list[dict]:
+    groups: dict[str, dict] = {}
+    for item in case_items:
+        extracted = item.get("extracted") or {}
+        clinical = extracted.get("clinical") or {}
+        group = extracted.get("group_label") or clinical.get("diagnosis") or "Ungrouped case"
+        bucket = groups.setdefault(
+            group,
+            {
+                "group": group,
+                "case_count": 0,
+                "case_ids": [],
+                "case_uids": [],
+                "diagnoses": set(),
+                "treatments": set(),
+                "outcomes": set(),
+                "missing_items": set(),
+                "warnings": set(),
+                "search_terms": set(),
+            },
+        )
+        bucket["case_count"] += 1
+        bucket["case_ids"].append(item["id"])
+        bucket["case_uids"].append(item["case_uid"])
+        for key, target in (("diagnosis", "diagnoses"), ("treatment", "treatments"), ("outcome", "outcomes")):
+            value = str(clinical.get(key, "")).strip()
+            if value:
+                bucket[target].add(value)
+        for value in extracted.get("missing_fields", []):
+            bucket["missing_items"].add(str(value))
+        for value in extracted.get("warnings", []):
+            bucket["warnings"].add(str(value))
+        for value in extracted.get("tags", []):
+            bucket["search_terms"].add(str(value))
+    opportunities = []
+    for bucket in groups.values():
+        case_count = bucket["case_count"]
+        missing_count = len(bucket["missing_items"])
+        warning_count = len(bucket["warnings"])
+        if case_count >= 5 and missing_count <= case_count:
+            potential = "high"
+        elif case_count >= 2 or missing_count <= 3:
+            potential = "moderate"
+        else:
+            potential = "early"
+        article_type = "case report" if case_count == 1 else "case series"
+        if case_count >= 10:
+            article_type = "retrospective cohort / case series"
+        rationale_parts = [f"{case_count} case(s) grouped under {bucket['group']}"]
+        if missing_count:
+            rationale_parts.append(f"{missing_count} missing publication data item(s)")
+        if warning_count:
+            rationale_parts.append(f"{warning_count} de-identification/data warning(s)")
+        opportunities.append(
+            {
+                "group": bucket["group"],
+                "case_count": case_count,
+                "case_ids": bucket["case_ids"],
+                "case_uids": bucket["case_uids"],
+                "suggested_article_type": article_type,
+                "publication_potential": potential,
+                "rationale": "; ".join(rationale_parts) + ".",
+                "diagnoses": sorted(bucket["diagnoses"]),
+                "treatments": sorted(bucket["treatments"]),
+                "outcomes": sorted(bucket["outcomes"]),
+                "missing_items": sorted(bucket["missing_items"]),
+                "warnings": sorted(bucket["warnings"]),
+                "literature_search_terms": sorted(bucket["search_terms"] | set(bucket["diagnoses"]) | set(bucket["treatments"]))[:12],
+                "next_actions": [
+                    "Complete missing case variables and de-identify source material.",
+                    "Run Academic AI review on representative cases.",
+                    "Confirm ethics/consent requirements before manuscript preparation.",
+                    "Export case CSV and prepare a reproducible analysis table.",
+                ],
+            }
+        )
+    return sorted(opportunities, key=lambda item: (-item["case_count"], item["group"]))
+
+
+def academic_cv_markdown(study: dict, cv_items: list[dict], opportunities: list[dict]) -> str:
+    lines = [
+        f"# Academic Portfolio - {study['name']}",
+        "",
+        "## Publication Pipeline",
+        "",
+    ]
+    if opportunities:
+        for item in opportunities:
+            lines.extend(
+                [
+                    f"- **{item['group']}**: {item['suggested_article_type']} ({item['publication_potential']} potential)",
+                    f"  - Cases: {', '.join(item['case_uids'])}",
+                    f"  - Rationale: {item['rationale']}",
+                    f"  - Next: {item['next_actions'][0]}",
+                ]
+            )
+    else:
+        lines.append("- No case-based publication opportunities have been generated yet.")
+    lines.extend(["", "## CV Items", ""])
+    if cv_items:
+        for item in cv_items:
+            date = f" ({item['item_date']})" if item.get("item_date") else ""
+            citation = f" - {item['citation']}" if item.get("citation") else ""
+            notes = f" Notes: {item['notes']}" if item.get("notes") else ""
+            lines.append(f"- **{item['title']}**{date}. {item['item_type']} / {item['status']}. Role: {item.get('role') or 'not specified'}{citation}.{notes}")
+    else:
+        lines.append("- Add abstracts, posters, manuscripts, presentations, audits, protocols, datasets, and awards here.")
+    lines.extend(["", "## Safety Notes", "", "- Verify every AI-generated suggestion against source records.", "- Keep patient identifiers out of publication exports unless approved and necessary."])
+    return "\n".join(lines) + "\n"
 
 
 def academic_review_schema() -> dict:
@@ -2792,6 +2926,11 @@ class App(BaseHTTPRequestHandler):
                 self.send_error_json("Report permission required", 403)
                 return
             return self.reports(conn, user, method, study_id, parts, membership)
+        if resource == "academic":
+            if not (membership_has(membership, "view_analysis") or membership_has(membership, "review_data") or membership_has(membership, "export_data")):
+                self.send_error_json("Academic workbench permission required", 403)
+                return
+            return self.academic_workbench(conn, user, method, study_id, parts, query)
         if resource == "backups":
             if not membership_has(membership, "manage_study"):
                 self.send_error_json("Study management permission required", 403)
@@ -4549,6 +4688,166 @@ class App(BaseHTTPRequestHandler):
             filename = f"clinical_report_{normalize_code(report['name'], 'report')}.csv"
             return self.export_entries_csv(conn, study_id, membership, load_json(report["filters_json"], {}), filename)
         self.send_error_json("Unsupported reports operation", 405)
+
+    def academic_cv_rows(self, conn, study_id: int) -> list[dict]:
+        data = rows(
+            conn,
+            """
+            SELECT academic_cv_items.*, case_intakes.case_uid AS linked_case_uid, users.display_name AS updated_by_name
+            FROM academic_cv_items
+            LEFT JOIN case_intakes ON case_intakes.id = academic_cv_items.linked_case_id
+            LEFT JOIN users ON users.id = academic_cv_items.updated_by
+            WHERE academic_cv_items.study_id = ? AND academic_cv_items.active = 1
+            ORDER BY academic_cv_items.item_date DESC, academic_cv_items.updated_at DESC, academic_cv_items.id DESC
+            """,
+            (study_id,),
+        )
+        for item in data:
+            item["metadata"] = load_json(item.pop("metadata_json"), {})
+        return data
+
+    def academic_payload(self, conn, study_id: int) -> dict:
+        study = row(conn, "SELECT * FROM studies WHERE id = ?", (study_id,))
+        cases = self.case_rows(conn, study_id)
+        cv_items = self.academic_cv_rows(conn, study_id)
+        opportunities = publication_opportunities(cases)
+        ai_review_count = row(conn, "SELECT COUNT(*) AS count FROM case_ai_reviews WHERE study_id = ?", (study_id,))["count"]
+        report_count = row(conn, "SELECT COUNT(*) AS count FROM reports WHERE study_id = ?", (study_id,))["count"]
+        return {
+            "metrics": {
+                "case_count": len(cases),
+                "opportunity_count": len(opportunities),
+                "cv_item_count": len(cv_items),
+                "ai_review_count": ai_review_count,
+                "report_count": report_count,
+            },
+            "opportunities": opportunities,
+            "cv_items": cv_items,
+            "cv_markdown": academic_cv_markdown(study, cv_items, opportunities),
+            "ai": ai_status(),
+            "guidance": [
+                "Use Case Intake for messy notes, photos, audio, PDFs, and scanned case details.",
+                "Run Academic AI review only on de-identified material unless policy explicitly allows PHI.",
+                "Promote strong case groups into CV items when an abstract, poster, manuscript, audit, or presentation starts.",
+                "Export the CV tracker before appraisal, grant, promotion, or manuscript planning meetings.",
+            ],
+        }
+
+    def academic_workbench(self, conn, user, method, study_id, parts, query) -> None:
+        if method == "GET" and len(parts) == 4:
+            self.send_json({"academic": self.academic_payload(conn, study_id)})
+            return
+        if method == "GET" and len(parts) == 5 and parts[4] == "export":
+            fmt = (query.get("format") or ["md"])[0].lower()
+            payload = self.academic_payload(conn, study_id)
+            audit(conn, user["id"], "export", "academic_cv_item", study_id, None, {"format": fmt}, study_id=study_id, **self.audit_context())
+            if fmt == "csv":
+                fields = ["item_type", "title", "role", "status", "item_date", "citation", "notes", "linked_case_uid"]
+                text_lines = []
+                class Sink:
+                    def write(self, value):
+                        text_lines.append(value)
+                writer = csv.DictWriter(Sink(), fieldnames=fields)
+                writer.writeheader()
+                for item in payload["cv_items"]:
+                    writer.writerow({field: item.get(field, "") for field in fields})
+                content = "".join(text_lines).encode("utf-8-sig")
+                self.send_response(200)
+                self.send_header("content-type", "text/csv; charset=utf-8")
+                self.send_header("content-disposition", "attachment; filename=academic_cv_tracker.csv")
+                self.send_header("content-length", str(len(content)))
+                self.end_headers()
+                self.wfile.write(content)
+                return
+            content = payload["cv_markdown"].encode("utf-8")
+            self.send_response(200)
+            self.send_header("content-type", "text/markdown; charset=utf-8")
+            self.send_header("content-disposition", "attachment; filename=academic_portfolio.md")
+            self.send_header("content-length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+            return
+        if method == "POST" and len(parts) == 5 and parts[4] == "cv-items":
+            payload = self.body()
+            timestamp = now()
+            title = str(payload.get("title", "")).strip()
+            if not title:
+                self.send_error_json("CV item title is required", 400)
+                return
+            linked_case_id = int(payload.get("linked_case_id") or 0) or None
+            if linked_case_id and not row(conn, "SELECT id FROM case_intakes WHERE id = ? AND study_id = ?", (linked_case_id, study_id)):
+                self.send_error_json("Linked case not found", 404)
+                return
+            item_type = normalize_code(str(payload.get("item_type", "publication")))[:40] or "publication"
+            status = normalize_code(str(payload.get("status", "planned")))[:40] or "planned"
+            cur = conn.execute(
+                """
+                INSERT INTO academic_cv_items(study_id, item_type, title, role, status, item_date, citation, notes, linked_case_id, metadata_json, active, created_by, updated_by, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                """,
+                (
+                    study_id,
+                    item_type,
+                    title,
+                    str(payload.get("role", "")).strip()[:160],
+                    status,
+                    str(payload.get("item_date", "")).strip()[:40],
+                    str(payload.get("citation", "")).strip(),
+                    str(payload.get("notes", "")).strip(),
+                    linked_case_id,
+                    json.dumps(payload.get("metadata", {})),
+                    user["id"],
+                    user["id"],
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            after = row(conn, "SELECT * FROM academic_cv_items WHERE id = ?", (cur.lastrowid,))
+            audit(conn, user["id"], "create", "academic_cv_item", cur.lastrowid, None, after, study_id=study_id, **self.audit_context())
+            conn.commit()
+            self.send_json({"cv_item": after}, 201)
+            return
+        if method == "PATCH" and len(parts) == 6 and parts[4] == "cv-items":
+            item_id = int(parts[5])
+            before = row(conn, "SELECT * FROM academic_cv_items WHERE id = ? AND study_id = ?", (item_id, study_id))
+            if not before:
+                self.send_error_json("CV item not found", 404)
+                return
+            payload = self.body()
+            linked_case_id = payload.get("linked_case_id", before.get("linked_case_id"))
+            linked_case_id = int(linked_case_id or 0) or None
+            if linked_case_id and not row(conn, "SELECT id FROM case_intakes WHERE id = ? AND study_id = ?", (linked_case_id, study_id)):
+                self.send_error_json("Linked case not found", 404)
+                return
+            conn.execute(
+                """
+                UPDATE academic_cv_items
+                SET item_type = ?, title = ?, role = ?, status = ?, item_date = ?, citation = ?, notes = ?, linked_case_id = ?, metadata_json = ?, active = ?, updated_by = ?, updated_at = ?
+                WHERE id = ? AND study_id = ?
+                """,
+                (
+                    normalize_code(str(payload.get("item_type", before["item_type"])))[:40] or before["item_type"],
+                    str(payload.get("title", before["title"])).strip() or before["title"],
+                    str(payload.get("role", before["role"])).strip()[:160],
+                    normalize_code(str(payload.get("status", before["status"])))[:40] or before["status"],
+                    str(payload.get("item_date", before["item_date"])).strip()[:40],
+                    str(payload.get("citation", before["citation"])).strip(),
+                    str(payload.get("notes", before["notes"])).strip(),
+                    linked_case_id,
+                    json.dumps(payload.get("metadata", load_json(before["metadata_json"], {}))),
+                    1 if payload.get("active", bool(before["active"])) else 0,
+                    user["id"],
+                    now(),
+                    item_id,
+                    study_id,
+                ),
+            )
+            after = row(conn, "SELECT * FROM academic_cv_items WHERE id = ?", (item_id,))
+            audit(conn, user["id"], "update", "academic_cv_item", item_id, before, after, study_id=study_id, **self.audit_context())
+            conn.commit()
+            self.send_json({"cv_item": after})
+            return
+        self.send_error_json("Unsupported academic workbench operation", 405)
 
     def export_odm(self, conn, study_id: int) -> None:
         meta = self.metadata_payload(conn, study_id)

@@ -19,10 +19,12 @@ class ApiSmokeTests(unittest.TestCase):
         self.original_backups = server.BACKUPS
         self.original_uploads = server.UPLOADS
         self.original_db = server.DB_PATH
+        self.original_backend = server.DATABASE_BACKEND
         server.DATA = Path(self.tmp.name)
         server.BACKUPS = server.DATA / "backups"
         server.UPLOADS = server.DATA / "uploads"
         server.DB_PATH = server.DATA / "smoke.sqlite3"
+        server.DATABASE_BACKEND = "sqlite"
         server.migrate()
         with closing(server.db()) as conn, conn:
             conn.execute("UPDATE users SET must_change_password = 0 WHERE username = 'admin'")
@@ -39,6 +41,7 @@ class ApiSmokeTests(unittest.TestCase):
         server.BACKUPS = self.original_backups
         server.UPLOADS = self.original_uploads
         server.DB_PATH = self.original_db
+        server.DATABASE_BACKEND = self.original_backend
         self.tmp.cleanup()
 
     def request_json(self, path, method="GET", payload=None, token=None):

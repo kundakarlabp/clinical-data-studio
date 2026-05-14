@@ -73,14 +73,17 @@ class CoreEdcTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             original_data = server.DATA
             original_db = server.DB_PATH
+            original_backend = server.DATABASE_BACKEND
             try:
                 server.DATA = Path(tmp)
                 server.DB_PATH = Path(tmp) / "test.sqlite3"
+                server.DATABASE_BACKEND = "sqlite"
                 server.migrate()
                 self.assertTrue(server.DB_PATH.exists())
             finally:
                 server.DATA = original_data
                 server.DB_PATH = original_db
+                server.DATABASE_BACKEND = original_backend
 
     def test_development_settings_do_not_bind_publicly(self):
         with patch.dict("os.environ", {"CDS_ENV": "development", "CDS_HOST": "0.0.0.0"}, clear=False):

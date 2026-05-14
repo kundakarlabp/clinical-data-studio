@@ -25,7 +25,16 @@ if (-not $env:CDS_BASE_URL -and -not (Test-AppReady $baseUrl)) {
   $env:CDS_ENV = "development"
   $env:CDS_HOST = "127.0.0.1"
   $env:CDS_PORT = "8765"
-  $serverProcess = Start-Process -FilePath $python -ArgumentList "server.py" -WorkingDirectory $repoRoot -WindowStyle Hidden -PassThru
+  $startArgs = @{
+    FilePath = $python
+    ArgumentList = "server.py"
+    WorkingDirectory = $repoRoot
+    PassThru = $true
+  }
+  if ($IsWindows) {
+    $startArgs.WindowStyle = "Hidden"
+  }
+  $serverProcess = Start-Process @startArgs
 
   $ready = $false
   for ($i = 0; $i -lt 30; $i++) {
@@ -43,7 +52,7 @@ if (-not $env:CDS_BASE_URL -and -not (Test-AppReady $baseUrl)) {
   }
 }
 
-$work = Join-Path $env:TEMP "cds-playwright-smoke"
+$work = Join-Path ([System.IO.Path]::GetTempPath()) "cds-playwright-smoke"
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 
 $script = @'

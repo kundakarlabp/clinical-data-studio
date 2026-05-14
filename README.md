@@ -126,6 +126,8 @@ Run the app on one study computer with `.\start.ps1`, then open the shown Wi-Fi 
 
 The installed app shell can open while offline, but clinical data save/sync still requires connection to the study computer. For completely separate non-connected sites, use exports/imports or backups until offline sync is explicitly validated.
 
+For Android install steps and offline draft behavior, see [docs/ANDROID_PWA_SETUP.md](docs/ANDROID_PWA_SETUP.md).
+
 ## Remote Access
 
 For real study data, keep one central running app and database. This preserves audit trail order, record locking, user permissions, backups, and query review history.

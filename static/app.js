@@ -83,6 +83,7 @@ async function loadAll() {
     const me = await api("/api/me");
     state.user = me.user;
     state.memberships = me.memberships || [];
+    if (state.user?.must_change_password) return renderPasswordChangeRequired();
     const studies = await api("/api/studies");
     state.studies = studies.studies;
     if (!state.studyId && state.studies[0]) state.studyId = state.studies[0].id;
@@ -184,6 +185,7 @@ function can(permission) {
 
 function render() {
   if (!state.token) return renderLogin();
+  if (state.user?.must_change_password) return renderPasswordChangeRequired();
   const study = activeStudy();
   app.innerHTML = `
     <div class="shell">
@@ -2344,10 +2346,10 @@ function renderLogin() {
           <p>Local-network clinical research data capture for small teams.</p>
         </div>
         ${state.error ? `<div class="notice error">${escapeHtml(state.error)}</div>` : ""}
-        <label>Username<input name="username" value="admin" autocomplete="username" required /></label>
-        <label>Password<input name="password" type="password" value="admin123" autocomplete="current-password" required /></label>
+        <label>Username<input name="username" autocomplete="username" required /></label>
+        <label>Password<input name="password" type="password" autocomplete="current-password" required /></label>
         <button>Login</button>
-        <p class="small">Default credentials are for first startup only. Change them before real research use.</p>
+        <p class="small">Use the named account provided by your study administrator.</p>
       </form>
     </section>
   `;
@@ -2360,11 +2362,50 @@ function renderLogin() {
       state.user = result.user;
       state.error = "";
       localStorage.setItem("cds_token", state.token);
+      if (state.user?.must_change_password) return renderPasswordChangeRequired();
       await loadAll();
     } catch (error) {
       state.error = error.message;
       renderLogin();
     }
+  });
+}
+
+function renderPasswordChangeRequired() {
+  app.innerHTML = `
+    <section class="login">
+      <form id="forced-password-form" class="login-card stack">
+        <div>
+          <h1>Change Password</h1>
+          <p>Your administrator requires a new password before using clinical data screens.</p>
+        </div>
+        ${state.error ? `<div class="notice error">${escapeHtml(state.error)}</div>` : ""}
+        <label>Current password<input name="current_password" type="password" autocomplete="current-password" required /></label>
+        <label>New password<input name="new_password" type="password" minlength="10" autocomplete="new-password" required /></label>
+        <button>Update Password</button>
+        <button type="button" class="secondary" id="forced-logout">Logout</button>
+      </form>
+    </section>
+  `;
+  document.querySelector("#forced-password-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = Object.fromEntries(new FormData(event.target));
+    try {
+      await api("/api/password", { method: "POST", body: JSON.stringify(data) });
+      state.error = "";
+      state.user.must_change_password = 0;
+      await loadAll();
+    } catch (error) {
+      state.error = error.message;
+      renderPasswordChangeRequired();
+    }
+  });
+  document.querySelector("#forced-logout").addEventListener("click", async () => {
+    await api("/api/logout", { method: "POST", body: "{}" }).catch(() => {});
+    state.token = "";
+    state.user = null;
+    localStorage.removeItem("cds_token");
+    renderLogin();
   });
 }
 
@@ -2377,8 +2418,8 @@ function renderSetup() {
           <p>Create the permanent administrator account before entering research data.</p>
         </div>
         ${state.error ? `<div class="notice error">${escapeHtml(state.error)}</div>` : ""}
-        <label>Admin username<input name="username" value="admin" autocomplete="username" required /></label>
-        <label>Display name<input name="display_name" value="Administrator" required /></label>
+        <label>Admin username<input name="username" placeholder="admin" autocomplete="username" required /></label>
+        <label>Display name<input name="display_name" placeholder="Study Administrator" required /></label>
         <label>New password<input name="password" type="password" minlength="12" autocomplete="new-password" required /></label>
         <label>Confirm password<input name="confirm_password" type="password" minlength="12" autocomplete="new-password" required /></label>
         <button>Secure App</button>

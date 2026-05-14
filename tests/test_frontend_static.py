@@ -23,6 +23,9 @@ class FrontendStaticTests(unittest.TestCase):
 
     def test_frontend_uses_new_hardening_endpoints(self):
         app_js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertNotIn('value="admin"', app_js)
+        self.assertNotIn("admin123", app_js)
+        self.assertIn("renderPasswordChangeRequired", app_js)
         self.assertIn("/assist/summary", app_js)
         self.assertIn("assistDraft", app_js)
         self.assertIn("external AI is used only when explicitly enabled", app_js)

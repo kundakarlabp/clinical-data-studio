@@ -2,6 +2,7 @@ import json
 import tempfile
 import threading
 import unittest
+from contextlib import closing
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
@@ -21,6 +22,8 @@ class ApiSmokeTests(unittest.TestCase):
         server.BACKUPS = server.DATA / "backups"
         server.DB_PATH = server.DATA / "smoke.sqlite3"
         server.migrate()
+        with closing(server.db()) as conn, conn:
+            conn.execute("UPDATE users SET must_change_password = 0 WHERE username = 'admin'")
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.App)
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
@@ -55,6 +58,11 @@ class ApiSmokeTests(unittest.TestCase):
         request = Request(f"{self.base_url}{path}", data=body, headers=headers, method=method)
         with urlopen(request, timeout=10) as response:
             return response.status, response.headers.get("content-type", ""), response.read()
+
+    def response_headers(self, path):
+        request = Request(f"{self.base_url}{path}")
+        with urlopen(request, timeout=10) as response:
+            return response.headers
 
     def test_health_login_summary_and_encrypted_backup(self):
         health = self.request_json("/api/health")
@@ -157,6 +165,47 @@ class ApiSmokeTests(unittest.TestCase):
             self.request_json("/api/login", "POST", {"username": "research.admin", "password": "VeryStrongAdmin123"})
         self.assertEqual(context.exception.code, 423)
         context.exception.close()
+
+    def test_must_change_password_blocks_protected_endpoints_until_changed(self):
+        with closing(server.db()) as conn, conn:
+            conn.execute("UPDATE users SET must_change_password = 1 WHERE username = 'admin'")
+        token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]
+        me = self.request_json("/api/me", token=token)
+        self.assertEqual(me["user"]["must_change_password"], 1)
+        with self.assertRaises(HTTPError) as blocked:
+            self.request_json("/api/studies", token=token)
+        self.assertEqual(blocked.exception.code, 403)
+        self.assertIn("Password change required", blocked.exception.read().decode("utf-8"))
+        blocked.exception.close()
+        changed = self.request_json(
+            "/api/password",
+            "POST",
+            {"current_password": "admin123", "new_password": "ChangedPassword123"},
+            token,
+        )
+        self.assertTrue(changed["ok"])
+        studies = self.request_json("/api/studies", token=token)["studies"]
+        self.assertTrue(studies)
+
+    def test_session_tokens_are_stored_as_digests_and_logout_removes_session(self):
+        token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]
+        with closing(server.db()) as conn, conn:
+            session = server.row(conn, "SELECT token FROM sessions LIMIT 1")
+        self.assertIsNotNone(session)
+        self.assertNotEqual(session["token"], token)
+        self.assertEqual(session["token"], server.session_token_digest(token))
+        logout = self.request_json("/api/logout", "POST", {}, token)
+        self.assertTrue(logout["ok"])
+        with closing(server.db()) as conn, conn:
+            remaining = server.row(conn, "SELECT token FROM sessions WHERE token = ?", (server.session_token_digest(token),))
+        self.assertIsNone(remaining)
+
+    def test_security_headers_are_present(self):
+        headers = self.response_headers("/api/health")
+        self.assertIn("default-src 'self'", headers.get("Content-Security-Policy"))
+        self.assertEqual(headers.get("X-Frame-Options"), "SAMEORIGIN")
+        self.assertEqual(headers.get("X-Content-Type-Options"), "nosniff")
+        self.assertEqual(headers.get("Referrer-Policy"), "same-origin")
 
     def test_record_import_and_entry_history(self):
         token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]

@@ -128,6 +128,28 @@ class CoreEdcTests(unittest.TestCase):
             server.DATABASE_BACKEND = original_backend
             server.DATABASE_URL = original_url
 
+    def test_production_startup_rejects_sqlite_without_explicit_override(self):
+        original_settings = server.SETTINGS
+        original_host = server.HOST
+        original_backend = server.DATABASE_BACKEND
+        try:
+            server.SETTINGS = replace(
+                original_settings,
+                env="production",
+                secret_key="x" * 40,
+                admin_password="StrongAdminPassword123",
+                public_base_url="https://example.org",
+            )
+            server.HOST = "127.0.0.1"
+            server.DATABASE_BACKEND = "sqlite"
+            with patch.dict("os.environ", {"CDS_ALLOW_SQLITE_PRODUCTION": ""}, clear=False):
+                with self.assertRaises(RuntimeError):
+                    server.validate_startup()
+        finally:
+            server.SETTINGS = original_settings
+            server.HOST = original_host
+            server.DATABASE_BACKEND = original_backend
+
     def test_external_ai_phi_gate_blocks_identifiers_by_default(self):
         original_settings = server.SETTINGS
         try:

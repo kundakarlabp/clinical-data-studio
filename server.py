@@ -44,6 +44,8 @@ DATABASE_URL = SETTINGS.database_url
 HOST = SETTINGS.host
 PORT = SETTINGS.port
 PBKDF2_ROUNDS = 260_000
+SESSION_TTL_SECONDS = 60 * 60 * 24 * 14
+MIN_PRODUCTION_SECRET_LENGTH = 32
 DEFAULT_OPENAI_MODEL = "gpt-5.2"
 DEFAULT_TRANSCRIBE_MODEL = "gpt-4o-transcribe"
 CALC_OPERATORS = {
@@ -172,6 +174,15 @@ def verify_password(password: str, encoded: str) -> bool:
 
 def token_digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def session_token_digest(token: str) -> str:
+    secret = SETTINGS.secret_key or "clinical-data-studio-development-session-key"
+    return hmac.new(secret.encode("utf-8"), token.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def prune_expired_sessions(conn: sqlite3.Connection) -> None:
+    conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now(),))
 
 
 def archive_key(passphrase: str, salt: bytes) -> bytes:
@@ -2043,6 +2054,16 @@ class App(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def end_headers(self) -> None:
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; object-src 'none'; frame-ancestors 'self'; base-uri 'self'; form-action 'self'")
+        self.send_header("X-Frame-Options", "SAMEORIGIN")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "same-origin")
+        self.send_header("Permissions-Policy", "camera=(self), microphone=(self), geolocation=()")
+        if SETTINGS.require_https or self.headers.get("x-forwarded-proto", "").lower() == "https":
+            self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        super().end_headers()
+
     def send_error_json(self, message: str, status: int = 400) -> None:
         self.send_json({"error": message}, status)
 
@@ -2073,6 +2094,7 @@ class App(BaseHTTPRequestHandler):
         if not header.startswith("Bearer "):
             return None
         token = header.removeprefix("Bearer ").strip()
+        digest = session_token_digest(token)
         user = row(
             conn,
             """
@@ -2080,7 +2102,7 @@ class App(BaseHTTPRequestHandler):
             FROM sessions JOIN users ON users.id = sessions.user_id
             WHERE sessions.token = ? AND sessions.expires_at > ? AND users.active = 1
             """,
-            (token, now()),
+            (digest, now()),
         )
         return user
 
@@ -2112,6 +2134,9 @@ class App(BaseHTTPRequestHandler):
 
                 user = self.require_user(conn)
                 if not user:
+                    return
+                if user.get("must_change_password") and path not in {"/api/me", "/api/password", "/api/logout"}:
+                    self.send_error_json("Password change required before continuing.", 403)
                     return
 
                 if path == "/api/me":
@@ -2175,8 +2200,9 @@ class App(BaseHTTPRequestHandler):
             self.send_error_json("Invalid username or password", 401)
             return
         token = secrets.token_urlsafe(32)
+        prune_expired_sessions(conn)
         conn.execute("UPDATE users SET failed_login_count = 0, locked_until = 0 WHERE id = ?", (user["id"],))
-        conn.execute("INSERT INTO sessions(token, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)", (token, user["id"], now() + 60 * 60 * 24 * 14, now()))
+        conn.execute("INSERT INTO sessions(token, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)", (session_token_digest(token), user["id"], now() + SESSION_TTL_SECONDS, now()))
         audit(conn, user["id"], "login", "session", None, None, {"username": username}, **self.audit_context())
         conn.commit()
         self.send_json({"token": token, "user": {"id": user["id"], "username": user["username"], "display_name": user["display_name"], "role": user["role"], "must_change_password": user.get("must_change_password", 0)}})
@@ -2215,8 +2241,9 @@ class App(BaseHTTPRequestHandler):
         header = self.headers.get("authorization", "")
         token = header.removeprefix("Bearer ").strip() if header.startswith("Bearer ") else ""
         if token:
-            session = row(conn, "SELECT user_id FROM sessions WHERE token = ?", (token,))
-            conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+            digest = session_token_digest(token)
+            session = row(conn, "SELECT user_id FROM sessions WHERE token = ?", (digest,))
+            conn.execute("DELETE FROM sessions WHERE token = ?", (digest,))
             audit(conn, session["user_id"] if session else None, "logout", "session", None, None, {"logged_out": bool(session)}, **self.audit_context())
         self.send_json({"ok": True})
 
@@ -5005,12 +5032,17 @@ class App(BaseHTTPRequestHandler):
 
 def validate_startup() -> None:
     if SETTINGS.production:
-        if not SETTINGS.secret_key or len(SETTINGS.secret_key) < 32 or SETTINGS.secret_key in {"change-me", "please-change-me"}:
+        weak_secrets = {"change-me", "please-change-me", "change_me", "changeme", "secret", "password"}
+        if not SETTINGS.secret_key or len(SETTINGS.secret_key) < MIN_PRODUCTION_SECRET_LENGTH or SETTINGS.secret_key.lower() in weak_secrets:
             raise RuntimeError("Production startup refused: set CDS_SECRET_KEY to a long random value.")
         if not SETTINGS.admin_password or len(SETTINGS.admin_password) < PRODUCTION_ADMIN_PASSWORD_MIN_LENGTH or SETTINGS.admin_password == "admin123":
             raise RuntimeError("Production startup refused: set CDS_ADMIN_PASSWORD to a strong non-default value.")
+        if DATABASE_BACKEND == "sqlite" and os.environ.get("CDS_ALLOW_SQLITE_PRODUCTION", "").strip().lower() not in {"1", "true", "yes", "on"}:
+            raise RuntimeError("Production startup refused: use PostgreSQL or set CDS_ALLOW_SQLITE_PRODUCTION=true for an explicit temporary exception.")
         if DATABASE_BACKEND == "postgres" and (not DATABASE_URL or "change_me" in DATABASE_URL.lower()):
             raise RuntimeError("Production startup refused: set DATABASE_URL or POSTGRES_PASSWORD for PostgreSQL.")
+        if not SETTINGS.require_https:
+            LOGGER.warning("CDS_REQUIRE_HTTPS=false in production. Use this only behind a trusted HTTPS reverse proxy.")
         if HOST in {"0.0.0.0", "::"}:
             LOGGER.warning("Clinical Data Studio is bound to all network interfaces in production. Use HTTPS and a firewall.")
         if SETTINGS.require_https and SETTINGS.public_base_url and not SETTINGS.public_base_url.startswith("https://"):

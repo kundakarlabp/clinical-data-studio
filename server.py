@@ -2202,6 +2202,7 @@ class App(BaseHTTPRequestHandler):
                 self.send_error_json("Participant not found", 404)
                 return
             allocation = self.allocate_randomization(conn, user, study_id, list_id, participant["id"])
+            conn.commit()
             return self.send_redcap_payload(allocation, output_format)
         self.send_error_json("Unsupported REDCap-style content", 400)
 
@@ -3326,6 +3327,7 @@ class App(BaseHTTPRequestHandler):
             )
             after = row(conn, "SELECT * FROM participants WHERE id = ?", (cur.lastrowid,))
             audit(conn, user["id"], "create", "participant", cur.lastrowid, None, after)
+            conn.commit()
             self.send_json({"participant": after}, 201)
             return
         if method == "PATCH" and len(parts) == 5:
@@ -3347,6 +3349,7 @@ class App(BaseHTTPRequestHandler):
             )
             after = row(conn, "SELECT * FROM participants WHERE id = ?", (participant_id,))
             audit(conn, user["id"], "update", "participant", participant_id, before, after)
+            conn.commit()
             self.send_json({"participant": after})
             return
         self.send_error_json("Unsupported participant operation", 405)
@@ -3448,6 +3451,7 @@ class App(BaseHTTPRequestHandler):
                 )
                 after = row(conn, "SELECT * FROM entries WHERE id = ?", (existing["id"],))
                 audit(conn, user["id"], "update", "entry", existing["id"], before, {"entry": after, "change_reason": payload.get("change_reason", "")})
+                conn.commit()
                 self.send_json({"entry": after})
                 return
             cur = conn.execute(
@@ -3456,6 +3460,7 @@ class App(BaseHTTPRequestHandler):
             )
             after = row(conn, "SELECT * FROM entries WHERE id = ?", (cur.lastrowid,))
             audit(conn, user["id"], "create", "entry", cur.lastrowid, None, after)
+            conn.commit()
             self.send_json({"entry": after}, 201)
             return
         if method == "PATCH" and len(parts) == 5:
@@ -3643,6 +3648,7 @@ class App(BaseHTTPRequestHandler):
             self.save_case_files(conn, user["id"], study_id, cur.lastrowid, files)
             after = row(conn, "SELECT * FROM case_intakes WHERE id = ?", (cur.lastrowid,))
             audit(conn, user["id"], "create", "case_intake", cur.lastrowid, None, {"case": after, "file_count": len(files), "group": extracted["group_label"]})
+            conn.commit()
             self.send_json({"case": self.case_payload(conn, after)}, 201)
             return
         if method == "PATCH" and len(parts) == 5:
@@ -3665,6 +3671,7 @@ class App(BaseHTTPRequestHandler):
             self.save_case_files(conn, user["id"], study_id, case_id, payload.get("files") or [])
             after = row(conn, "SELECT * FROM case_intakes WHERE id = ?", (case_id,))
             audit(conn, user["id"], "update", "case_intake", case_id, before, {"case": after, "group": extracted["group_label"]})
+            conn.commit()
             self.send_json({"case": self.case_payload(conn, after)})
             return
         self.send_error_json("Unsupported case intake operation", 405)
@@ -3962,6 +3969,7 @@ class App(BaseHTTPRequestHandler):
             )
             after = row(conn, "SELECT * FROM randomization_lists WHERE id = ?", (cur.lastrowid,))
             audit(conn, user["id"], "create", "randomization_list", cur.lastrowid, None, after)
+            conn.commit()
             self.send_json({"list": after}, 201)
             return
         if method == "POST" and len(parts) == 6 and parts[5] == "allocate":
@@ -3969,6 +3977,7 @@ class App(BaseHTTPRequestHandler):
             payload = self.body()
             participant_id = int(payload.get("participant_id") or 0)
             after = self.allocate_randomization(conn, user, study_id, list_id, participant_id)
+            conn.commit()
             self.send_json({"allocation": after}, 201)
             return
         self.send_error_json("Unsupported randomization operation", 405)

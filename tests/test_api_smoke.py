@@ -461,16 +461,26 @@ class ApiSmokeTests(unittest.TestCase):
             {"username": "entry.user", "display_name": "Entry User", "password": "Temporary12345", "role": "data_entry"},
             admin_token,
         )["user"]
+        other_data_user = self.request_json(
+            "/api/users",
+            "POST",
+            {"username": "entry.other", "display_name": "Other Entry User", "password": "Temporary12345", "role": "data_entry"},
+            admin_token,
+        )["user"]
         analyst_user = self.request_json(
             "/api/users",
             "POST",
             {"username": "analyst.user", "display_name": "Analyst User", "password": "Temporary12345", "role": "analyst"},
             admin_token,
         )["user"]
-        self.request_json(f"/api/studies/{study_id}/memberships", "POST", {"user_id": data_user["id"], "role": "data_entry", "active": True}, admin_token)
+        group_a = self.request_json(f"/api/studies/{study_id}/groups", "POST", {"name": "Site A", "code": "site_a"}, admin_token)["group"]
+        group_b = self.request_json(f"/api/studies/{study_id}/groups", "POST", {"name": "Site B", "code": "site_b"}, admin_token)["group"]
+        self.request_json(f"/api/studies/{study_id}/memberships", "POST", {"user_id": data_user["id"], "role": "data_entry", "data_group_id": group_a["id"], "active": True}, admin_token)
+        self.request_json(f"/api/studies/{study_id}/memberships", "POST", {"user_id": other_data_user["id"], "role": "data_entry", "data_group_id": group_b["id"], "active": True}, admin_token)
         self.request_json(f"/api/studies/{study_id}/memberships", "POST", {"user_id": analyst_user["id"], "role": "analyst", "active": True}, admin_token)
 
         entry_token = self.request_json("/api/login", "POST", {"username": "entry.user", "password": "Temporary12345"})["token"]
+        self.request_json("/api/password", "POST", {"current_password": "Temporary12345", "new_password": "EntryUserStrong123"}, entry_token)
         created = self.request_json(
             f"/api/studies/{study_id}/participants",
             "POST",
@@ -495,7 +505,29 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertEqual(export_denied.exception.code, 403)
         export_denied.exception.close()
 
+        case = self.request_json(
+            f"/api/studies/{study_id}/case-intake",
+            "POST",
+            {
+                "case_uid": "GROUP-CASE-001",
+                "title": "Group restricted case",
+                "participant_id": created["id"],
+                "source_text": "A deidentified group A case for access testing.",
+                "files": [{"name": "group-note.txt", "type": "text/plain", "data": "Z3JvdXAgbm90ZQ=="}],
+            },
+            entry_token,
+        )["case"]
+        self.assertEqual(len(self.request_json(f"/api/studies/{study_id}/case-intake", token=entry_token)["cases"]), 1)
+        other_entry_token = self.request_json("/api/login", "POST", {"username": "entry.other", "password": "Temporary12345"})["token"]
+        self.request_json("/api/password", "POST", {"current_password": "Temporary12345", "new_password": "OtherEntryStrong123"}, other_entry_token)
+        self.assertEqual(self.request_json(f"/api/studies/{study_id}/case-intake", token=other_entry_token)["cases"], [])
+        with self.assertRaises(HTTPError) as file_denied:
+            self.request_raw(f"/api/studies/{study_id}/case-intake/{case['id']}/files/{case['files'][0]['id']}", token=other_entry_token)
+        self.assertEqual(file_denied.exception.code, 404)
+        file_denied.exception.close()
+
         analyst_token = self.request_json("/api/login", "POST", {"username": "analyst.user", "password": "Temporary12345"})["token"]
+        self.request_json("/api/password", "POST", {"current_password": "Temporary12345", "new_password": "AnalystStrong123"}, analyst_token)
         with self.assertRaises(HTTPError) as edit_denied:
             self.request_json(f"/api/studies/{study_id}/participants", "POST", {"study_uid": "RBAC002"}, analyst_token)
         self.assertEqual(edit_denied.exception.code, 403)

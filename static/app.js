@@ -45,6 +45,18 @@ const state = {
 
 const draftTimers = new Map();
 const app = document.querySelector("#app");
+const ROLE_LABELS = {
+  super_admin: "System Admin",
+  admin: "System Admin",
+  owner: "Project Admin / PI",
+  project_admin: "Project Admin / PI",
+  pi: "Project Admin / PI",
+  data_entry: "Data Entry",
+  reviewer: "Reviewer",
+  analyst: "Analyst",
+  viewer: "Viewer",
+  read_only: "Viewer",
+};
 
 async function api(path, options = {}) {
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
@@ -183,6 +195,10 @@ function can(permission) {
     read_only: ["view_analysis"],
   };
   return (permissions[role] || []).includes(permission);
+}
+
+function roleLabel(role) {
+  return ROLE_LABELS[role] || role;
 }
 
 function render() {
@@ -1471,7 +1487,7 @@ function accessView() {
             <label>Temporary password<input name="password" type="password" minlength="10" required /></label>
             <label>Global role
               <select name="role">
-                ${globalRoleOptions.map((role) => `<option value="${role}">${role}</option>`).join("")}
+                ${globalRoleOptions.map((role) => `<option value="${role}">${roleLabel(role)}</option>`).join("")}
               </select>
             </label>
             <button>Create User</button>
@@ -1497,7 +1513,7 @@ function accessView() {
         </label>
         <label>Project role
           <select name="role">
-            ${roleOptions.map((role) => `<option value="${role}">${role}</option>`).join("")}
+            ${roleOptions.map((role) => `<option value="${role}">${roleLabel(role)}</option>`).join("")}
           </select>
         </label>
         <label>Data access group
@@ -1521,7 +1537,7 @@ function accessView() {
             ${state.studyMembers.map((item) => `
               <tr>
                 <td>${escapeHtml(item.username)}<br><span class="small">${escapeHtml(item.display_name)}</span></td>
-                <td><span class="pill">${escapeHtml(item.role)}</span></td>
+                <td><span class="pill">${escapeHtml(roleLabel(item.role))}</span></td>
                 <td>${escapeHtml(item.data_group_name || "All groups")}</td>
                 <td>${item.active ? "Yes" : "No"}</td>
               </tr>

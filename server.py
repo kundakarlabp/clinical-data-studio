@@ -2668,6 +2668,7 @@ class App(BaseHTTPRequestHandler):
             return
         conn.execute("UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?", (encode_password(new_password), user["id"]))
         audit(conn, user["id"], "change_password", "user", user["id"], None, {"user_id": user["id"]})
+        conn.commit()
         self.send_json({"ok": True})
 
     def assist_crf(self, conn: sqlite3.Connection, user: dict) -> None:
@@ -3009,7 +3010,7 @@ class App(BaseHTTPRequestHandler):
             if not (membership_has(membership, "view_analysis") or membership_has(membership, "review_data") or membership_has(membership, "export_data")):
                 self.send_error_json("Academic workbench permission required", 403)
                 return
-            return self.academic_workbench(conn, user, method, study_id, parts, query)
+            return self.academic_workbench(conn, user, method, study_id, parts, query, membership)
         if resource == "backups":
             if not membership_has(membership, "manage_study"):
                 self.send_error_json("Study management permission required", 403)
@@ -3756,9 +3757,39 @@ class App(BaseHTTPRequestHandler):
         payload["latest_ai_review"] = reviews[0] if reviews else None
         return payload
 
-    def case_rows(self, conn: sqlite3.Connection, study_id: int) -> list[dict]:
-        cases = rows(conn, "SELECT * FROM case_intakes WHERE study_id = ? ORDER BY updated_at DESC, id DESC", (study_id,))
+    def case_rows(self, conn: sqlite3.Connection, study_id: int, membership: dict | None = None, user: dict | None = None) -> list[dict]:
+        if membership and membership.get("data_group_id"):
+            cases = rows(
+                conn,
+                """
+                SELECT case_intakes.*
+                FROM case_intakes
+                LEFT JOIN participants ON participants.id = case_intakes.participant_id
+                WHERE case_intakes.study_id = ?
+                  AND (
+                    participants.data_group_id = ?
+                    OR (case_intakes.participant_id IS NULL AND case_intakes.created_by = ?)
+                  )
+                ORDER BY case_intakes.updated_at DESC, case_intakes.id DESC
+                """,
+                (study_id, membership["data_group_id"], user["id"] if user else 0),
+            )
+        else:
+            cases = rows(conn, "SELECT * FROM case_intakes WHERE study_id = ? ORDER BY updated_at DESC, id DESC", (study_id,))
         return [self.case_payload(conn, item) for item in cases]
+
+    def case_for_member(self, conn: sqlite3.Connection, study_id: int, case_id: int, membership: dict | None, user: dict) -> dict | None:
+        case_row = row(conn, "SELECT * FROM case_intakes WHERE id = ? AND study_id = ?", (case_id, study_id))
+        if not case_row:
+            return None
+        if membership and membership.get("data_group_id"):
+            if case_row.get("participant_id"):
+                participant = row(conn, "SELECT data_group_id FROM participants WHERE id = ? AND study_id = ?", (case_row["participant_id"], study_id))
+                if not participant or participant.get("data_group_id") != membership["data_group_id"]:
+                    return None
+            elif case_row.get("created_by") != user["id"]:
+                return None
+        return case_row
 
     def save_case_files(self, conn: sqlite3.Connection, user_id: int, study_id: int, case_id: int, files: list) -> None:
         if len(files) > 8:
@@ -3811,17 +3842,20 @@ class App(BaseHTTPRequestHandler):
 
     def case_intake(self, conn, user, method, study_id, parts, membership) -> None:
         if method == "GET" and len(parts) == 4:
-            cases = self.case_rows(conn, study_id)
+            cases = self.case_rows(conn, study_id, membership, user)
             self.send_json({"cases": cases, "series": case_series_summary(cases), "ai": ai_status()})
             return
         if method == "GET" and len(parts) == 5 and parts[4] == "export":
             if not membership_has(membership, "export_data") and not membership_has(membership, "view_analysis"):
                 self.send_error_json("Export permission required", 403)
                 return
-            return self.export_case_intake_csv(conn, study_id)
+            return self.export_case_intake_csv(conn, study_id, membership, user)
         if method == "GET" and len(parts) == 7 and parts[5] == "files":
             case_id = int(parts[4])
             file_id = int(parts[6])
+            if not self.case_for_member(conn, study_id, case_id, membership, user):
+                self.send_error_json("Case evidence file not found", 404)
+                return
             file_row = row(conn, "SELECT * FROM case_files WHERE id = ? AND case_id = ? AND study_id = ?", (file_id, case_id, study_id))
             if not file_row:
                 self.send_error_json("Case evidence file not found", 404)
@@ -3842,13 +3876,13 @@ class App(BaseHTTPRequestHandler):
             return
         if method == "POST" and len(parts) == 6 and parts[5] == "ai-review":
             case_id = int(parts[4])
-            case_row = row(conn, "SELECT * FROM case_intakes WHERE id = ? AND study_id = ?", (case_id, study_id))
+            case_row = self.case_for_member(conn, study_id, case_id, membership, user)
             if not case_row:
                 self.send_error_json("Case not found", 404)
                 return
             payload = self.body()
             question = str(payload.get("question", "")).strip()
-            all_cases = self.case_rows(conn, study_id)
+            all_cases = self.case_rows(conn, study_id, membership, user)
             case_item = self.case_payload(conn, case_row)
             status = ai_status()
             mode = "local"
@@ -3891,6 +3925,11 @@ class App(BaseHTTPRequestHandler):
             if participant_id and not row(conn, "SELECT id FROM participants WHERE id = ? AND study_id = ?", (participant_id, study_id)):
                 self.send_error_json("Linked participant not found", 404)
                 return
+            if participant_id and membership.get("data_group_id"):
+                participant = row(conn, "SELECT data_group_id FROM participants WHERE id = ? AND study_id = ?", (participant_id, study_id))
+                if not participant or participant.get("data_group_id") != membership["data_group_id"]:
+                    self.send_error_json("Linked participant is outside your data access group", 403)
+                    return
             extracted = extract_case_intelligence(source_text, title)
             status = str(payload.get("status", "draft")).strip().lower()
             if status not in {"draft", "triaged", "ready", "excluded"}:
@@ -3910,7 +3949,7 @@ class App(BaseHTTPRequestHandler):
             return
         if method == "PATCH" and len(parts) == 5:
             case_id = int(parts[4])
-            before = row(conn, "SELECT * FROM case_intakes WHERE id = ? AND study_id = ?", (case_id, study_id))
+            before = self.case_for_member(conn, study_id, case_id, membership, user)
             if not before:
                 self.send_error_json("Case not found", 404)
                 return
@@ -3933,8 +3972,8 @@ class App(BaseHTTPRequestHandler):
             return
         self.send_error_json("Unsupported case intake operation", 405)
 
-    def export_case_intake_csv(self, conn, study_id: int) -> None:
-        cases = self.case_rows(conn, study_id)
+    def export_case_intake_csv(self, conn, study_id: int, membership: dict | None, user: dict) -> None:
+        cases = self.case_rows(conn, study_id, membership, user)
         fieldnames = ["case_uid", "title", "status", "group", "age", "sex", "diagnosis", "presentation", "investigations", "treatment", "outcome", "missing_fields", "warnings", "file_count", "updated_at"]
         text_lines = []
         class Sink:
@@ -4824,9 +4863,9 @@ class App(BaseHTTPRequestHandler):
             item["metadata"] = load_json(item.pop("metadata_json"), {})
         return data
 
-    def academic_payload(self, conn, study_id: int) -> dict:
+    def academic_payload(self, conn, study_id: int, membership: dict | None = None, user: dict | None = None) -> dict:
         study = row(conn, "SELECT * FROM studies WHERE id = ?", (study_id,))
-        cases = self.case_rows(conn, study_id)
+        cases = self.case_rows(conn, study_id, membership, user)
         cv_items = self.academic_cv_rows(conn, study_id)
         opportunities = publication_opportunities(cases)
         ai_review_count = row(conn, "SELECT COUNT(*) AS count FROM case_ai_reviews WHERE study_id = ?", (study_id,))["count"]
@@ -4851,13 +4890,13 @@ class App(BaseHTTPRequestHandler):
             ],
         }
 
-    def academic_workbench(self, conn, user, method, study_id, parts, query) -> None:
+    def academic_workbench(self, conn, user, method, study_id, parts, query, membership) -> None:
         if method == "GET" and len(parts) == 4:
-            self.send_json({"academic": self.academic_payload(conn, study_id)})
+            self.send_json({"academic": self.academic_payload(conn, study_id, membership, user)})
             return
         if method == "GET" and len(parts) == 5 and parts[4] == "export":
             fmt = (query.get("format") or ["md"])[0].lower()
-            payload = self.academic_payload(conn, study_id)
+            payload = self.academic_payload(conn, study_id, membership, user)
             audit(conn, user["id"], "export", "academic_cv_item", study_id, None, {"format": fmt}, study_id=study_id, **self.audit_context())
             if fmt == "csv":
                 fields = ["item_type", "title", "role", "status", "item_date", "citation", "notes", "linked_case_uid"]

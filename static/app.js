@@ -33,6 +33,7 @@ const state = {
   adminLogs: [],
   view: "dashboard",
   selectedParticipantId: 0,
+  participantSearch: "",
   selectedEventId: Number(localStorage.getItem("cds_event_id") || 0),
   editingFormId: 0,
   menuOpen: false,
@@ -42,7 +43,20 @@ const state = {
   error: "",
 };
 
+const draftTimers = new Map();
 const app = document.querySelector("#app");
+const ROLE_LABELS = {
+  super_admin: "System Admin",
+  admin: "System Admin",
+  owner: "Project Admin / PI",
+  project_admin: "Project Admin / PI",
+  pi: "Project Admin / PI",
+  data_entry: "Data Entry",
+  reviewer: "Reviewer",
+  analyst: "Analyst",
+  viewer: "Viewer",
+  read_only: "Viewer",
+};
 
 async function api(path, options = {}) {
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
@@ -83,6 +97,7 @@ async function loadAll() {
     const me = await api("/api/me");
     state.user = me.user;
     state.memberships = me.memberships || [];
+    if (state.user?.must_change_password) return renderPasswordChangeRequired();
     const studies = await api("/api/studies");
     state.studies = studies.studies;
     if (!state.studyId && state.studies[0]) state.studyId = state.studies[0].id;
@@ -182,8 +197,13 @@ function can(permission) {
   return (permissions[role] || []).includes(permission);
 }
 
+function roleLabel(role) {
+  return ROLE_LABELS[role] || role;
+}
+
 function render() {
   if (!state.token) return renderLogin();
+  if (state.user?.must_change_password) return renderPasswordChangeRequired();
   const study = activeStudy();
   app.innerHTML = `
     <div class="shell">
@@ -213,6 +233,8 @@ function render() {
           ${navButton("analysis", "Analysis")}
           ${can("view_analysis") || can("export_data") ? navButton("reports", "Reports") : ""}
           ${can("view_analysis") || can("export_data") ? navButton("academic", "Academic CV") : ""}
+          ${can("enter_data") ? navButton("local-drafts", "Local Drafts") : ""}
+          ${can("manage_study") || can("manage_users") ? navButton("mobile-setup", "Mobile Setup") : ""}
           ${can("manage_study") ? navButton("backups", "Backups") : ""}
           ${navButton("audit", "Audit Trail")}
           ${can("manage_users") ? navButton("access", "Access") : ""}
@@ -242,11 +264,28 @@ function render() {
           ${state.error ? `<div class="notice error">${escapeHtml(state.error)}</div>` : ""}
           ${route()}
         </div>
+        ${mobileBottomNav()}
       </section>
     </div>
   `;
   bindShell();
   bindRoute();
+}
+
+function mobileBottomNav() {
+  const items = [
+    ["dashboard", "Home"],
+    ["data", "Entry"],
+    ["case-intake", "Cases"],
+    ["local-drafts", "Drafts"],
+    ["academic", "CV"],
+  ].filter(([view]) => {
+    if (view === "case-intake") return can("enter_data") || can("view_analysis") || can("review_data");
+    if (view === "local-drafts") return can("enter_data");
+    if (view === "academic") return can("view_analysis") || can("export_data");
+    return true;
+  });
+  return `<nav class="bottom-nav">${items.map(([view, label]) => `<button data-view="${view}" class="${state.view === view ? "active" : ""}">${label}</button>`).join("")}</nav>`;
 }
 
 function navButton(view, label) {
@@ -268,10 +307,12 @@ function route() {
   if (state.view === "analysis") return analysisView();
   if (state.view === "reports") return reportsView();
   if (state.view === "academic") return academicView();
+  if (state.view === "local-drafts") return localDraftsView();
   if (state.view === "backups") return backupsView();
   if (state.view === "audit") return auditView();
   if (state.view === "access") return accessView();
   if (state.view === "remote") return remoteAccessView();
+  if (state.view === "mobile-setup") return mobileSetupView();
   if (state.view === "settings") return settingsView();
   return dashboardView();
 }
@@ -460,7 +501,11 @@ function participantsTable(participants) {
 }
 
 function dataView() {
-  const selected = state.participants.find((item) => item.id === state.selectedParticipantId) || state.participants[0];
+  const search = state.participantSearch.trim().toLowerCase();
+  const filteredParticipants = search
+    ? state.participants.filter((item) => [item.study_uid, item.initials, item.status].join(" ").toLowerCase().includes(search))
+    : state.participants;
+  const selected = filteredParticipants.find((item) => item.id === state.selectedParticipantId) || filteredParticipants[0] || state.participants.find((item) => item.id === state.selectedParticipantId) || state.participants[0];
   const selectedEvent = state.events.find((event) => event.id === state.selectedEventId) || state.events[0];
   const mappedFormIds = state.formEvents.filter((item) => item.event_id === selectedEvent?.id).map((item) => item.form_id);
   const visibleForms = mappedFormIds.length ? state.forms.filter((form) => mappedFormIds.includes(form.id)) : state.forms;
@@ -469,10 +514,14 @@ function dataView() {
     <section class="panel">
       <h2>Data Entry</h2>
       <div class="form-grid">
+        <label class="full">
+          Search participant
+          <input id="participant-search" value="${escapeHtml(state.participantSearch)}" placeholder="Search study ID, initials, or status" autocomplete="off" />
+        </label>
         <label>
           Participant
           <select id="participant-picker">
-            ${state.participants.map((item) => `<option value="${item.id}" ${selected?.id === item.id ? "selected" : ""}>${escapeHtml(item.study_uid)} ${escapeHtml(item.initials)}</option>`).join("")}
+            ${filteredParticipants.map((item) => `<option value="${item.id}" ${selected?.id === item.id ? "selected" : ""}>${escapeHtml(item.study_uid)} ${escapeHtml(item.initials)}</option>`).join("")}
           </select>
         </label>
         <label>
@@ -482,6 +531,9 @@ function dataView() {
           </select>
         </label>
       </div>
+      <div class="recent-strip">
+        ${state.participants.slice(0, 6).map((item) => `<button type="button" class="secondary" data-enter="${item.id}">${escapeHtml(item.study_uid)}</button>`).join("")}
+      </div>
     </section>
     <section class="grid two">${entryCards}</section>
   `;
@@ -490,13 +542,15 @@ function dataView() {
 function entryCard(participant, form, selectedEvent) {
   const existing = state.entries.find((entry) => entry.participant_id === participant.id && entry.form_id === form.id && (entry.event_id === selectedEvent?.id || (!entry.event_id && entry.event_name === (selectedEvent?.code || "Baseline")))) || { data: {}, status: "draft", event_name: selectedEvent?.code || "Baseline", event_id: selectedEvent?.id || null, repeat_instance: 1 };
   const locked = Boolean(existing.locked_at);
+  const draftKey = window.CDSOfflineDrafts?.entryKey({ studyId: state.studyId, participantId: participant.id, formId: form.id, eventId: selectedEvent?.id || null, repeatInstance: existing.repeat_instance || 1 }) || "";
   return `
-    <form class="card stack entry-form" data-form-id="${form.id}" data-participant-id="${participant.id}">
+    <form class="card stack entry-form" data-form-id="${form.id}" data-participant-id="${participant.id}" data-entry-id="${existing.id || ""}" data-entry-updated-at="${existing.updated_at || 0}" data-draft-key="${escapeHtml(draftKey)}">
       <div class="row">
         <div>
           <h3>${escapeHtml(form.name)}</h3>
           <span class="pill ${existing.status === "complete" ? "ok" : "warn"}">${escapeHtml(existing.status)}</span>
           ${locked ? `<span class="pill ok">locked</span>` : ""}
+          <span class="pill draft-status" data-draft-status>Synced</span>
         </div>
         <label>Event<input name="event_name" value="${escapeHtml(selectedEvent?.name || existing.event_name || "Baseline")}" readonly /></label>
       </div>
@@ -520,8 +574,9 @@ function entryCard(participant, form, selectedEvent) {
           <label>Reason<input name="field_state_reason" placeholder="Review note" /></label>
         </div>
       ` : ""}
-      <div class="split-actions">
+      <div class="split-actions sticky-save">
         <button>Save CRF</button>
+        <button type="button" class="secondary" data-save-local-draft>Save Draft</button>
         <button type="button" class="secondary" data-query-form="${form.id}" data-query-participant="${participant.id}">Open Query</button>
         ${existing.id && !locked ? `<button type="button" class="secondary" data-lock-entry="${existing.id}">Lock</button>` : ""}
         ${existing.id && locked ? `<button type="button" class="warning" data-unlock-entry="${existing.id}">Unlock</button>` : ""}
@@ -907,6 +962,30 @@ function queriesView() {
   `;
 }
 
+function mobileSetupView() {
+  return `
+    <section class="panel">
+      <div class="row">
+        <div>
+          <h2>Mobile App Setup</h2>
+          <p>Use Android Chrome as the first mobile app. Install from the browser after the central study server is running.</p>
+        </div>
+        ${state.installPrompt && !state.standalone ? `<button id="install-app-inline">Install App</button>` : `<span class="pill ${state.standalone ? "ok" : ""}">${state.standalone ? "installed" : "browser mode"}</span>`}
+      </div>
+      <div class="readiness-list">
+        ${[
+          "Open this app URL in Android Chrome.",
+          "Log in with your named account.",
+          "Tap Install App if shown, or Chrome menu -> Add to Home screen.",
+          "Use Data Entry for CRFs and Case Intake for photos, audio, PDFs, or rough notes.",
+          "If offline, local CRF drafts are stored on the device and must be synced later.",
+          "Never share the admin account; create one user account per data-entry person."
+        ].map((item) => `<div class="readiness-item"><span class="pill ok">step</span><div><strong>${escapeHtml(item)}</strong></div></div>`).join("")}
+      </div>
+    </section>
+  `;
+}
+
 function qualityView() {
   return `
     <section class="panel">
@@ -973,7 +1052,8 @@ function caseIntakeView() {
           <button type="button" class="secondary" id="case-dictate">Start Dictation</button>
           <span class="small">Dictation works only in browsers that support speech recognition. Uploaded audio is stored as evidence; local transcription is not automatic.</span>
         </div>
-        <label>Evidence files<input name="files" type="file" multiple accept="image/*,audio/*,.pdf,.txt,.csv" /></label>
+        <label>Evidence files<input name="files" type="file" multiple accept="image/*,audio/*,application/pdf,text/plain,text/csv,.pdf,.txt,.csv" /></label>
+        <div id="case-file-preview" class="file-preview"></div>
         <button>Save And Organize Case</button>
       </form>
     </section>
@@ -1277,6 +1357,59 @@ function reportFilterText(filters) {
   return parts.length ? parts.join(", ") : "No filters";
 }
 
+function localDraftsView() {
+  return `
+    <section class="panel">
+      <div class="row">
+        <div>
+          <h2>Local Drafts</h2>
+          <p>These CRF drafts are saved in this browser on this device. Sync before clearing browser data or changing devices.</p>
+        </div>
+        <button id="refresh-drafts" class="secondary">Refresh</button>
+      </div>
+      <div id="draft-list" class="stack"><p>Loading local drafts...</p></div>
+    </section>
+  `;
+}
+
+async function renderDraftList() {
+  const target = document.querySelector("#draft-list");
+  if (!target) return;
+  if (!window.CDSOfflineDrafts) {
+    target.innerHTML = `<div class="notice error">IndexedDB is not available. Offline drafts cannot be used in this browser.</div>`;
+    return;
+  }
+  const drafts = await window.CDSOfflineDrafts.listDrafts(state.studyId).catch((error) => {
+    target.innerHTML = `<div class="notice error">${escapeHtml(error.message)}</div>`;
+    return [];
+  });
+  target.innerHTML = drafts.length ? drafts.map((draft) => {
+    const participant = state.participants.find((item) => item.id === draft.participantId);
+    const form = state.forms.find((item) => item.id === draft.formId);
+    const serverEntry = state.entries.find((entry) => entry.participant_id === draft.participantId && entry.form_id === draft.formId && Number(entry.repeat_instance || 1) === Number(draft.repeatInstance || 1));
+    const conflict = serverEntry?.updated_at && draft.baselineUpdatedAt && serverEntry.updated_at !== draft.baselineUpdatedAt;
+    return `
+      <article class="card">
+        <div class="row">
+          <div>
+            <h3>${escapeHtml(form?.name || `Form ${draft.formId}`)}</h3>
+            <p>${escapeHtml(participant?.study_uid || `Participant ${draft.participantId}`)} - saved ${new Date(draft.updatedAt).toLocaleString()}</p>
+          </div>
+          <span class="pill ${conflict ? "bad" : "warn"}">${conflict ? "conflict" : "pending"}</span>
+        </div>
+        ${conflict ? `<div class="notice error">Server record changed after this draft started. Compare before syncing.</div>` : ""}
+        <pre class="draft-preview">${escapeHtml(JSON.stringify(draft.payload.data || {}, null, 2))}</pre>
+        <div class="split-actions">
+          <button type="button" data-sync-draft="${escapeHtml(draft.key)}">Sync Now</button>
+          <button type="button" class="secondary" data-delete-draft="${escapeHtml(draft.key)}">Discard Draft</button>
+        </div>
+      </article>
+    `;
+  }).join("") : `<p>No local drafts on this device.</p>`;
+  target.querySelectorAll("[data-sync-draft]").forEach((button) => button.addEventListener("click", () => syncLocalDraft(button.dataset.syncDraft)));
+  target.querySelectorAll("[data-delete-draft]").forEach((button) => button.addEventListener("click", () => deleteDraftByKey(button.dataset.deleteDraft)));
+}
+
 function backupsView() {
   return `
     <section class="panel">
@@ -1354,7 +1487,7 @@ function accessView() {
             <label>Temporary password<input name="password" type="password" minlength="10" required /></label>
             <label>Global role
               <select name="role">
-                ${globalRoleOptions.map((role) => `<option value="${role}">${role}</option>`).join("")}
+                ${globalRoleOptions.map((role) => `<option value="${role}">${roleLabel(role)}</option>`).join("")}
               </select>
             </label>
             <button>Create User</button>
@@ -1380,7 +1513,7 @@ function accessView() {
         </label>
         <label>Project role
           <select name="role">
-            ${roleOptions.map((role) => `<option value="${role}">${role}</option>`).join("")}
+            ${roleOptions.map((role) => `<option value="${role}">${roleLabel(role)}</option>`).join("")}
           </select>
         </label>
         <label>Data access group
@@ -1404,7 +1537,7 @@ function accessView() {
             ${state.studyMembers.map((item) => `
               <tr>
                 <td>${escapeHtml(item.username)}<br><span class="small">${escapeHtml(item.display_name)}</span></td>
-                <td><span class="pill">${escapeHtml(item.role)}</span></td>
+                <td><span class="pill">${escapeHtml(roleLabel(item.role))}</span></td>
                 <td>${escapeHtml(item.data_group_name || "All groups")}</td>
                 <td>${item.active ? "Yes" : "No"}</td>
               </tr>
@@ -1520,12 +1653,10 @@ function bindShell() {
     });
   });
   document.querySelector("#install-app")?.addEventListener("click", async () => {
-    const prompt = state.installPrompt;
-    if (!prompt) return;
-    prompt.prompt();
-    await prompt.userChoice.catch(() => null);
-    state.installPrompt = null;
-    render();
+    await promptInstall();
+  });
+  document.querySelector("#install-app-inline")?.addEventListener("click", async () => {
+    await promptInstall();
   });
   document.querySelector("#study-picker")?.addEventListener("change", async (event) => {
     state.studyId = Number(event.target.value);
@@ -1541,6 +1672,15 @@ function bindShell() {
   });
   document.querySelector("#export-csv")?.addEventListener("click", () => downloadApi(`/api/studies/${state.studyId}/export${currentMembership()?.role === "analyst" ? "?deidentified=1" : ""}`, "clinical_data_export.csv"));
   document.querySelector("#export-codebook")?.addEventListener("click", () => downloadApi(`/api/studies/${state.studyId}/codebook`, "clinical_data_codebook.csv"));
+}
+
+async function promptInstall() {
+    const prompt = state.installPrompt;
+    if (!prompt) return;
+    prompt.prompt();
+    await prompt.userChoice.catch(() => null);
+    state.installPrompt = null;
+    render();
 }
 
 function bindRoute() {
@@ -1568,7 +1708,10 @@ function bindRoute() {
   document.querySelector("#academic-cv-form")?.addEventListener("submit", submitAcademicCvItem);
   document.querySelector("#academic-export-md")?.addEventListener("click", () => downloadApi(`/api/studies/${state.studyId}/academic/export?format=md`, "academic_portfolio.md"));
   document.querySelector("#academic-export-csv")?.addEventListener("click", () => downloadApi(`/api/studies/${state.studyId}/academic/export?format=csv`, "academic_cv_tracker.csv"));
+  document.querySelector("#refresh-drafts")?.addEventListener("click", renderDraftList);
+  if (state.view === "local-drafts") renderDraftList();
   document.querySelector("#case-intake-form")?.addEventListener("submit", submitCaseIntake);
+  document.querySelector('#case-intake-form [name="files"]')?.addEventListener("change", previewCaseFiles);
   document.querySelector("#case-dictate")?.addEventListener("click", startCaseDictation);
   document.querySelector("#case-export")?.addEventListener("click", () => downloadApi(`/api/studies/${state.studyId}/case-intake/export`, "case_intake_export.csv"));
   document.querySelectorAll("[data-case-file]").forEach((button) => {
@@ -1603,6 +1746,10 @@ function bindRoute() {
     state.selectedParticipantId = Number(event.target.value);
     render();
   });
+  document.querySelector("#participant-search")?.addEventListener("input", (event) => {
+    state.participantSearch = event.target.value;
+    render();
+  });
   document.querySelector("#event-picker")?.addEventListener("change", (event) => {
     state.selectedEventId = Number(event.target.value);
     localStorage.setItem("cds_event_id", String(state.selectedEventId || ""));
@@ -1610,8 +1757,18 @@ function bindRoute() {
   });
   document.querySelectorAll(".entry-form").forEach((form) => {
     form.addEventListener("submit", submitEntry);
-    form.addEventListener("input", () => applyBranching(form));
+    form.addEventListener("input", () => {
+      applyBranching(form);
+      markDraftStatus(form, "Unsaved");
+      clearTimeout(draftTimers.get(form.dataset.draftKey));
+      draftTimers.set(form.dataset.draftKey, setTimeout(() => saveLocalDraft(form).catch(() => markDraftStatus(form, "Draft error")), 1200));
+    });
+    form.querySelector("[data-save-local-draft]")?.addEventListener("click", () => saveLocalDraft(form).catch((error) => {
+      state.error = error.message;
+      render();
+    }));
     applyBranching(form);
+    restoreLocalDraft(form);
   });
   document.querySelectorAll("[data-query-form]").forEach((button) => button.addEventListener("click", openQuery));
   document.querySelectorAll("[data-close-query]").forEach((button) => button.addEventListener("click", () => closeQuery(button.dataset.closeQuery)));
@@ -1983,6 +2140,18 @@ async function submitCaseIntake(event) {
   }
 }
 
+function previewCaseFiles(event) {
+  const target = document.querySelector("#case-file-preview");
+  if (!target) return;
+  const files = [...(event.target.files || [])];
+  target.innerHTML = files.length ? files.map((file) => {
+    const sizeMb = file.size / 1024 / 1024;
+    const warning = sizeMb > 8 ? " Large file; consider compressing before upload." : "";
+    const preview = file.type.startsWith("image/") ? `<img src="${URL.createObjectURL(file)}" alt="${escapeHtml(file.name)}" />` : "";
+    return `<div class="file-chip">${preview}<span>${escapeHtml(file.name)} (${sizeMb.toFixed(1)} MB)${warning}</span></div>`;
+  }).join("") : "";
+}
+
 function startCaseDictation() {
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SpeechRecognition) {
@@ -2043,6 +2212,34 @@ async function downloadApi(path, filename) {
     state.error = error.message;
     render();
   }
+}
+
+async function syncLocalDraft(key) {
+  try {
+    const draft = await window.CDSOfflineDrafts.getDraft(key);
+    if (!draft) return;
+    const serverEntry = state.entries.find((entry) => entry.participant_id === draft.participantId && entry.form_id === draft.formId && Number(entry.repeat_instance || 1) === Number(draft.repeatInstance || 1));
+    if (serverEntry?.updated_at && draft.baselineUpdatedAt && serverEntry.updated_at !== draft.baselineUpdatedAt && !confirm("The server record changed after this draft started. Replace the server record with this local draft?")) {
+      return;
+    }
+    await api(`/api/studies/${state.studyId}/entries`, {
+      method: "POST",
+      body: JSON.stringify(draft.payload),
+    });
+    await window.CDSOfflineDrafts.deleteDraft(key);
+    await loadStudy();
+    state.error = "Local draft synced.";
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function deleteDraftByKey(key) {
+  if (!confirm("Discard this local draft from this device?")) return;
+  await window.CDSOfflineDrafts.deleteDraft(key);
+  await renderDraftList();
 }
 
 async function createBackup() {
@@ -2203,6 +2400,23 @@ async function showFormVersions(formId) {
 async function submitEntry(event) {
   event.preventDefault();
   const form = event.target;
+  const payload = await collectEntryPayload(form);
+  try {
+    await api(`/api/studies/${state.studyId}/entries`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    await deleteLocalDraft(form);
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    markDraftStatus(form, "Error");
+    render();
+  }
+}
+
+async function collectEntryPayload(form) {
   const data = {};
   const payload = Object.fromEntries(new FormData(form));
   const formDef = state.forms.find((item) => item.id === Number(form.dataset.formId));
@@ -2223,26 +2437,68 @@ async function submitEntry(event) {
       }
     }
   }
-  try {
-    await api(`/api/studies/${state.studyId}/entries`, {
-      method: "POST",
-      body: JSON.stringify({
-        participant_id: Number(form.dataset.participantId),
-        form_id: Number(form.dataset.formId),
-        event_id: payload.event_id ? Number(payload.event_id) : null,
-        event_name: payload.event_name || "Baseline",
-        repeat_instance: Number(payload.repeat_instance || 1),
-        status: payload.status || "draft",
-        change_reason: payload.change_reason || "",
-        data,
-      }),
-    });
-    await loadStudy();
-    render();
-  } catch (error) {
-    state.error = error.message;
-    render();
+  return {
+    participant_id: Number(form.dataset.participantId),
+    form_id: Number(form.dataset.formId),
+    event_id: payload.event_id ? Number(payload.event_id) : null,
+    event_name: payload.event_name || "Baseline",
+    repeat_instance: Number(payload.repeat_instance || 1),
+    status: payload.status || "draft",
+    change_reason: payload.change_reason || "",
+    data,
+  };
+}
+
+function markDraftStatus(form, text) {
+  const target = form.querySelector("[data-draft-status]");
+  if (target) target.textContent = text;
+}
+
+async function saveLocalDraft(form) {
+  if (!window.CDSOfflineDrafts) return;
+  const payload = await collectEntryPayload(form);
+  await window.CDSOfflineDrafts.putDraft({
+    key: form.dataset.draftKey,
+    studyId: state.studyId,
+    participantId: Number(form.dataset.participantId),
+    formId: Number(form.dataset.formId),
+    eventId: payload.event_id,
+    repeatInstance: payload.repeat_instance,
+    baselineUpdatedAt: Number(form.dataset.entryUpdatedAt || 0),
+    payload,
+  });
+  markDraftStatus(form, "Draft saved");
+}
+
+async function deleteLocalDraft(form) {
+  if (window.CDSOfflineDrafts && form.dataset.draftKey) {
+    await window.CDSOfflineDrafts.deleteDraft(form.dataset.draftKey).catch(() => null);
   }
+}
+
+async function restoreLocalDraft(form) {
+  if (!window.CDSOfflineDrafts || !form.dataset.draftKey) return;
+  const draft = await window.CDSOfflineDrafts.getDraft(form.dataset.draftKey).catch(() => null);
+  if (!draft) return;
+  const serverUpdatedAt = Number(form.dataset.entryUpdatedAt || 0);
+  if (serverUpdatedAt && draft.baselineUpdatedAt && serverUpdatedAt !== draft.baselineUpdatedAt) {
+    form.insertAdjacentHTML("afterbegin", `<div class="notice error">Local draft exists, but the server record changed after the draft started. Open Local Drafts to compare before syncing.</div>`);
+    markDraftStatus(form, "Conflict");
+    return;
+  }
+  applyEntryDraft(form, draft.payload);
+  markDraftStatus(form, "Unsynced draft");
+}
+
+function applyEntryDraft(form, payload) {
+  if (!payload?.data) return;
+  Object.entries(payload.data).forEach(([key, value]) => {
+    const field = form.elements[key];
+    if (!field || field.type === "file") return;
+    if (field instanceof RadioNodeList || field.length) return;
+    field.value = Array.isArray(value) ? value.join(", ") : value;
+  });
+  if (form.elements.status && payload.status) form.elements.status.value = payload.status;
 }
 
 async function lockEntry(id) {
@@ -2344,10 +2600,10 @@ function renderLogin() {
           <p>Local-network clinical research data capture for small teams.</p>
         </div>
         ${state.error ? `<div class="notice error">${escapeHtml(state.error)}</div>` : ""}
-        <label>Username<input name="username" value="admin" autocomplete="username" required /></label>
-        <label>Password<input name="password" type="password" value="admin123" autocomplete="current-password" required /></label>
+        <label>Username<input name="username" autocomplete="username" required /></label>
+        <label>Password<input name="password" type="password" autocomplete="current-password" required /></label>
         <button>Login</button>
-        <p class="small">Default credentials are for first startup only. Change them before real research use.</p>
+        <p class="small">Use the named account provided by your study administrator.</p>
       </form>
     </section>
   `;
@@ -2360,11 +2616,50 @@ function renderLogin() {
       state.user = result.user;
       state.error = "";
       localStorage.setItem("cds_token", state.token);
+      if (state.user?.must_change_password) return renderPasswordChangeRequired();
       await loadAll();
     } catch (error) {
       state.error = error.message;
       renderLogin();
     }
+  });
+}
+
+function renderPasswordChangeRequired() {
+  app.innerHTML = `
+    <section class="login">
+      <form id="forced-password-form" class="login-card stack">
+        <div>
+          <h1>Change Password</h1>
+          <p>Your administrator requires a new password before using clinical data screens.</p>
+        </div>
+        ${state.error ? `<div class="notice error">${escapeHtml(state.error)}</div>` : ""}
+        <label>Current password<input name="current_password" type="password" autocomplete="current-password" required /></label>
+        <label>New password<input name="new_password" type="password" minlength="10" autocomplete="new-password" required /></label>
+        <button>Update Password</button>
+        <button type="button" class="secondary" id="forced-logout">Logout</button>
+      </form>
+    </section>
+  `;
+  document.querySelector("#forced-password-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = Object.fromEntries(new FormData(event.target));
+    try {
+      await api("/api/password", { method: "POST", body: JSON.stringify(data) });
+      state.error = "";
+      state.user.must_change_password = 0;
+      await loadAll();
+    } catch (error) {
+      state.error = error.message;
+      renderPasswordChangeRequired();
+    }
+  });
+  document.querySelector("#forced-logout").addEventListener("click", async () => {
+    await api("/api/logout", { method: "POST", body: "{}" }).catch(() => {});
+    state.token = "";
+    state.user = null;
+    localStorage.removeItem("cds_token");
+    renderLogin();
   });
 }
 
@@ -2377,8 +2672,8 @@ function renderSetup() {
           <p>Create the permanent administrator account before entering research data.</p>
         </div>
         ${state.error ? `<div class="notice error">${escapeHtml(state.error)}</div>` : ""}
-        <label>Admin username<input name="username" value="admin" autocomplete="username" required /></label>
-        <label>Display name<input name="display_name" value="Administrator" required /></label>
+        <label>Admin username<input name="username" placeholder="admin" autocomplete="username" required /></label>
+        <label>Display name<input name="display_name" placeholder="Study Administrator" required /></label>
         <label>New password<input name="password" type="password" minlength="12" autocomplete="new-password" required /></label>
         <label>Confirm password<input name="confirm_password" type="password" minlength="12" autocomplete="new-password" required /></label>
         <button>Secure App</button>
@@ -2421,6 +2716,12 @@ window.addEventListener("appinstalled", () => {
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", () => {
     navigator.serviceWorker.register("/service-worker.js").catch(() => {});
+  });
+  navigator.serviceWorker.addEventListener("message", (event) => {
+    if (event.data?.type === "CDS_APP_UPDATED") {
+      state.error = "App update installed. Refresh if anything looks outdated.";
+      render();
+    }
   });
 }
 

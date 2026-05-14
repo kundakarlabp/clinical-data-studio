@@ -1,5 +1,6 @@
 from pathlib import Path
 import unittest
+import json
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,21 +14,40 @@ class FrontendStaticTests(unittest.TestCase):
         service_worker = (ROOT / "static" / "service-worker.js").read_text(encoding="utf-8")
         self.assertIn('name="viewport"', index)
         self.assertIn('rel="manifest"', index)
+        self.assertIn('/offline-drafts.js', index)
         self.assertIn("apple-mobile-web-app-capable", index)
         self.assertIn("@media (max-width: 860px)", css)
         self.assertIn("connection.online", css)
         self.assertIn('"display"', manifest)
         self.assertIn('"icons"', manifest)
+        manifest_json = json.loads(manifest)
+        icon_sources = {icon["src"] for icon in manifest_json["icons"]}
+        self.assertIn("/icon-192.png", icon_sources)
+        self.assertIn("/icon-512.png", icon_sources)
+        self.assertIn("/icon-maskable-512.png", icon_sources)
+        for icon in icon_sources:
+            if icon.endswith(".png"):
+                self.assertTrue((ROOT / "static" / icon.lstrip("/")).exists())
         self.assertIn("clinical-data-studio", service_worker)
         self.assertIn("/offline.html", service_worker)
+        self.assertIn("/offline-drafts.js", service_worker)
+        self.assertIn('url.pathname.startsWith("/api/")', service_worker)
+        self.assertIn("event.respondWith(fetch(request));", service_worker)
 
     def test_frontend_uses_new_hardening_endpoints(self):
         app_js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertNotIn('value="admin"', app_js)
+        self.assertNotIn("admin123", app_js)
+        self.assertIn("renderPasswordChangeRequired", app_js)
         self.assertIn("/assist/summary", app_js)
         self.assertIn("assistDraft", app_js)
         self.assertIn("external AI is used only when explicitly enabled", app_js)
         self.assertIn("serviceWorker", app_js)
         self.assertIn("beforeinstallprompt", app_js)
+        self.assertIn("CDSOfflineDrafts", app_js)
+        self.assertIn("Local Drafts", app_js)
+        self.assertIn("Mobile App Setup", app_js)
+        self.assertIn("bottom-nav", app_js)
         self.assertIn("encrypted-backup-form", app_js)
         self.assertIn("Create Encrypted Archive", app_js)
         self.assertIn("First Run Setup", app_js)

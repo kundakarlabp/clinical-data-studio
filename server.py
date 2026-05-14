@@ -30,6 +30,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request as UrlRequest, urlopen as urlopen_request
 from xml.etree import ElementTree
 
+from ai.safety import ai_status_payload, assert_external_ai_safe as assert_ai_text_safe, deidentify_for_ai as deidentify_text_for_ai, phi_findings as detect_phi_findings
 from config import load_settings
 from storage import connect_database, migrate_postgres
 
@@ -38,12 +39,15 @@ STATIC = ROOT / "static"
 SETTINGS = load_settings()
 DATA = SETTINGS.data_dir
 BACKUPS = SETTINGS.backup_dir
+UPLOADS = SETTINGS.upload_dir
 DB_PATH = SETTINGS.sqlite_path
 DATABASE_BACKEND = SETTINGS.database_backend
 DATABASE_URL = SETTINGS.database_url
 HOST = SETTINGS.host
 PORT = SETTINGS.port
 PBKDF2_ROUNDS = 260_000
+SESSION_TTL_SECONDS = 60 * 60 * 24 * 14
+MIN_PRODUCTION_SECRET_LENGTH = 32
 DEFAULT_OPENAI_MODEL = "gpt-5.2"
 DEFAULT_TRANSCRIBE_MODEL = "gpt-4o-transcribe"
 CALC_OPERATORS = {
@@ -123,14 +127,6 @@ API_TOKEN_SCOPES = {
     "ai:use",
 }
 DEFAULT_API_TOKEN_SCOPES = sorted(API_TOKEN_SCOPES)
-PHI_PATTERNS = [
-    ("email", re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)),
-    ("phone", re.compile(r"(?:\+?\d[\s-]?){10,14}")),
-    ("aadhaar_like", re.compile(r"\b\d{4}[\s-]?\d{4}[\s-]?\d{4}\b")),
-    ("identifier_label", re.compile(r"\b(?:mrd|mrn|uhid|aadhaar|aadhar|hospital\s*number|phone|mobile|email|address)\b\s*[:#-]", re.IGNORECASE)),
-    ("patient_name_label", re.compile(r"\b(?:patient\s*name|name)\b\s*[:#-]\s*[A-Za-z][A-Za-z .'-]{2,}", re.IGNORECASE)),
-]
-
 SETTINGS.log_dir.mkdir(parents=True, exist_ok=True)
 LOG_FILE = SETTINGS.log_dir / "clinical-data-studio.log"
 logging.basicConfig(
@@ -148,6 +144,7 @@ def now() -> int:
 def db() -> sqlite3.Connection:
     DATA.mkdir(parents=True, exist_ok=True)
     BACKUPS.mkdir(parents=True, exist_ok=True)
+    UPLOADS.mkdir(parents=True, exist_ok=True)
     return connect_database(DATABASE_BACKEND, DB_PATH, DATABASE_URL)
 
 
@@ -172,6 +169,15 @@ def verify_password(password: str, encoded: str) -> bool:
 
 def token_digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def session_token_digest(token: str) -> str:
+    secret = SETTINGS.secret_key or "clinical-data-studio-development-session-key"
+    return hmac.new(secret.encode("utf-8"), token.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def prune_expired_sessions(conn: sqlite3.Connection) -> None:
+    conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now(),))
 
 
 def archive_key(passphrase: str, salt: bytes) -> bytes:
@@ -266,20 +272,7 @@ def data_protection_status() -> dict:
 
 
 def ai_status() -> dict:
-    provider = SETTINGS.ai_provider
-    ai_enabled = SETTINGS.ai_enabled
-    external_enabled = ai_enabled and provider == "openai" and bool(os.environ.get("OPENAI_API_KEY", "").strip())
-    multimodal_enabled = external_enabled and os.environ.get("CDS_AI_MULTIMODAL", "").strip().lower() in {"1", "true", "yes", "on"}
-    return {
-        "provider": provider if external_enabled else "local",
-        "ai_enabled": ai_enabled,
-        "external_ai_enabled": external_enabled,
-        "model": os.environ.get("CDS_AI_MODEL", DEFAULT_OPENAI_MODEL) if external_enabled else "local-rules",
-        "transcribe_model": os.environ.get("CDS_AI_TRANSCRIBE_MODEL", DEFAULT_TRANSCRIBE_MODEL) if external_enabled else "local-rules",
-        "multimodal_enabled": multimodal_enabled,
-        "phi_allowed": SETTINGS.ai_allow_phi,
-        "note": "External AI is disabled unless CDS_AI_ENABLED=true, CDS_AI_PROVIDER=openai, and OPENAI_API_KEY are configured. Uploaded evidence files are sent only when CDS_AI_MULTIMODAL=1.",
-    }
+    return ai_status_payload(SETTINGS, os.environ, DEFAULT_OPENAI_MODEL, DEFAULT_TRANSCRIBE_MODEL)
 
 
 def is_super_admin(user: dict | None) -> bool:
@@ -300,35 +293,15 @@ def token_has_scope(token_row: dict, scope: str) -> bool:
 
 
 def phi_findings(text: str) -> list[str]:
-    findings = []
-    for label, pattern in PHI_PATTERNS:
-        if pattern.search(text):
-            findings.append(label)
-    return sorted(set(findings))
+    return detect_phi_findings(text)
 
 
 def deidentify_for_ai(text: str, replacement: str = "Study participant") -> str:
-    cleaned = text
-    cleaned = PHI_PATTERNS[0][1].sub("[email removed]", cleaned)
-    cleaned = PHI_PATTERNS[1][1].sub("[phone removed]", cleaned)
-    cleaned = PHI_PATTERNS[2][1].sub("[identifier removed]", cleaned)
-    cleaned = re.sub(r"\b(patient\s*name|name)\b\s*[:#-]\s*[^\n,;]+", f"Patient name: {replacement}", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\b(address)\b\s*[:#-]\s*[^\n]+", "Address: [removed]", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\b(mrd|mrn|uhid|aadhaar|aadhar|hospital\s*number)\b\s*[:#-]\s*[^\s,;]+", r"\1: [removed]", cleaned, flags=re.IGNORECASE)
-    return cleaned
+    return deidentify_text_for_ai(text, replacement)
 
 
 def assert_external_ai_safe(text: str) -> None:
-    status = ai_status()
-    if not status["external_ai_enabled"] or status["phi_allowed"]:
-        return
-    findings = phi_findings(text)
-    if findings:
-        raise ValueError(
-            "External AI is blocked because the case text appears to contain identifiers: "
-            + ", ".join(findings)
-            + ". Remove identifiers or keep CDS_AI_ALLOW_PHI=false and use local AI only."
-        )
+    assert_ai_text_safe(text, ai_status())
 
 
 def git_commit() -> str:
@@ -452,6 +425,46 @@ def backup_files_for_study(study_id: int) -> list[dict]:
         if item.is_file() and item.name.startswith(f"study_{study_id}_") and item.suffix in (".sqlite3", ".cdsenc", ".dump"):
             files.append({"name": item.name, "size": item.stat().st_size, "created_at": int(item.stat().st_mtime), "encrypted": item.suffix == ".cdsenc"})
     return files
+
+
+def allowed_evidence_content_type(content_type: str, filename: str) -> bool:
+    suffix = Path(filename).suffix.lower()
+    return (
+        content_type.startswith("image/")
+        or content_type.startswith("audio/")
+        or content_type in {"application/pdf", "text/plain", "text/csv", "application/csv"}
+        or suffix in {".pdf", ".txt", ".csv"}
+    )
+
+
+def case_upload_dir(study_id: int, case_id: int) -> Path:
+    target = UPLOADS / "studies" / str(study_id) / "cases" / str(case_id)
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def stored_case_file_path(study_id: int, case_id: int, stored_filename: str) -> Path:
+    target = (UPLOADS / "studies" / str(study_id) / "cases" / str(case_id) / stored_filename).resolve()
+    root = (UPLOADS / "studies" / str(study_id) / "cases" / str(case_id)).resolve()
+    if not str(target).startswith(str(root)) or not target.exists():
+        raise FileNotFoundError("Case evidence file not found on disk")
+    return target
+
+
+def case_file_content(file_row: dict) -> bytes:
+    if file_row.get("data_base64"):
+        return base64.b64decode(file_row["data_base64"], validate=True)
+    stored_filename = file_row.get("stored_filename", "")
+    if not stored_filename:
+        raise FileNotFoundError("Case evidence file is missing stored filename")
+    return stored_case_file_path(file_row["study_id"], file_row["case_id"], stored_filename).read_bytes()
+
+
+def stored_case_filename(original_name: str) -> str:
+    suffix = Path(original_name).suffix.lower()
+    if suffix and not re.match(r"^\.[a-z0-9]{1,12}$", suffix):
+        suffix = ""
+    return f"{now()}_{secrets.token_hex(12)}{suffix}"
 
 
 def setup_required(conn: sqlite3.Connection) -> bool:
@@ -616,6 +629,9 @@ def migrate() -> None:
             add_column(conn, "survey_links", "expires_at", "BIGINT")
             add_column(conn, "survey_links", "one_time", "INTEGER NOT NULL DEFAULT 0")
             add_column(conn, "academic_cv_items", "active", "INTEGER NOT NULL DEFAULT 1")
+            add_column(conn, "case_files", "original_filename", "TEXT NOT NULL DEFAULT ''")
+            add_column(conn, "case_files", "stored_filename", "TEXT NOT NULL DEFAULT ''")
+            add_column(conn, "case_files", "sha256", "TEXT NOT NULL DEFAULT ''")
             seed_initial_data(conn)
             return
         conn.executescript(
@@ -876,8 +892,11 @@ def migrate() -> None:
                 case_id INTEGER NOT NULL REFERENCES case_intakes(id) ON DELETE CASCADE,
                 study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
                 name TEXT NOT NULL,
+                original_filename TEXT NOT NULL DEFAULT '',
+                stored_filename TEXT NOT NULL DEFAULT '',
                 content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
                 size INTEGER NOT NULL DEFAULT 0,
+                sha256 TEXT NOT NULL DEFAULT '',
                 data_base64 TEXT NOT NULL DEFAULT '',
                 created_by INTEGER REFERENCES users(id),
                 created_at INTEGER NOT NULL
@@ -967,6 +986,9 @@ def migrate() -> None:
         add_column(conn, "survey_links", "expires_at", "INTEGER")
         add_column(conn, "survey_links", "one_time", "INTEGER NOT NULL DEFAULT 0")
         add_column(conn, "academic_cv_items", "active", "INTEGER NOT NULL DEFAULT 1")
+        add_column(conn, "case_files", "original_filename", "TEXT NOT NULL DEFAULT ''")
+        add_column(conn, "case_files", "stored_filename", "TEXT NOT NULL DEFAULT ''")
+        add_column(conn, "case_files", "sha256", "TEXT NOT NULL DEFAULT ''")
         migrate_entries_unique_key(conn)
         seed_initial_data(conn)
         add_production_indexes(conn)
@@ -1322,7 +1344,7 @@ def draft_crf_schema_with_openai(text: str) -> dict:
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise ValueError("OPENAI_API_KEY is not configured")
-    model = os.environ.get("CDS_AI_MODEL", DEFAULT_OPENAI_MODEL).strip() or DEFAULT_OPENAI_MODEL
+    model = SETTINGS.ai_model or DEFAULT_OPENAI_MODEL
     schema = {
         "type": "object",
         "additionalProperties": False,
@@ -1387,7 +1409,7 @@ def openai_response_json(system_prompt: str, content_parts: list[dict], schema_n
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise ValueError("OPENAI_API_KEY is not configured")
-    model = os.environ.get("CDS_AI_MODEL", DEFAULT_OPENAI_MODEL).strip() or DEFAULT_OPENAI_MODEL
+    model = SETTINGS.ai_model or DEFAULT_OPENAI_MODEL
     request_payload = {
         "model": model,
         "input": [
@@ -1417,7 +1439,7 @@ def openai_transcribe_audio(filename: str, content_type: str, content: bytes) ->
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise ValueError("OPENAI_API_KEY is not configured")
-    model = os.environ.get("CDS_AI_TRANSCRIBE_MODEL", DEFAULT_TRANSCRIBE_MODEL).strip() or DEFAULT_TRANSCRIBE_MODEL
+    model = SETTINGS.ai_transcribe_model or DEFAULT_TRANSCRIBE_MODEL
     boundary = f"----cds{secrets.token_hex(16)}"
     chunks: list[bytes] = []
 
@@ -1914,9 +1936,9 @@ def build_openai_case_content(conn: sqlite3.Connection, study_id: int, case_item
         name = file_row["name"]
         content_type = file_row["content_type"] or mimetypes.guess_type(name)[0] or "application/octet-stream"
         try:
-            decoded = base64.b64decode(file_row["data_base64"], validate=True)
+            decoded = case_file_content(file_row)
         except Exception:
-            evidence_notes.append(f"{name}: could not decode stored evidence.")
+            evidence_notes.append(f"{name}: could not read stored evidence.")
             continue
         if (content_type.startswith("text/") or Path(name).suffix.lower() in {".txt", ".csv"}) and status["multimodal_enabled"]:
             text = decoded.decode("utf-8", errors="replace")[:10000]
@@ -1924,10 +1946,11 @@ def build_openai_case_content(conn: sqlite3.Connection, study_id: int, case_item
             safe_text = deidentify_for_ai(text, str(case_item.get("case_uid") or "Study participant")) if not status["phi_allowed"] else text
             content_parts.append({"type": "input_text", "text": f"Evidence text file {name}:\n{safe_text}"})
             evidence_notes.append(f"{name}: text evidence included after identifier safety check.")
-        elif content_type.startswith("image/") and status["multimodal_enabled"] and len(decoded) <= 8 * 1024 * 1024:
-            content_parts.append({"type": "input_image", "image_url": f"data:{content_type};base64,{file_row['data_base64']}"})
+        elif content_type.startswith("image/") and status["multimodal_enabled"] and len(decoded) <= status["max_file_mb"] * 1024 * 1024:
+            image_base64 = base64.b64encode(decoded).decode("ascii")
+            content_parts.append({"type": "input_image", "image_url": f"data:{content_type};base64,{image_base64}"})
             evidence_notes.append(f"{name}: image sent for AI vision review.")
-        elif content_type.startswith("audio/") and status["multimodal_enabled"] and len(decoded) <= 24 * 1024 * 1024:
+        elif content_type.startswith("audio/") and status["multimodal_enabled"] and len(decoded) <= status["max_file_mb"] * 1024 * 1024:
             transcript = openai_transcribe_audio(name, content_type, decoded)
             assert_external_ai_safe(transcript)
             safe_transcript = deidentify_for_ai(transcript, str(case_item.get("case_uid") or "Study participant")) if not status["phi_allowed"] else transcript
@@ -2043,6 +2066,16 @@ class App(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def end_headers(self) -> None:
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; object-src 'none'; frame-ancestors 'self'; base-uri 'self'; form-action 'self'")
+        self.send_header("X-Frame-Options", "SAMEORIGIN")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "same-origin")
+        self.send_header("Permissions-Policy", "camera=(self), microphone=(self), geolocation=()")
+        if SETTINGS.require_https or self.headers.get("x-forwarded-proto", "").lower() == "https":
+            self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        super().end_headers()
+
     def send_error_json(self, message: str, status: int = 400) -> None:
         self.send_json({"error": message}, status)
 
@@ -2073,6 +2106,7 @@ class App(BaseHTTPRequestHandler):
         if not header.startswith("Bearer "):
             return None
         token = header.removeprefix("Bearer ").strip()
+        digest = session_token_digest(token)
         user = row(
             conn,
             """
@@ -2080,7 +2114,7 @@ class App(BaseHTTPRequestHandler):
             FROM sessions JOIN users ON users.id = sessions.user_id
             WHERE sessions.token = ? AND sessions.expires_at > ? AND users.active = 1
             """,
-            (token, now()),
+            (digest, now()),
         )
         return user
 
@@ -2112,6 +2146,9 @@ class App(BaseHTTPRequestHandler):
 
                 user = self.require_user(conn)
                 if not user:
+                    return
+                if user.get("must_change_password") and path not in {"/api/me", "/api/password", "/api/logout"}:
+                    self.send_error_json("Password change required before continuing.", 403)
                     return
 
                 if path == "/api/me":
@@ -2175,8 +2212,9 @@ class App(BaseHTTPRequestHandler):
             self.send_error_json("Invalid username or password", 401)
             return
         token = secrets.token_urlsafe(32)
+        prune_expired_sessions(conn)
         conn.execute("UPDATE users SET failed_login_count = 0, locked_until = 0 WHERE id = ?", (user["id"],))
-        conn.execute("INSERT INTO sessions(token, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)", (token, user["id"], now() + 60 * 60 * 24 * 14, now()))
+        conn.execute("INSERT INTO sessions(token, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)", (session_token_digest(token), user["id"], now() + SESSION_TTL_SECONDS, now()))
         audit(conn, user["id"], "login", "session", None, None, {"username": username}, **self.audit_context())
         conn.commit()
         self.send_json({"token": token, "user": {"id": user["id"], "username": user["username"], "display_name": user["display_name"], "role": user["role"], "must_change_password": user.get("must_change_password", 0)}})
@@ -2215,8 +2253,9 @@ class App(BaseHTTPRequestHandler):
         header = self.headers.get("authorization", "")
         token = header.removeprefix("Bearer ").strip() if header.startswith("Bearer ") else ""
         if token:
-            session = row(conn, "SELECT user_id FROM sessions WHERE token = ?", (token,))
-            conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+            digest = session_token_digest(token)
+            session = row(conn, "SELECT user_id FROM sessions WHERE token = ?", (digest,))
+            conn.execute("DELETE FROM sessions WHERE token = ?", (digest,))
             audit(conn, session["user_id"] if session else None, "logout", "session", None, None, {"logged_out": bool(session)}, **self.audit_context())
         self.send_json({"ok": True})
 
@@ -2589,6 +2628,7 @@ class App(BaseHTTPRequestHandler):
             return
         conn.execute("UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?", (encode_password(new_password), user["id"]))
         audit(conn, user["id"], "change_password", "user", user["id"], None, {"user_id": user["id"]})
+        conn.commit()
         self.send_json({"ok": True})
 
     def assist_crf(self, conn: sqlite3.Connection, user: dict) -> None:
@@ -2930,7 +2970,7 @@ class App(BaseHTTPRequestHandler):
             if not (membership_has(membership, "view_analysis") or membership_has(membership, "review_data") or membership_has(membership, "export_data")):
                 self.send_error_json("Academic workbench permission required", 403)
                 return
-            return self.academic_workbench(conn, user, method, study_id, parts, query)
+            return self.academic_workbench(conn, user, method, study_id, parts, query, membership)
         if resource == "backups":
             if not membership_has(membership, "manage_study"):
                 self.send_error_json("Study management permission required", 403)
@@ -3656,7 +3696,16 @@ class App(BaseHTTPRequestHandler):
         payload = dict(case)
         payload["extracted"] = load_json(payload.pop("extracted_json", "{}"), {})
         payload["tags"] = load_json(payload.pop("tags_json", "[]"), [])
-        payload["files"] = rows(conn, "SELECT id, name, content_type, size, created_at FROM case_files WHERE case_id = ? ORDER BY id", (case["id"],))
+        payload["files"] = rows(
+            conn,
+            """
+            SELECT id, name, original_filename, content_type, size, sha256, created_at
+            FROM case_files
+            WHERE case_id = ?
+            ORDER BY id
+            """,
+            (case["id"],),
+        )
         reviews = rows(
             conn,
             "SELECT id, user_prompt, mode, response_json, file_count, created_by, created_at FROM case_ai_reviews WHERE case_id = ? ORDER BY id DESC LIMIT 5",
@@ -3668,55 +3717,118 @@ class App(BaseHTTPRequestHandler):
         payload["latest_ai_review"] = reviews[0] if reviews else None
         return payload
 
-    def case_rows(self, conn: sqlite3.Connection, study_id: int) -> list[dict]:
-        cases = rows(conn, "SELECT * FROM case_intakes WHERE study_id = ? ORDER BY updated_at DESC, id DESC", (study_id,))
+    def case_rows(self, conn: sqlite3.Connection, study_id: int, membership: dict | None = None, user: dict | None = None) -> list[dict]:
+        if membership and membership.get("data_group_id"):
+            cases = rows(
+                conn,
+                """
+                SELECT case_intakes.*
+                FROM case_intakes
+                LEFT JOIN participants ON participants.id = case_intakes.participant_id
+                WHERE case_intakes.study_id = ?
+                  AND (
+                    participants.data_group_id = ?
+                    OR (case_intakes.participant_id IS NULL AND case_intakes.created_by = ?)
+                  )
+                ORDER BY case_intakes.updated_at DESC, case_intakes.id DESC
+                """,
+                (study_id, membership["data_group_id"], user["id"] if user else 0),
+            )
+        else:
+            cases = rows(conn, "SELECT * FROM case_intakes WHERE study_id = ? ORDER BY updated_at DESC, id DESC", (study_id,))
         return [self.case_payload(conn, item) for item in cases]
+
+    def case_for_member(self, conn: sqlite3.Connection, study_id: int, case_id: int, membership: dict | None, user: dict) -> dict | None:
+        case_row = row(conn, "SELECT * FROM case_intakes WHERE id = ? AND study_id = ?", (case_id, study_id))
+        if not case_row:
+            return None
+        if membership and membership.get("data_group_id"):
+            if case_row.get("participant_id"):
+                participant = row(conn, "SELECT data_group_id FROM participants WHERE id = ? AND study_id = ?", (case_row["participant_id"], study_id))
+                if not participant or participant.get("data_group_id") != membership["data_group_id"]:
+                    return None
+            elif case_row.get("created_by") != user["id"]:
+                return None
+        return case_row
 
     def save_case_files(self, conn: sqlite3.Connection, user_id: int, study_id: int, case_id: int, files: list) -> None:
         if len(files) > 8:
             raise ValueError("Upload at most 8 evidence files for one case")
         total_size = 0
+        max_file_bytes = SETTINGS.max_upload_mb * 1024 * 1024
+        max_total_bytes = max_file_bytes * 3
         for item in files:
             name = Path(str(item.get("name", "case_evidence"))).name[:160] or "case_evidence"
             content_type = str(item.get("type") or item.get("content_type") or mimetypes.guess_type(name)[0] or "application/octet-stream")[:120]
             data_base64 = str(item.get("data", ""))
             if not data_base64:
                 continue
+            if not allowed_evidence_content_type(content_type, name):
+                raise ValueError(f"Evidence file {name} type is not allowed")
             try:
                 decoded = base64.b64decode(data_base64, validate=True)
             except Exception as exc:
                 raise ValueError(f"Evidence file {name} is not valid base64") from exc
-            size = int(item.get("size") or len(decoded))
-            if len(decoded) > 8 * 1024 * 1024:
-                raise ValueError(f"Evidence file {name} is larger than 8 MB")
+            size = len(decoded)
+            if len(decoded) > max_file_bytes:
+                raise ValueError(f"Evidence file {name} is larger than {SETTINGS.max_upload_mb} MB")
             total_size += len(decoded)
-            if total_size > 24 * 1024 * 1024:
-                raise ValueError("Total evidence upload for one case must stay under 24 MB")
-            conn.execute(
-                "INSERT INTO case_files(case_id, study_id, name, content_type, size, data_base64, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (case_id, study_id, name, content_type, size, data_base64, user_id, now()),
+            if total_size > max_total_bytes:
+                raise ValueError(f"Total evidence upload for one case must stay under {SETTINGS.max_upload_mb * 3} MB")
+            sha256 = hashlib.sha256(decoded).hexdigest()
+            stored_filename = stored_case_filename(name)
+            stored_path = case_upload_dir(study_id, case_id) / stored_filename
+            stored_path.write_bytes(decoded)
+            cur = conn.execute(
+                """
+                INSERT INTO case_files(
+                    case_id, study_id, name, original_filename, stored_filename,
+                    content_type, size, sha256, data_base64, created_by, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
+                """,
+                (case_id, study_id, name, name, stored_filename, content_type, size, sha256, user_id, now()),
+            )
+            audit(
+                conn,
+                user_id,
+                "upload",
+                "case_file",
+                cur.lastrowid,
+                None,
+                {"case_id": case_id, "name": name, "content_type": content_type, "size": size, "sha256": sha256},
+                study_id=study_id,
             )
 
     def case_intake(self, conn, user, method, study_id, parts, membership) -> None:
         if method == "GET" and len(parts) == 4:
-            cases = self.case_rows(conn, study_id)
+            cases = self.case_rows(conn, study_id, membership, user)
             self.send_json({"cases": cases, "series": case_series_summary(cases), "ai": ai_status()})
             return
         if method == "GET" and len(parts) == 5 and parts[4] == "export":
             if not membership_has(membership, "export_data") and not membership_has(membership, "view_analysis"):
                 self.send_error_json("Export permission required", 403)
                 return
-            return self.export_case_intake_csv(conn, study_id)
+            return self.export_case_intake_csv(conn, study_id, membership, user)
         if method == "GET" and len(parts) == 7 and parts[5] == "files":
             case_id = int(parts[4])
             file_id = int(parts[6])
+            if not self.case_for_member(conn, study_id, case_id, membership, user):
+                self.send_error_json("Case evidence file not found", 404)
+                return
             file_row = row(conn, "SELECT * FROM case_files WHERE id = ? AND case_id = ? AND study_id = ?", (file_id, case_id, study_id))
             if not file_row:
                 self.send_error_json("Case evidence file not found", 404)
                 return
-            content = base64.b64decode(file_row["data_base64"])
+            try:
+                content = case_file_content(file_row)
+            except Exception:
+                self.send_error_json("Case evidence file content is unavailable", 404)
+                return
+            audit(conn, user["id"], "download", "case_file", file_id, None, {"case_id": case_id, "name": file_row["name"]}, study_id=study_id, **self.audit_context())
+            conn.commit()
             self.send_response(200)
-            self.send_header("content-type", file_row["content_type"])
+            self.send_header("content-type", file_row["content_type"] or "application/octet-stream")
             self.send_header("content-disposition", f"attachment; filename={Path(file_row['name']).name}")
             self.send_header("content-length", str(len(content)))
             self.end_headers()
@@ -3724,13 +3836,13 @@ class App(BaseHTTPRequestHandler):
             return
         if method == "POST" and len(parts) == 6 and parts[5] == "ai-review":
             case_id = int(parts[4])
-            case_row = row(conn, "SELECT * FROM case_intakes WHERE id = ? AND study_id = ?", (case_id, study_id))
+            case_row = self.case_for_member(conn, study_id, case_id, membership, user)
             if not case_row:
                 self.send_error_json("Case not found", 404)
                 return
             payload = self.body()
             question = str(payload.get("question", "")).strip()
-            all_cases = self.case_rows(conn, study_id)
+            all_cases = self.case_rows(conn, study_id, membership, user)
             case_item = self.case_payload(conn, case_row)
             status = ai_status()
             mode = "local"
@@ -3773,6 +3885,11 @@ class App(BaseHTTPRequestHandler):
             if participant_id and not row(conn, "SELECT id FROM participants WHERE id = ? AND study_id = ?", (participant_id, study_id)):
                 self.send_error_json("Linked participant not found", 404)
                 return
+            if participant_id and membership.get("data_group_id"):
+                participant = row(conn, "SELECT data_group_id FROM participants WHERE id = ? AND study_id = ?", (participant_id, study_id))
+                if not participant or participant.get("data_group_id") != membership["data_group_id"]:
+                    self.send_error_json("Linked participant is outside your data access group", 403)
+                    return
             extracted = extract_case_intelligence(source_text, title)
             status = str(payload.get("status", "draft")).strip().lower()
             if status not in {"draft", "triaged", "ready", "excluded"}:
@@ -3792,7 +3909,7 @@ class App(BaseHTTPRequestHandler):
             return
         if method == "PATCH" and len(parts) == 5:
             case_id = int(parts[4])
-            before = row(conn, "SELECT * FROM case_intakes WHERE id = ? AND study_id = ?", (case_id, study_id))
+            before = self.case_for_member(conn, study_id, case_id, membership, user)
             if not before:
                 self.send_error_json("Case not found", 404)
                 return
@@ -3815,8 +3932,8 @@ class App(BaseHTTPRequestHandler):
             return
         self.send_error_json("Unsupported case intake operation", 405)
 
-    def export_case_intake_csv(self, conn, study_id: int) -> None:
-        cases = self.case_rows(conn, study_id)
+    def export_case_intake_csv(self, conn, study_id: int, membership: dict | None, user: dict) -> None:
+        cases = self.case_rows(conn, study_id, membership, user)
         fieldnames = ["case_uid", "title", "status", "group", "age", "sex", "diagnosis", "presentation", "investigations", "treatment", "outcome", "missing_fields", "warnings", "file_count", "updated_at"]
         text_lines = []
         class Sink:
@@ -4706,9 +4823,9 @@ class App(BaseHTTPRequestHandler):
             item["metadata"] = load_json(item.pop("metadata_json"), {})
         return data
 
-    def academic_payload(self, conn, study_id: int) -> dict:
+    def academic_payload(self, conn, study_id: int, membership: dict | None = None, user: dict | None = None) -> dict:
         study = row(conn, "SELECT * FROM studies WHERE id = ?", (study_id,))
-        cases = self.case_rows(conn, study_id)
+        cases = self.case_rows(conn, study_id, membership, user)
         cv_items = self.academic_cv_rows(conn, study_id)
         opportunities = publication_opportunities(cases)
         ai_review_count = row(conn, "SELECT COUNT(*) AS count FROM case_ai_reviews WHERE study_id = ?", (study_id,))["count"]
@@ -4733,13 +4850,13 @@ class App(BaseHTTPRequestHandler):
             ],
         }
 
-    def academic_workbench(self, conn, user, method, study_id, parts, query) -> None:
+    def academic_workbench(self, conn, user, method, study_id, parts, query, membership) -> None:
         if method == "GET" and len(parts) == 4:
-            self.send_json({"academic": self.academic_payload(conn, study_id)})
+            self.send_json({"academic": self.academic_payload(conn, study_id, membership, user)})
             return
         if method == "GET" and len(parts) == 5 and parts[4] == "export":
             fmt = (query.get("format") or ["md"])[0].lower()
-            payload = self.academic_payload(conn, study_id)
+            payload = self.academic_payload(conn, study_id, membership, user)
             audit(conn, user["id"], "export", "academic_cv_item", study_id, None, {"format": fmt}, study_id=study_id, **self.audit_context())
             if fmt == "csv":
                 fields = ["item_type", "title", "role", "status", "item_date", "citation", "notes", "linked_case_uid"]
@@ -5005,12 +5122,17 @@ class App(BaseHTTPRequestHandler):
 
 def validate_startup() -> None:
     if SETTINGS.production:
-        if not SETTINGS.secret_key or len(SETTINGS.secret_key) < 32 or SETTINGS.secret_key in {"change-me", "please-change-me"}:
+        weak_secrets = {"change-me", "please-change-me", "change_me", "changeme", "secret", "password"}
+        if not SETTINGS.secret_key or len(SETTINGS.secret_key) < MIN_PRODUCTION_SECRET_LENGTH or SETTINGS.secret_key.lower() in weak_secrets:
             raise RuntimeError("Production startup refused: set CDS_SECRET_KEY to a long random value.")
         if not SETTINGS.admin_password or len(SETTINGS.admin_password) < PRODUCTION_ADMIN_PASSWORD_MIN_LENGTH or SETTINGS.admin_password == "admin123":
             raise RuntimeError("Production startup refused: set CDS_ADMIN_PASSWORD to a strong non-default value.")
+        if DATABASE_BACKEND == "sqlite" and os.environ.get("CDS_ALLOW_SQLITE_PRODUCTION", "").strip().lower() not in {"1", "true", "yes", "on"}:
+            raise RuntimeError("Production startup refused: use PostgreSQL or set CDS_ALLOW_SQLITE_PRODUCTION=true for an explicit temporary exception.")
         if DATABASE_BACKEND == "postgres" and (not DATABASE_URL or "change_me" in DATABASE_URL.lower()):
             raise RuntimeError("Production startup refused: set DATABASE_URL or POSTGRES_PASSWORD for PostgreSQL.")
+        if not SETTINGS.require_https:
+            LOGGER.warning("CDS_REQUIRE_HTTPS=false in production. Use this only behind a trusted HTTPS reverse proxy.")
         if HOST in {"0.0.0.0", "::"}:
             LOGGER.warning("Clinical Data Studio is bound to all network interfaces in production. Use HTTPS and a firewall.")
         if SETTINGS.require_https and SETTINGS.public_base_url and not SETTINGS.public_base_url.startswith("https://"):

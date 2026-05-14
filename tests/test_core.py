@@ -73,14 +73,17 @@ class CoreEdcTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             original_data = server.DATA
             original_db = server.DB_PATH
+            original_backend = server.DATABASE_BACKEND
             try:
                 server.DATA = Path(tmp)
                 server.DB_PATH = Path(tmp) / "test.sqlite3"
+                server.DATABASE_BACKEND = "sqlite"
                 server.migrate()
                 self.assertTrue(server.DB_PATH.exists())
             finally:
                 server.DATA = original_data
                 server.DB_PATH = original_db
+                server.DATABASE_BACKEND = original_backend
 
     def test_development_settings_do_not_bind_publicly(self):
         with patch.dict("os.environ", {"CDS_ENV": "development", "CDS_HOST": "0.0.0.0"}, clear=False):
@@ -128,15 +131,58 @@ class CoreEdcTests(unittest.TestCase):
             server.DATABASE_BACKEND = original_backend
             server.DATABASE_URL = original_url
 
+    def test_production_startup_rejects_sqlite_without_explicit_override(self):
+        original_settings = server.SETTINGS
+        original_host = server.HOST
+        original_backend = server.DATABASE_BACKEND
+        try:
+            server.SETTINGS = replace(
+                original_settings,
+                env="production",
+                secret_key="x" * 40,
+                admin_password="StrongAdminPassword123",
+                public_base_url="https://example.org",
+            )
+            server.HOST = "127.0.0.1"
+            server.DATABASE_BACKEND = "sqlite"
+            with patch.dict("os.environ", {"CDS_ALLOW_SQLITE_PRODUCTION": ""}, clear=False):
+                with self.assertRaises(RuntimeError):
+                    server.validate_startup()
+        finally:
+            server.SETTINGS = original_settings
+            server.HOST = original_host
+            server.DATABASE_BACKEND = original_backend
+
     def test_external_ai_phi_gate_blocks_identifiers_by_default(self):
         original_settings = server.SETTINGS
         try:
             server.SETTINGS = replace(original_settings, ai_provider="openai", ai_enabled=True, ai_allow_phi=False)
             with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}, clear=False):
                 with self.assertRaises(ValueError):
-                    server.assert_external_ai_safe("Patient name: John Doe\nPhone: 9999999999")
+                    server.assert_external_ai_safe("Patient name: John Doe\nPhone: 9999999999\nDOB: 01/02/1960")
         finally:
             server.SETTINGS = original_settings
+
+    def test_ai_safety_deidentifies_common_identifiers(self):
+        text = "Patient name: John Doe\nPhone: 9999999999\nEmail: john@example.com\nDOB: 01/02/1960\nUHID: ABC123"
+        cleaned = server.deidentify_for_ai(text, "CASE-001")
+        self.assertIn("Patient name: CASE-001", cleaned)
+        self.assertIn("[phone removed]", cleaned)
+        self.assertIn("[email removed]", cleaned)
+        self.assertIn("DOB: [removed]", cleaned)
+        self.assertIn("UHID: [removed]", cleaned)
+
+    def test_ai_status_defaults_to_local_without_key(self):
+        original_settings = server.SETTINGS
+        try:
+            server.SETTINGS = replace(original_settings, ai_provider="openai", ai_enabled=True, ai_allow_phi=False, ai_multimodal=True)
+            with patch.dict("os.environ", {"OPENAI_API_KEY": ""}, clear=False):
+                status = server.ai_status()
+        finally:
+            server.SETTINGS = original_settings
+        self.assertEqual(status["provider"], "local")
+        self.assertFalse(status["external_ai_enabled"])
+        self.assertFalse(status["multimodal_enabled"])
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-const CACHE_NAME = "clinical-data-studio-v1";
+const CACHE_NAME = "clinical-data-studio-v2";
 const APP_SHELL = [
   "/",
   "/index.html",
@@ -6,9 +6,13 @@ const APP_SHELL = [
   "/offline.html",
   "/styles.css",
   "/app.js",
+  "/offline-drafts.js",
   "/survey.js",
   "/manifest.json",
   "/icon.svg",
+  "/icon-192.png",
+  "/icon-512.png",
+  "/icon-maskable-512.png",
 ];
 
 self.addEventListener("install", (event) => {
@@ -20,6 +24,10 @@ self.addEventListener("activate", (event) => {
   event.waitUntil(
     caches.keys().then((keys) =>
       Promise.all(keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key)))
+    ).then(() =>
+      self.clients.matchAll({ type: "window" }).then((clients) => {
+        clients.forEach((client) => client.postMessage({ type: "CDS_APP_UPDATED" }));
+      })
     )
   );
   self.clients.claim();

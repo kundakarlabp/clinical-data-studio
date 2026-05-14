@@ -405,8 +405,11 @@ CREATE TABLE IF NOT EXISTS case_files (
     case_id BIGINT NOT NULL REFERENCES case_intakes(id) ON DELETE CASCADE,
     study_id BIGINT NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
+    original_filename TEXT NOT NULL DEFAULT '',
+    stored_filename TEXT NOT NULL DEFAULT '',
     content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
     size BIGINT NOT NULL DEFAULT 0,
+    sha256 TEXT NOT NULL DEFAULT '',
     data_base64 TEXT NOT NULL DEFAULT '',
     created_by BIGINT REFERENCES users(id),
     created_at BIGINT NOT NULL

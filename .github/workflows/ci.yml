@@ -48,3 +48,56 @@ jobs:
 
       - name: Compose config check
         run: docker compose -f docker-compose.local.yml config
+
+  postgres-test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: clinical
+          POSTGRES_PASSWORD: clinical_test_password
+          POSTGRES_DB: clinical_data_studio_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U clinical -d clinical_data_studio_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      CDS_ENV: production
+      CDS_HOST: 127.0.0.1
+      CDS_PORT: 8765
+      CDS_SECRET_KEY: ci_postgres_secret_key_please_replace_in_real_deployments_1234567890
+      CDS_DATABASE_BACKEND: postgres
+      DATABASE_URL: postgresql://clinical:clinical_test_password@127.0.0.1:5432/clinical_data_studio_test
+      CDS_REQUIRE_HTTPS: "false"
+      CDS_ADMIN_USERNAME: admin
+      CDS_ADMIN_PASSWORD: StrongCIAdminPassword123
+      CDS_ADMIN_DISPLAY_NAME: CI Administrator
+      CDS_AI_ENABLED: "false"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+
+      - name: Run PostgreSQL migrations
+        run: python server.py migrate
+
+      - name: PostgreSQL healthcheck
+        run: python server.py healthcheck
+
+      - name: PostgreSQL unit and API tests
+        env:
+          CDS_ENV: development
+        run: python -W error::ResourceWarning -m unittest discover -s tests

@@ -2,6 +2,7 @@ import json
 import tempfile
 import threading
 import unittest
+from contextlib import closing
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
@@ -16,11 +17,17 @@ class ApiSmokeTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.original_data = server.DATA
         self.original_backups = server.BACKUPS
+        self.original_uploads = server.UPLOADS
         self.original_db = server.DB_PATH
+        self.original_backend = server.DATABASE_BACKEND
         server.DATA = Path(self.tmp.name)
         server.BACKUPS = server.DATA / "backups"
+        server.UPLOADS = server.DATA / "uploads"
         server.DB_PATH = server.DATA / "smoke.sqlite3"
+        server.DATABASE_BACKEND = "sqlite"
         server.migrate()
+        with closing(server.db()) as conn, conn:
+            conn.execute("UPDATE users SET must_change_password = 0 WHERE username = 'admin'")
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.App)
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
@@ -32,7 +39,9 @@ class ApiSmokeTests(unittest.TestCase):
         self.thread.join(timeout=5)
         server.DATA = self.original_data
         server.BACKUPS = self.original_backups
+        server.UPLOADS = self.original_uploads
         server.DB_PATH = self.original_db
+        server.DATABASE_BACKEND = self.original_backend
         self.tmp.cleanup()
 
     def request_json(self, path, method="GET", payload=None, token=None):
@@ -55,6 +64,11 @@ class ApiSmokeTests(unittest.TestCase):
         request = Request(f"{self.base_url}{path}", data=body, headers=headers, method=method)
         with urlopen(request, timeout=10) as response:
             return response.status, response.headers.get("content-type", ""), response.read()
+
+    def response_headers(self, path):
+        request = Request(f"{self.base_url}{path}")
+        with urlopen(request, timeout=10) as response:
+            return response.headers
 
     def test_health_login_summary_and_encrypted_backup(self):
         health = self.request_json("/api/health")
@@ -158,6 +172,47 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertEqual(context.exception.code, 423)
         context.exception.close()
 
+    def test_must_change_password_blocks_protected_endpoints_until_changed(self):
+        with closing(server.db()) as conn, conn:
+            conn.execute("UPDATE users SET must_change_password = 1 WHERE username = 'admin'")
+        token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]
+        me = self.request_json("/api/me", token=token)
+        self.assertEqual(me["user"]["must_change_password"], 1)
+        with self.assertRaises(HTTPError) as blocked:
+            self.request_json("/api/studies", token=token)
+        self.assertEqual(blocked.exception.code, 403)
+        self.assertIn("Password change required", blocked.exception.read().decode("utf-8"))
+        blocked.exception.close()
+        changed = self.request_json(
+            "/api/password",
+            "POST",
+            {"current_password": "admin123", "new_password": "ChangedPassword123"},
+            token,
+        )
+        self.assertTrue(changed["ok"])
+        studies = self.request_json("/api/studies", token=token)["studies"]
+        self.assertTrue(studies)
+
+    def test_session_tokens_are_stored_as_digests_and_logout_removes_session(self):
+        token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]
+        with closing(server.db()) as conn, conn:
+            session = server.row(conn, "SELECT token FROM sessions LIMIT 1")
+        self.assertIsNotNone(session)
+        self.assertNotEqual(session["token"], token)
+        self.assertEqual(session["token"], server.session_token_digest(token))
+        logout = self.request_json("/api/logout", "POST", {}, token)
+        self.assertTrue(logout["ok"])
+        with closing(server.db()) as conn, conn:
+            remaining = server.row(conn, "SELECT token FROM sessions WHERE token = ?", (server.session_token_digest(token),))
+        self.assertIsNone(remaining)
+
+    def test_security_headers_are_present(self):
+        headers = self.response_headers("/api/health")
+        self.assertIn("default-src 'self'", headers.get("Content-Security-Policy"))
+        self.assertEqual(headers.get("X-Frame-Options"), "SAMEORIGIN")
+        self.assertEqual(headers.get("X-Content-Type-Options"), "nosniff")
+        self.assertEqual(headers.get("Referrer-Policy"), "same-origin")
+
     def test_record_import_and_entry_history(self):
         token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]
         study_id = self.request_json("/api/studies", token=token)["studies"][0]["id"]
@@ -191,6 +246,12 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertEqual(created["case_uid"], "CASE-RETRO-001")
         self.assertEqual(created["extracted"]["demographics"]["age"], "42")
         self.assertTrue(created["files"])
+        self.assertEqual(created["files"][0]["sha256"], "627a6c2140448938132bb2441d164fb27a07312738406eed9a76bd31b61a0f8f")
+        with closing(server.db()) as conn:
+            file_record = server.row(conn, "SELECT * FROM case_files WHERE id = ?", (created["files"][0]["id"],))
+            self.assertTrue(file_record["stored_filename"])
+            self.assertFalse(file_record["data_base64"])
+            self.assertTrue((server.UPLOADS / "studies" / str(study_id) / "cases" / str(created["id"]) / file_record["stored_filename"]).exists())
         _, file_type, file_body = self.request_raw(f"/api/studies/{study_id}/case-intake/{created['id']}/files/{created['files'][0]['id']}", token=token)
         self.assertIn("text/plain", file_type)
         self.assertEqual(file_body, b"case note")
@@ -403,16 +464,26 @@ class ApiSmokeTests(unittest.TestCase):
             {"username": "entry.user", "display_name": "Entry User", "password": "Temporary12345", "role": "data_entry"},
             admin_token,
         )["user"]
+        other_data_user = self.request_json(
+            "/api/users",
+            "POST",
+            {"username": "entry.other", "display_name": "Other Entry User", "password": "Temporary12345", "role": "data_entry"},
+            admin_token,
+        )["user"]
         analyst_user = self.request_json(
             "/api/users",
             "POST",
             {"username": "analyst.user", "display_name": "Analyst User", "password": "Temporary12345", "role": "analyst"},
             admin_token,
         )["user"]
-        self.request_json(f"/api/studies/{study_id}/memberships", "POST", {"user_id": data_user["id"], "role": "data_entry", "active": True}, admin_token)
+        group_a = self.request_json(f"/api/studies/{study_id}/groups", "POST", {"name": "Site A", "code": "site_a"}, admin_token)["group"]
+        group_b = self.request_json(f"/api/studies/{study_id}/groups", "POST", {"name": "Site B", "code": "site_b"}, admin_token)["group"]
+        self.request_json(f"/api/studies/{study_id}/memberships", "POST", {"user_id": data_user["id"], "role": "data_entry", "data_group_id": group_a["id"], "active": True}, admin_token)
+        self.request_json(f"/api/studies/{study_id}/memberships", "POST", {"user_id": other_data_user["id"], "role": "data_entry", "data_group_id": group_b["id"], "active": True}, admin_token)
         self.request_json(f"/api/studies/{study_id}/memberships", "POST", {"user_id": analyst_user["id"], "role": "analyst", "active": True}, admin_token)
 
         entry_token = self.request_json("/api/login", "POST", {"username": "entry.user", "password": "Temporary12345"})["token"]
+        self.request_json("/api/password", "POST", {"current_password": "Temporary12345", "new_password": "EntryUserStrong123"}, entry_token)
         created = self.request_json(
             f"/api/studies/{study_id}/participants",
             "POST",
@@ -437,7 +508,29 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertEqual(export_denied.exception.code, 403)
         export_denied.exception.close()
 
+        case = self.request_json(
+            f"/api/studies/{study_id}/case-intake",
+            "POST",
+            {
+                "case_uid": "GROUP-CASE-001",
+                "title": "Group restricted case",
+                "participant_id": created["id"],
+                "source_text": "A deidentified group A case for access testing.",
+                "files": [{"name": "group-note.txt", "type": "text/plain", "data": "Z3JvdXAgbm90ZQ=="}],
+            },
+            entry_token,
+        )["case"]
+        self.assertEqual(len(self.request_json(f"/api/studies/{study_id}/case-intake", token=entry_token)["cases"]), 1)
+        other_entry_token = self.request_json("/api/login", "POST", {"username": "entry.other", "password": "Temporary12345"})["token"]
+        self.request_json("/api/password", "POST", {"current_password": "Temporary12345", "new_password": "OtherEntryStrong123"}, other_entry_token)
+        self.assertEqual(self.request_json(f"/api/studies/{study_id}/case-intake", token=other_entry_token)["cases"], [])
+        with self.assertRaises(HTTPError) as file_denied:
+            self.request_raw(f"/api/studies/{study_id}/case-intake/{case['id']}/files/{case['files'][0]['id']}", token=other_entry_token)
+        self.assertEqual(file_denied.exception.code, 404)
+        file_denied.exception.close()
+
         analyst_token = self.request_json("/api/login", "POST", {"username": "analyst.user", "password": "Temporary12345"})["token"]
+        self.request_json("/api/password", "POST", {"current_password": "Temporary12345", "new_password": "AnalystStrong123"}, analyst_token)
         with self.assertRaises(HTTPError) as edit_denied:
             self.request_json(f"/api/studies/{study_id}/participants", "POST", {"study_uid": "RBAC002"}, analyst_token)
         self.assertEqual(edit_denied.exception.code, 403)

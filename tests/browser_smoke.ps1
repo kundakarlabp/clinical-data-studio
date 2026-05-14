@@ -1,6 +1,48 @@
 $ErrorActionPreference = "Stop"
 
-$baseUrl = if ($env:CDS_BASE_URL) { $env:CDS_BASE_URL } else { "http://127.0.0.1:8765" }
+$defaultBaseUrl = "http://127.0.0.1:8765"
+$baseUrl = if ($env:CDS_BASE_URL) { $env:CDS_BASE_URL } else { $defaultBaseUrl }
+$repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
+$serverProcess = $null
+$oldCdsEnv = $env:CDS_ENV
+$oldCdsHost = $env:CDS_HOST
+$oldCdsPort = $env:CDS_PORT
+
+function Test-AppReady {
+  param([string]$Url)
+
+  try {
+    $response = Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec 2
+    return ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500)
+  }
+  catch {
+    return $false
+  }
+}
+
+if (-not $env:CDS_BASE_URL -and -not (Test-AppReady $baseUrl)) {
+  $python = (Get-Command python -ErrorAction Stop).Source
+  $env:CDS_ENV = "development"
+  $env:CDS_HOST = "127.0.0.1"
+  $env:CDS_PORT = "8765"
+  $serverProcess = Start-Process -FilePath $python -ArgumentList "server.py" -WorkingDirectory $repoRoot -WindowStyle Hidden -PassThru
+
+  $ready = $false
+  for ($i = 0; $i -lt 30; $i++) {
+    Start-Sleep -Seconds 1
+    if ($serverProcess.HasExited) {
+      throw "Clinical Data Studio server exited before browser smoke could run."
+    }
+    if (Test-AppReady $baseUrl) {
+      $ready = $true
+      break
+    }
+  }
+  if (-not $ready) {
+    throw "Clinical Data Studio server did not become ready at $baseUrl."
+  }
+}
+
 $work = Join-Path $env:TEMP "cds-playwright-smoke"
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 
@@ -50,4 +92,10 @@ try {
 }
 finally {
   Pop-Location
+  if ($serverProcess -and -not $serverProcess.HasExited) {
+    Stop-Process -Id $serverProcess.Id -Force
+  }
+  $env:CDS_ENV = $oldCdsEnv
+  $env:CDS_HOST = $oldCdsHost
+  $env:CDS_PORT = $oldCdsPort
 }

@@ -2,6 +2,11 @@
 
 Backups protect the study database. Keep the backup passphrase outside the server and outside GitHub.
 
+Clinical Data Studio stores large Case Intake evidence files in `uploads/`, not inside the database. A safe backup plan must protect both:
+
+- PostgreSQL database: participants, CRFs, entries, audit, case metadata, AI reviews.
+- Upload folder: case photos, PDFs, audio, and text evidence.
+
 ## Create A PostgreSQL Backup
 
 ```bash
@@ -10,6 +15,12 @@ bash scripts/backup_postgres.sh
 ```
 
 If `CDS_BACKUP_PASSPHRASE` is set in `.env`, the script creates an encrypted backup.
+
+The Docker Compose deployment keeps upload files in the `cds_uploads` volume. For a full server backup, also copy or snapshot that volume. On a small Lightsail server, the simplest safe route is:
+
+```bash
+docker run --rm -v clinical-data-studio_cds_uploads:/uploads -v "$PWD/backups:/backups" alpine tar -czf /backups/uploads_$(date +%Y%m%d_%H%M%S).tar.gz -C /uploads .
+```
 
 ## List Backups
 
@@ -55,6 +66,8 @@ Do a restore drill before real study use:
 1. Create a test project.
 2. Add one participant and one CRF entry.
 3. Create a backup.
-4. Restore the backup on a test server or test container.
-5. Confirm login, participant, CRF, and audit log.
-6. Record the result in the safety checklist.
+4. Upload one test PDF/photo in Case Intake.
+5. Back up the upload volume.
+6. Restore database and uploads on a test server or test container.
+7. Confirm login, participant, CRF, audit log, and file download.
+8. Record the result in the safety checklist.

@@ -128,6 +128,8 @@ The installed app shell can open while offline, but clinical data save/sync stil
 
 For Android install steps and offline draft behavior, see [docs/ANDROID_PWA_SETUP.md](docs/ANDROID_PWA_SETUP.md).
 
+For a later optional native Android shell, see [docs/ANDROID_CAPACITOR_BUILD.md](docs/ANDROID_CAPACITOR_BUILD.md). Use this only after the hosted PWA is stable.
+
 ## Remote Access
 
 For real study data, keep one central running app and database. This preserves audit trail order, record locking, user permissions, backups, and query review history.

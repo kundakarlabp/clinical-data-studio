@@ -46,6 +46,18 @@ Generate a long secret:
 openssl rand -hex 32
 ```
 
+Keep these storage settings:
+
+```text
+CDS_DATABASE_BACKEND=postgres
+CDS_UPLOAD_DIR=/app/uploads
+CDS_BACKUP_DIR=/app/backups
+CDS_AI_ENABLED=false
+CDS_AI_ALLOW_PHI=false
+```
+
+Do not use SQLite for real production data on Lightsail.
+
 ## 5. Start The App
 
 ```bash
@@ -115,6 +127,8 @@ docker compose exec app python server.py create-admin
 8. Enter one test CRF.
 9. Check Audit Trail.
 10. Create a backup.
+11. Upload one test PDF or photo in Case Intake.
+12. Confirm the file appears in the app and downloads.
 
 ## 9. Update Later
 
@@ -122,7 +136,26 @@ docker compose exec app python server.py create-admin
 bash scripts/update.sh
 ```
 
-## 10. Official References
+## 10. Android Use
+
+On Android Chrome:
+
+1. Open `https://your-domain.example`.
+2. Log in with the named account created by the admin.
+3. Tap **Install App** if shown.
+4. If not shown, open Chrome menu and tap **Add to Home screen**.
+5. Use **Data Entry** for CRFs and **Case Intake** for photos, PDFs, audio, and rough notes.
+6. Open **Local Drafts** before leaving the clinic if the phone was offline.
+
+## 11. What Not To Do
+
+- Do not upload live patient data to GitHub.
+- Do not email the `.env` file.
+- Do not share the admin account.
+- Do not delete the `postgres_data`, `cds_uploads`, or `cds_backups` Docker volumes.
+- Do not enable external AI for PHI unless your ethics and institutional policy explicitly allow it.
+
+## 12. Official References
 
 - AWS Lightsail docs: https://docs.aws.amazon.com/lightsail/
 - Docker Engine install docs: https://docs.docker.com/engine/install/ubuntu/

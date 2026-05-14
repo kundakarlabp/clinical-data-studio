@@ -65,6 +65,7 @@ Implemented foundation:
 - File upload fields stored inside CRF data records
 - Smart Case Intake for unstructured retrospective case notes, photos, audio evidence, local extraction, grouping, and case-series CSV export
 - Optional OpenAI Academic AI review for multimodal case interpretation, adaptive CRF suggestions, and publication guidance
+- Academic Workbench for publication opportunities, CV item tracking, and Markdown/CSV academic portfolio export
 - Windows scheduled-task start-at-login helper
 - Validation execution record template
 - Survey invitation and reminder tracking
@@ -116,6 +117,8 @@ For case-report and case-series AI review with images/audio, see [docs/OPENAI_AC
 ## Case Reports And Case Series
 
 Use **Case Intake** when case material arrives as notes, images, audio, scanned details, or rough typed summaries before a formal CRF is ready. The app stores original evidence, extracts draft demographics/diagnosis/treatment/outcome fields locally, groups similar cases, and exports a case-series CSV. See [docs/CASE_SERIES_WORKFLOW.md](docs/CASE_SERIES_WORKFLOW.md).
+
+Use **Academic CV** to convert grouped cases into publication opportunities, track abstracts/posters/manuscripts/presentations/audits, and export a CV-ready portfolio. See [docs/ACADEMIC_WORKBENCH.md](docs/ACADEMIC_WORKBENCH.md).
 
 ## Android And Multi-Device Use
 

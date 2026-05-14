@@ -213,6 +213,30 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertIn("text/csv", csv_type)
         self.assertIn(b"CASE-RETRO-001", csv_body)
 
+        academic = self.request_json(f"/api/studies/{study_id}/academic", token=token)["academic"]
+        self.assertEqual(academic["metrics"]["case_count"], 1)
+        self.assertTrue(academic["opportunities"])
+        self.assertIn("cv_markdown", academic)
+        cv_item = self.request_json(
+            f"/api/studies/{study_id}/academic/cv-items",
+            "POST",
+            {
+                "item_type": "case_report",
+                "title": "Influenza pneumonia case report",
+                "role": "First author",
+                "status": "drafting",
+                "linked_case_id": created["id"],
+                "notes": "Prepare CARE checklist.",
+            },
+            token,
+        )["cv_item"]
+        self.assertEqual(cv_item["title"], "Influenza pneumonia case report")
+        updated_academic = self.request_json(f"/api/studies/{study_id}/academic", token=token)["academic"]
+        self.assertEqual(updated_academic["metrics"]["cv_item_count"], 1)
+        _, md_type, md_body = self.request_raw(f"/api/studies/{study_id}/academic/export?format=md", token=token)
+        self.assertIn("text/markdown", md_type)
+        self.assertIn(b"Influenza pneumonia case report", md_body)
+
     def test_public_survey_with_consent_and_file_upload(self):
         token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]
         study_id = self.request_json("/api/studies", token=token)["studies"][0]["id"]

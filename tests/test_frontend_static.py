@@ -53,6 +53,10 @@ class FrontendStaticTests(unittest.TestCase):
         self.assertIn("data-case-file", app_js)
         self.assertIn("Academic AI Review", app_js)
         self.assertIn("requestCaseAiReview", app_js)
+        self.assertIn("Academic Workbench", app_js)
+        self.assertIn("/academic", app_js)
+        self.assertIn("submitAcademicCvItem", app_js)
+        self.assertIn("academic_portfolio.md", app_js)
 
     def test_public_survey_shell_is_present(self):
         survey_html = (ROOT / "static" / "survey.html").read_text(encoding="utf-8")

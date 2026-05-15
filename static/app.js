@@ -1,6 +1,6 @@
 const state = {
-  token: localStorage.getItem("cds_token") || "",
   user: null,
+  csrfToken: "",
   setupRequired: false,
   studies: [],
   memberships: [],
@@ -60,9 +60,13 @@ const ROLE_LABELS = {
 };
 
 async function api(path, options = {}) {
+  const method = (options.method || "GET").toUpperCase();
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
-  if (state.token) headers.Authorization = `Bearer ${state.token}`;
-  const response = await fetch(path, { ...options, headers });
+  if (!["GET", "HEAD", "OPTIONS"].includes(method) && !["/api/login", "/api/setup"].includes(path)) {
+    await ensureCsrf();
+    if (state.csrfToken) headers["X-CSRF-Token"] = state.csrfToken;
+  }
+  const response = await fetch(path, { ...options, headers, credentials: "same-origin" });
   if (!response.ok) {
     const payload = await response.json().catch(() => ({ error: response.statusText }));
     throw new Error(payload.error || response.statusText);
@@ -70,6 +74,22 @@ async function api(path, options = {}) {
   const type = response.headers.get("content-type") || "";
   if (type.includes("application/json")) return response.json();
   return response.text();
+}
+
+async function refreshCsrf() {
+  const response = await fetch("/api/csrf", { credentials: "same-origin" });
+  if (!response.ok) {
+    state.csrfToken = "";
+    return "";
+  }
+  const payload = await response.json();
+  state.csrfToken = payload.csrf_token || "";
+  return state.csrfToken;
+}
+
+async function ensureCsrf() {
+  if (state.csrfToken) return state.csrfToken;
+  return refreshCsrf();
 }
 
 function escapeHtml(value) {
@@ -93,11 +113,11 @@ async function loadAll() {
   const setup = await api("/api/setup").catch(() => ({ required: false }));
   state.setupRequired = Boolean(setup.required);
   if (state.setupRequired) return renderSetup();
-  if (!state.token) return renderLogin();
   try {
     const me = await api("/api/me");
     state.user = me.user;
     state.memberships = me.memberships || [];
+    await refreshCsrf();
     if (state.user?.must_change_password) return renderPasswordChangeRequired();
     const studies = await api("/api/studies");
     state.studies = studies.studies;
@@ -105,9 +125,10 @@ async function loadAll() {
     localStorage.setItem("cds_study_id", String(state.studyId || ""));
     await loadStudy();
   } catch (error) {
-    state.token = "";
-    localStorage.removeItem("cds_token");
-    state.error = error.message;
+    state.user = null;
+    state.csrfToken = "";
+    state.error = error.message === "Login required" ? "" : error.message;
+    return renderLogin();
   }
   render();
 }
@@ -205,7 +226,7 @@ function roleLabel(role) {
 }
 
 function render() {
-  if (!state.token) return renderLogin();
+  if (!state.user) return renderLogin();
   if (state.user?.must_change_password) return renderPasswordChangeRequired();
   const study = activeStudy();
   app.innerHTML = `
@@ -1715,8 +1736,8 @@ function bindShell() {
   });
   document.querySelector("#logout")?.addEventListener("click", async () => {
     await api("/api/logout", { method: "POST", body: "{}" }).catch(() => {});
-    state.token = "";
-    localStorage.removeItem("cds_token");
+    state.user = null;
+    state.csrfToken = "";
     renderLogin();
   });
   document.querySelector("#export-csv")?.addEventListener("click", () => downloadApi(`/api/studies/${state.studyId}/export${currentMembership()?.role === "analyst" ? "?deidentified=1" : ""}`, "clinical_data_export.csv"));
@@ -2249,7 +2270,7 @@ async function requestCaseAiReview(caseId) {
 
 async function downloadApi(path, filename) {
   try {
-    const response = await fetch(path, { headers: { Authorization: `Bearer ${state.token}` } });
+    const response = await fetch(path, { credentials: "same-origin" });
     if (!response.ok) {
       const payload = await response.json().catch(() => ({ error: response.statusText }));
       throw new Error(payload.error || response.statusText);
@@ -2697,10 +2718,9 @@ function renderLogin() {
     const data = Object.fromEntries(new FormData(event.target));
     try {
       const result = await api("/api/login", { method: "POST", body: JSON.stringify(data) });
-      state.token = result.token;
       state.user = result.user;
       state.error = "";
-      localStorage.setItem("cds_token", state.token);
+      await refreshCsrf();
       if (state.user?.must_change_password) return renderPasswordChangeRequired();
       await loadAll();
     } catch (error) {
@@ -2741,9 +2761,8 @@ function renderPasswordChangeRequired() {
   });
   document.querySelector("#forced-logout").addEventListener("click", async () => {
     await api("/api/logout", { method: "POST", body: "{}" }).catch(() => {});
-    state.token = "";
     state.user = null;
-    localStorage.removeItem("cds_token");
+    state.csrfToken = "";
     renderLogin();
   });
 }

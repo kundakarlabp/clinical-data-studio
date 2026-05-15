@@ -53,17 +53,37 @@ class ApiSmokeTests(unittest.TestCase):
         with urlopen(request, timeout=10) as response:
             return json.loads(response.read().decode("utf-8"))
 
-    def request_raw(self, path, method="GET", payload=None, token=None, content_type="application/json"):
+    def request_raw(self, path, method="GET", payload=None, token=None, content_type="application/json", headers=None):
         if isinstance(payload, dict) and content_type == "application/x-www-form-urlencoded":
             body = urlencode(payload).encode("utf-8")
         else:
             body = None if payload is None else json.dumps(payload).encode("utf-8")
-        headers = {"Content-Type": content_type}
+        headers = {"Content-Type": content_type, **(headers or {})}
         if token:
             headers["Authorization"] = f"Bearer {token}"
         request = Request(f"{self.base_url}{path}", data=body, headers=headers, method=method)
         with urlopen(request, timeout=10) as response:
             return response.status, response.headers.get("content-type", ""), response.read()
+
+    def request_with_headers(self, path, method="GET", payload=None, headers=None, content_type="application/json"):
+        body = None if payload is None else json.dumps(payload).encode("utf-8")
+        request_headers = {"Content-Type": content_type, **(headers or {})}
+        request = Request(f"{self.base_url}{path}", data=body, headers=request_headers, method=method)
+        with urlopen(request, timeout=10) as response:
+            return response.status, response.headers, response.read()
+
+    def login_cookie(self, extra_headers=None):
+        status, headers, body = self.request_with_headers(
+            "/api/login",
+            "POST",
+            {"username": "admin", "password": "admin123"},
+            headers=extra_headers,
+        )
+        self.assertEqual(status, 200)
+        payload = json.loads(body.decode("utf-8"))
+        cookie = headers.get("Set-Cookie")
+        self.assertIsNotNone(cookie)
+        return payload, cookie
 
     def response_headers(self, path):
         request = Request(f"{self.base_url}{path}")
@@ -216,6 +236,66 @@ class ApiSmokeTests(unittest.TestCase):
         with closing(server.db()) as conn, conn:
             remaining = server.row(conn, "SELECT token FROM sessions WHERE token = ?", (server.session_token_digest(token),))
         self.assertIsNone(remaining)
+
+    def test_browser_session_cookie_and_csrf_flow(self):
+        login, cookie = self.login_cookie()
+        self.assertEqual(login["session"], "cookie")
+        self.assertIn("cds_session=", cookie)
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("SameSite=Lax", cookie)
+        self.assertIn("Path=/", cookie)
+        self.assertIn("Max-Age=", cookie)
+        with closing(server.db()) as conn:
+            stored_tokens = [item["token"] for item in server.rows(conn, "SELECT token FROM sessions")]
+        self.assertNotIn(login["token"], stored_tokens)
+
+        me_status, _, me_body = self.request_with_headers("/api/me", headers={"Cookie": cookie})
+        self.assertEqual(me_status, 200)
+        self.assertEqual(json.loads(me_body.decode("utf-8"))["user"]["username"], "admin")
+
+        with self.assertRaises(HTTPError) as missing_csrf:
+            self.request_with_headers(
+                "/api/studies",
+                "POST",
+                {"name": "Blocked Cookie Study", "protocol_id": "CSRF-BLOCK"},
+                headers={"Cookie": cookie},
+            )
+        self.assertEqual(missing_csrf.exception.code, 403)
+        self.assertIn("CSRF token required", missing_csrf.exception.read().decode("utf-8"))
+        missing_csrf.exception.close()
+
+        csrf_status, _, csrf_body = self.request_with_headers("/api/csrf", headers={"Cookie": cookie})
+        self.assertEqual(csrf_status, 200)
+        csrf = json.loads(csrf_body.decode("utf-8"))["csrf_token"]
+        created_status, _, created_body = self.request_with_headers(
+            "/api/studies",
+            "POST",
+            {"name": "Cookie CSRF Study", "protocol_id": "CSRF-OK"},
+            headers={"Cookie": cookie, "X-CSRF-Token": csrf, "Origin": self.base_url},
+        )
+        self.assertEqual(created_status, 201)
+        self.assertEqual(json.loads(created_body.decode("utf-8"))["study"]["protocol_id"], "CSRF-OK")
+
+        with self.assertRaises(HTTPError) as bad_origin:
+            self.request_with_headers(
+                "/api/studies",
+                "POST",
+                {"name": "Bad Origin", "protocol_id": "CSRF-BAD"},
+                headers={"Cookie": cookie, "X-CSRF-Token": csrf, "Origin": "https://attacker.example"},
+            )
+        self.assertEqual(bad_origin.exception.code, 403)
+        bad_origin.exception.close()
+
+        logout_status, logout_headers, logout_body = self.request_with_headers("/api/logout", "POST", {}, headers={"Cookie": cookie})
+        self.assertEqual(logout_status, 200)
+        self.assertTrue(json.loads(logout_body.decode("utf-8"))["ok"])
+        cleared_cookie = logout_headers.get("Set-Cookie")
+        self.assertIn("cds_session=", cleared_cookie)
+        self.assertIn("Max-Age=0", cleared_cookie)
+
+    def test_secure_cookie_is_used_behind_https_proxy(self):
+        _, cookie = self.login_cookie({"X-Forwarded-Proto": "https"})
+        self.assertIn("Secure", cookie)
 
     def test_security_headers_are_present(self):
         headers = self.response_headers("/api/health")

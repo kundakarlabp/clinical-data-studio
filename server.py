@@ -48,6 +48,8 @@ PORT = SETTINGS.port
 PBKDF2_ROUNDS = 260_000
 SESSION_TTL_SECONDS = 60 * 60 * 24 * 14
 MIN_PRODUCTION_SECRET_LENGTH = 32
+SESSION_COOKIE_NAME = "cds_session"
+CSRF_HEADER_NAME = "X-CSRF-Token"
 DEFAULT_OPENAI_MODEL = "gpt-5.2"
 DEFAULT_TRANSCRIBE_MODEL = "gpt-4o-transcribe"
 CALC_OPERATORS = {
@@ -174,6 +176,24 @@ def token_digest(token: str) -> str:
 def session_token_digest(token: str) -> str:
     secret = SETTINGS.secret_key or "clinical-data-studio-development-session-key"
     return hmac.new(secret.encode("utf-8"), token.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def csrf_token(session_digest: str, timestamp: int | None = None) -> str:
+    issued_at = timestamp or now()
+    secret = SETTINGS.secret_key or "clinical-data-studio-development-session-key"
+    signature = hmac.new(secret.encode("utf-8"), f"{session_digest}:{issued_at}".encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{issued_at}.{signature}"
+
+
+def verify_csrf_token(session_digest: str, token: str) -> bool:
+    try:
+        issued_raw, signature = token.split(".", 1)
+        issued_at = int(issued_raw)
+    except Exception:
+        return False
+    if issued_at <= 0 or now() - issued_at > SESSION_TTL_SECONDS:
+        return False
+    return hmac.compare_digest(csrf_token(session_digest, issued_at), token)
 
 
 def prune_expired_sessions(conn: sqlite3.Connection) -> None:
@@ -2286,7 +2306,15 @@ class App(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def queue_header(self, name: str, value: str) -> None:
+        headers = getattr(self, "_extra_headers", [])
+        headers.append((name, value))
+        self._extra_headers = headers
+
     def end_headers(self) -> None:
+        for name, value in getattr(self, "_extra_headers", []):
+            self.send_header(name, value)
+        self._extra_headers = []
         self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; object-src 'none'; frame-ancestors 'self'; base-uri 'self'; form-action 'self'")
         self.send_header("X-Frame-Options", "SAMEORIGIN")
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -2295,6 +2323,62 @@ class App(BaseHTTPRequestHandler):
         if SETTINGS.require_https or self.headers.get("x-forwarded-proto", "").lower() == "https":
             self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
         super().end_headers()
+
+    def cookies(self) -> dict:
+        parsed = {}
+        for part in self.headers.get("cookie", "").split(";"):
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            parsed[key.strip()] = value.strip()
+        return parsed
+
+    def request_is_https(self) -> bool:
+        return SETTINGS.require_https or SETTINGS.production or self.headers.get("x-forwarded-proto", "").lower() == "https"
+
+    def session_cookie_header(self, token: str, max_age: int = SESSION_TTL_SECONDS) -> str:
+        parts = [f"{SESSION_COOKIE_NAME}={token}", "HttpOnly", "Path=/", "SameSite=Lax", f"Max-Age={max_age}"]
+        if self.request_is_https():
+            parts.append("Secure")
+        return "; ".join(parts)
+
+    def clear_session_cookie(self) -> None:
+        parts = [f"{SESSION_COOKIE_NAME}=", "HttpOnly", "Path=/", "SameSite=Lax", "Max-Age=0"]
+        if self.request_is_https():
+            parts.append("Secure")
+        self.queue_header("Set-Cookie", "; ".join(parts))
+
+    def expected_origins(self) -> set[str]:
+        host = self.headers.get("host", "")
+        scheme = self.headers.get("x-forwarded-proto", "https" if self.request_is_https() else "http")
+        origins = {f"{scheme}://{host}"} if host else set()
+        if SETTINGS.public_base_url:
+            parsed = urlparse(SETTINGS.public_base_url)
+            if parsed.scheme and parsed.netloc:
+                origins.add(f"{parsed.scheme}://{parsed.netloc}")
+        return origins
+
+    def origin_is_allowed(self) -> bool:
+        supplied = self.headers.get("origin") or self.headers.get("referer")
+        if not supplied:
+            return True
+        parsed = urlparse(supplied)
+        if not parsed.scheme or not parsed.netloc:
+            return False
+        return f"{parsed.scheme}://{parsed.netloc}" in self.expected_origins()
+
+    def require_csrf_for_cookie_auth(self) -> bool:
+        if getattr(self, "auth_source", "") != "cookie" or self.command not in {"POST", "PATCH", "DELETE"}:
+            return True
+        if not self.origin_is_allowed():
+            self.send_error_json("CSRF origin check failed", 403)
+            return False
+        token = self.headers.get(CSRF_HEADER_NAME, "")
+        session_digest = getattr(self, "session_digest", "")
+        if not session_digest or not verify_csrf_token(session_digest, token):
+            self.send_error_json("CSRF token required", 403)
+            return False
+        return True
 
     def send_error_json(self, message: str, status: int = 400) -> None:
         self.send_json({"error": message}, status)
@@ -2322,11 +2406,21 @@ class App(BaseHTTPRequestHandler):
         self.wfile.write(content)
 
     def current_user(self, conn: sqlite3.Connection) -> dict | None:
+        self.auth_source = ""
+        self.session_digest = ""
         header = self.headers.get("authorization", "")
-        if not header.startswith("Bearer "):
+        token = ""
+        if header.startswith("Bearer "):
+            token = header.removeprefix("Bearer ").strip()
+            self.auth_source = "bearer"
+        else:
+            token = self.cookies().get(SESSION_COOKIE_NAME, "")
+            if token:
+                self.auth_source = "cookie"
+        if not token:
             return None
-        token = header.removeprefix("Bearer ").strip()
         digest = session_token_digest(token)
+        self.session_digest = digest
         user = row(
             conn,
             """
@@ -2366,6 +2460,10 @@ class App(BaseHTTPRequestHandler):
 
                 user = self.require_user(conn)
                 if not user:
+                    return
+                if path == "/api/csrf" and method == "GET":
+                    return self.send_json({"csrf_token": csrf_token(getattr(self, "session_digest", ""))})
+                if not self.require_csrf_for_cookie_auth():
                     return
                 if user.get("must_change_password") and path not in {"/api/me", "/api/password", "/api/logout"}:
                     self.send_error_json("Password change required before continuing.", 403)
@@ -2437,7 +2535,8 @@ class App(BaseHTTPRequestHandler):
         conn.execute("INSERT INTO sessions(token, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)", (session_token_digest(token), user["id"], now() + SESSION_TTL_SECONDS, now()))
         audit(conn, user["id"], "login", "session", None, None, {"username": username}, **self.audit_context())
         conn.commit()
-        self.send_json({"token": token, "user": {"id": user["id"], "username": user["username"], "display_name": user["display_name"], "role": user["role"], "must_change_password": user.get("must_change_password", 0)}})
+        self.queue_header("Set-Cookie", self.session_cookie_header(token))
+        self.send_json({"token": token, "session": "cookie", "user": {"id": user["id"], "username": user["username"], "display_name": user["display_name"], "role": user["role"], "must_change_password": user.get("must_change_password", 0)}})
 
     def first_run_setup(self, conn: sqlite3.Connection) -> None:
         if not setup_required(conn):
@@ -2472,11 +2571,15 @@ class App(BaseHTTPRequestHandler):
     def logout(self, conn: sqlite3.Connection) -> None:
         header = self.headers.get("authorization", "")
         token = header.removeprefix("Bearer ").strip() if header.startswith("Bearer ") else ""
+        if not token:
+            token = self.cookies().get(SESSION_COOKIE_NAME, "")
         if token:
             digest = session_token_digest(token)
             session = row(conn, "SELECT user_id FROM sessions WHERE token = ?", (digest,))
             conn.execute("DELETE FROM sessions WHERE token = ?", (digest,))
             audit(conn, session["user_id"] if session else None, "logout", "session", None, None, {"logged_out": bool(session)}, **self.audit_context())
+            conn.commit()
+        self.clear_session_cookie()
         self.send_json({"ok": True})
 
     def user_from_api_token(self, conn: sqlite3.Connection, raw_token: str) -> tuple[dict, dict] | tuple[None, None]:

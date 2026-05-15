@@ -21,7 +21,7 @@ import tempfile
 import time
 import ctypes
 import zipfile
-from io import StringIO
+from io import BytesIO, StringIO
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -31,6 +31,7 @@ from urllib.request import Request as UrlRequest, urlopen as urlopen_request
 from xml.etree import ElementTree
 
 from ai.safety import ai_status_payload, assert_external_ai_safe as assert_ai_text_safe, deidentify_for_ai as deidentify_text_for_ai, phi_findings as detect_phi_findings
+from authz import PROJECT_ADMIN_ROLES, ROLE_PERMISSIONS, SYSTEM_ADMIN_ROLES, can as authz_can, is_super_admin as authz_is_super_admin, membership_has as authz_membership_has, role_has as authz_role_has, safe_role as authz_safe_role
 from config import load_settings
 from storage import connect_database, migrate_postgres
 
@@ -48,6 +49,8 @@ PORT = SETTINGS.port
 PBKDF2_ROUNDS = 260_000
 SESSION_TTL_SECONDS = 60 * 60 * 24 * 14
 MIN_PRODUCTION_SECRET_LENGTH = 32
+SESSION_COOKIE_NAME = "cds_session"
+CSRF_HEADER_NAME = "X-CSRF-Token"
 DEFAULT_OPENAI_MODEL = "gpt-5.2"
 DEFAULT_TRANSCRIBE_MODEL = "gpt-4o-transcribe"
 CALC_OPERATORS = {
@@ -60,61 +63,7 @@ CALC_OPERATORS = {
 }
 FILE_ATTRIBUTE_ENCRYPTED = 0x4000
 
-ROLE_PERMISSIONS = {
-    "super_admin": {
-        "system_admin",
-        "manage_users",
-        "manage_study",
-        "manage_forms",
-        "enter_data",
-        "review_data",
-        "export_data",
-        "view_analysis",
-    },
-    "admin": {
-        "system_admin",
-        "manage_users",
-        "manage_study",
-        "manage_forms",
-        "enter_data",
-        "review_data",
-        "export_data",
-        "view_analysis",
-    },
-    "owner": {
-        "manage_users",
-        "manage_study",
-        "manage_forms",
-        "enter_data",
-        "review_data",
-        "export_data",
-        "view_analysis",
-    },
-    "project_admin": {
-        "manage_users",
-        "manage_study",
-        "manage_forms",
-        "enter_data",
-        "review_data",
-        "export_data",
-        "view_analysis",
-    },
-    "pi": {
-        "manage_users",
-        "manage_study",
-        "manage_forms",
-        "enter_data",
-        "review_data",
-        "export_data",
-        "view_analysis",
-    },
-    "data_entry": {"enter_data"},
-    "reviewer": {"review_data", "view_analysis"},
-    "analyst": {"export_data", "view_analysis"},
-    "viewer": {"view_analysis"},
-    "read_only": {"view_analysis"},
-}
-SUPERUSER_ROLES = {"admin", "super_admin"}
+SUPERUSER_ROLES = SYSTEM_ADMIN_ROLES
 PROJECT_ADMIN_ROLES = {"owner", "project_admin", "pi"}
 PASSWORD_MIN_LENGTH = 10
 PRODUCTION_ADMIN_PASSWORD_MIN_LENGTH = 12
@@ -127,6 +76,17 @@ API_TOKEN_SCOPES = {
     "ai:use",
 }
 DEFAULT_API_TOKEN_SCOPES = sorted(API_TOKEN_SCOPES)
+ACADEMIC_OUTPUT_TYPES = {
+    "publication_idea",
+    "abstract_draft",
+    "manuscript_draft",
+    "conference_submission",
+    "poster",
+    "audit_project",
+    "teaching_session",
+    "grant_proposal",
+    "cv_item",
+}
 SETTINGS.log_dir.mkdir(parents=True, exist_ok=True)
 LOG_FILE = SETTINGS.log_dir / "clinical-data-studio.log"
 logging.basicConfig(
@@ -174,6 +134,24 @@ def token_digest(token: str) -> str:
 def session_token_digest(token: str) -> str:
     secret = SETTINGS.secret_key or "clinical-data-studio-development-session-key"
     return hmac.new(secret.encode("utf-8"), token.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def csrf_token(session_digest: str, timestamp: int | None = None) -> str:
+    issued_at = timestamp or now()
+    secret = SETTINGS.secret_key or "clinical-data-studio-development-session-key"
+    signature = hmac.new(secret.encode("utf-8"), f"{session_digest}:{issued_at}".encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{issued_at}.{signature}"
+
+
+def verify_csrf_token(session_digest: str, token: str) -> bool:
+    try:
+        issued_raw, signature = token.split(".", 1)
+        issued_at = int(issued_raw)
+    except Exception:
+        return False
+    if issued_at <= 0 or now() - issued_at > SESSION_TTL_SECONDS:
+        return False
+    return hmac.compare_digest(csrf_token(session_digest, issued_at), token)
 
 
 def prune_expired_sessions(conn: sqlite3.Connection) -> None:
@@ -276,11 +254,11 @@ def ai_status() -> dict:
 
 
 def is_super_admin(user: dict | None) -> bool:
-    return bool(user and user.get("role") in SUPERUSER_ROLES)
+    return authz_is_super_admin(user)
 
 
 def safe_role(role: str) -> str:
-    return (role or "").strip().lower()
+    return authz_safe_role(role)
 
 
 def parse_token_scopes(value: str | None) -> set[str]:
@@ -333,6 +311,43 @@ def latest_backup_time() -> int | None:
     return int(max(item.stat().st_mtime for item in files))
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def sha256_bytes(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def backup_file_info(path: Path, backup_type: str | None = None) -> dict:
+    info = {
+        "name": path.name,
+        "size": path.stat().st_size,
+        "created_at": int(path.stat().st_mtime),
+        "encrypted": path.suffix == ".cdsenc",
+    }
+    if backup_type:
+        info["backup_type"] = backup_type
+    return info
+
+
+def latest_matching_backup(predicate) -> dict | None:
+    if not BACKUPS.exists():
+        return None
+    matches = [item for item in BACKUPS.iterdir() if item.is_file() and predicate(item)]
+    if not matches:
+        return None
+    target = max(matches, key=lambda item: item.stat().st_mtime)
+    if ".full." in target.name or target.name.startswith("full_"):
+        return latest_full_backup_info(target)
+    backup_type = "postgres" if target.name.startswith("postgres_") or target.name.endswith(".dump") else "database"
+    return backup_file_info(target, backup_type)
+
+
 def backup_name(prefix: str = "system") -> str:
     return f"{prefix}_{time.strftime('%Y%m%d_%H%M%S', time.localtime())}"
 
@@ -364,6 +379,177 @@ def create_database_backup(passphrase: str = "", study_id: int | None = None) ->
     else:
         target = plain_target
     return {"name": target.name, "size": target.stat().st_size, "created_at": int(target.stat().st_mtime), "encrypted": target.suffix == ".cdsenc", "backend": "sqlite"}
+
+
+def write_uploads_archive(target: Path) -> int:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    upload_count = 0
+    with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
+        if UPLOADS.exists():
+            for item in sorted(UPLOADS.rglob("*")):
+                if item.is_file():
+                    archive.write(item, item.relative_to(UPLOADS).as_posix())
+                    upload_count += 1
+        if upload_count == 0:
+            archive.writestr("EMPTY_UPLOADS.txt", "No upload files were present when this backup was created.\n")
+    return upload_count
+
+
+def write_database_dump(target: Path) -> str:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if DATABASE_BACKEND == "postgres":
+        subprocess.run(["pg_dump", "--format=custom", "--file", str(target), DATABASE_URL], check=True, capture_output=True, text=True, timeout=300)
+        return "postgres.dump"
+    with closing(db()) as conn:
+        write_sqlite_backup(conn, target)
+    return "sqlite.sqlite3"
+
+
+def create_full_backup(passphrase: str = "") -> dict:
+    passphrase = passphrase or SETTINGS.backup_passphrase
+    if not passphrase:
+        raise ValueError("Full backup passphrase is required")
+    BACKUPS.mkdir(parents=True, exist_ok=True)
+    UPLOADS.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    target = BACKUPS / f"full_{timestamp}.full.cdsenc"
+    with tempfile.TemporaryDirectory(dir=BACKUPS) as tmp_name:
+        tmp = Path(tmp_name)
+        db_name = "postgres.dump" if DATABASE_BACKEND == "postgres" else "sqlite.sqlite3"
+        db_path = tmp / db_name
+        db_name = write_database_dump(db_path)
+        uploads_path = tmp / "uploads.zip"
+        upload_count = write_uploads_archive(uploads_path)
+        manifest = {
+            "backup_type": "full",
+            "created_at": int(time.time()),
+            "created_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "app": "Clinical Data Studio",
+            "version": os.environ.get("CDS_VERSION", "0.1"),
+            "git_commit": git_commit(),
+            "database_backend": DATABASE_BACKEND,
+            "database_dump": db_name,
+            "uploads_archive": uploads_path.name,
+            "upload_file_count": upload_count,
+            "encryption": {
+                "format": "CDSENC1",
+                "kdf": "pbkdf2_hmac_sha256",
+                "passphrase_stored": False,
+            },
+        }
+        manifest_path = tmp / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+        checksum_targets = [db_path, uploads_path, manifest_path]
+        sums_path = tmp / "SHA256SUMS.txt"
+        sums_path.write_text("".join(f"{file_sha256(item)}  {item.name}\n" for item in checksum_targets), encoding="utf-8")
+        payload_path = tmp / "full_backup_payload.zip"
+        with zipfile.ZipFile(payload_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            for item in [db_path, uploads_path, manifest_path, sums_path]:
+                archive.write(item, item.name)
+        target.write_bytes(encrypted_archive_bytes(payload_path.read_bytes(), passphrase))
+    info = backup_file_info(target, "full")
+    info.update({"backend": DATABASE_BACKEND, "uploads_included": True, "verified": False})
+    return info
+
+
+def verification_sidecar_path(backup_path: Path) -> Path:
+    return backup_path.with_name(f"{backup_path.name}.verify.json")
+
+
+def full_backup_candidates() -> list[Path]:
+    if not BACKUPS.exists():
+        return []
+    return sorted(
+        [item for item in BACKUPS.iterdir() if item.is_file() and not item.name.endswith(".verify.json") and (item.name.startswith("full_") or ".full." in item.name)],
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def latest_full_backup_info(path: Path | None = None) -> dict | None:
+    target = path or (full_backup_candidates()[0] if full_backup_candidates() else None)
+    if not target:
+        return None
+    info = backup_file_info(target, "full")
+    info["uploads_included"] = True
+    sidecar = verification_sidecar_path(target)
+    if sidecar.exists():
+        try:
+            verification = json.loads(sidecar.read_text(encoding="utf-8"))
+            info["verification"] = verification
+            info["verified"] = bool(verification.get("ok"))
+            info["verified_at"] = verification.get("checked_at")
+        except Exception:
+            info["verified"] = False
+    else:
+        info["verified"] = False
+    return info
+
+
+def latest_postgres_backup_info() -> dict | None:
+    return latest_matching_backup(lambda item: item.name.startswith("postgres_") or item.name.endswith(".dump"))
+
+
+def verify_full_backup(backup_file: Path, passphrase: str = "", record: bool = False) -> dict:
+    passphrase = passphrase or SETTINGS.backup_passphrase
+    if not passphrase:
+        raise ValueError("Full backup passphrase is required for verification")
+    target = backup_file.resolve()
+    backup_root = BACKUPS.resolve()
+    if not str(target).startswith(str(backup_root)) or not target.exists() or not target.is_file():
+        raise ValueError("Full backup file not found inside configured backup directory")
+    archive_bytes = decrypted_archive_bytes(target.read_bytes(), passphrase) if target.suffix == ".cdsenc" else target.read_bytes()
+    result = {
+        "ok": False,
+        "name": target.name,
+        "checked_at": int(time.time()),
+        "contents": [],
+        "database_dump": "",
+        "uploads_archive": "",
+        "upload_file_count": 0,
+        "errors": [],
+    }
+    try:
+        with zipfile.ZipFile(BytesIO(archive_bytes), "r") as archive:
+            names = archive.namelist()
+            result["contents"] = names
+            required = {"manifest.json", "SHA256SUMS.txt", "uploads.zip"}
+            missing = sorted(required - set(names))
+            if missing:
+                result["errors"].append(f"Missing required file(s): {', '.join(missing)}")
+            manifest = json.loads(archive.read("manifest.json").decode("utf-8")) if "manifest.json" in names else {}
+            result["manifest"] = manifest
+            result["database_dump"] = str(manifest.get("database_dump") or "")
+            result["uploads_archive"] = str(manifest.get("uploads_archive") or "")
+            if result["database_dump"] not in names:
+                result["errors"].append("Database dump is missing")
+            if result["uploads_archive"] not in names:
+                result["errors"].append("Uploads archive is missing")
+            if manifest.get("backup_type") != "full":
+                result["errors"].append("Manifest backup_type is not full")
+            if "SHA256SUMS.txt" in names:
+                checksum_lines = archive.read("SHA256SUMS.txt").decode("utf-8").splitlines()
+                for line in checksum_lines:
+                    if not line.strip():
+                        continue
+                    expected, filename = line.split(None, 1)
+                    filename = filename.strip()
+                    if filename not in names:
+                        result["errors"].append(f"Checksum target missing: {filename}")
+                        continue
+                    actual = sha256_bytes(archive.read(filename))
+                    if actual != expected:
+                        result["errors"].append(f"Checksum mismatch: {filename}")
+            if result["uploads_archive"] in names:
+                with zipfile.ZipFile(BytesIO(archive.read(result["uploads_archive"])), "r") as uploads:
+                    result["upload_file_count"] = len([name for name in uploads.namelist() if not name.endswith("/") and name != "EMPTY_UPLOADS.txt"])
+        result["ok"] = not result["errors"]
+    except Exception as exc:
+        result["errors"].append(str(exc))
+        result["ok"] = False
+    if record:
+        verification_sidecar_path(target).write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+    return result
 
 
 def restore_database_backup(backup_file: Path, passphrase: str = "") -> dict:
@@ -398,6 +584,7 @@ def restore_database_backup(backup_file: Path, passphrase: str = "") -> dict:
 
 def health_payload() -> dict:
     db_status = database_status()
+    latest_full = latest_full_backup_info()
     return {
         "ok": db_status["ok"],
         "app": "Clinical Data Studio",
@@ -414,7 +601,18 @@ def health_payload() -> dict:
         "https_detected": SETTINGS.public_base_url.startswith("https://"),
         "data_protection": data_protection_status(),
         "ai": ai_status(),
-        "backup": {"directory": str(BACKUPS), "latest_backup_at": latest_backup_time()},
+        "backup": {
+            "directory": str(BACKUPS),
+            "latest_backup_at": latest_backup_time(),
+            "latest_postgres_backup": latest_postgres_backup_info(),
+            "latest_full_backup": latest_full,
+            "latest_full_backup_verified": bool(latest_full and latest_full.get("verified")),
+            "uploads": {
+                "directory": str(UPLOADS),
+                "exists": UPLOADS.exists(),
+                "file_count": sum(1 for item in UPLOADS.rglob("*") if item.is_file()) if UPLOADS.exists() else 0,
+            },
+        },
     }
 
 
@@ -423,7 +621,7 @@ def backup_files_for_study(study_id: int) -> list[dict]:
     files = []
     for item in sorted(BACKUPS.iterdir(), key=lambda path: path.stat().st_mtime, reverse=True):
         if item.is_file() and item.name.startswith(f"study_{study_id}_") and item.suffix in (".sqlite3", ".cdsenc", ".dump"):
-            files.append({"name": item.name, "size": item.stat().st_size, "created_at": int(item.stat().st_mtime), "encrypted": item.suffix == ".cdsenc"})
+            files.append(backup_file_info(item, "database"))
     return files
 
 
@@ -528,6 +726,9 @@ def migrate_entries_unique_key(conn: sqlite3.Connection) -> None:
             repeat_instance INTEGER NOT NULL DEFAULT 1,
             status TEXT NOT NULL DEFAULT 'draft',
             data_json TEXT NOT NULL DEFAULT '{}',
+            form_version INTEGER NOT NULL DEFAULT 1,
+            schema_snapshot_json TEXT NOT NULL DEFAULT '{}',
+            entry_hash TEXT NOT NULL DEFAULT '',
             created_by INTEGER REFERENCES users(id),
             updated_by INTEGER REFERENCES users(id),
             locked_at INTEGER,
@@ -539,11 +740,11 @@ def migrate_entries_unique_key(conn: sqlite3.Connection) -> None:
         );
         INSERT INTO entries(
             id, study_id, participant_id, form_id, event_id, event_name, repeat_instance, status,
-            data_json, created_by, updated_by, locked_at, locked_by, lock_reason, created_at, updated_at
+            data_json, form_version, schema_snapshot_json, entry_hash, created_by, updated_by, locked_at, locked_by, lock_reason, created_at, updated_at
         )
         SELECT
             id, study_id, participant_id, form_id, event_id, event_name,
-            COALESCE(repeat_instance, 1), status, data_json, created_by, updated_by,
+            COALESCE(repeat_instance, 1), status, data_json, COALESCE(form_version, 1), COALESCE(schema_snapshot_json, '{}'), COALESCE(entry_hash, ''), created_by, updated_by,
             locked_at, locked_by, COALESCE(lock_reason, ''), created_at, updated_at
         FROM entries_old;
         DROP TABLE entries_old;
@@ -585,6 +786,52 @@ def audit(
     )
 
 
+def record_ai_audit(
+    conn: sqlite3.Connection,
+    user_id: int | None,
+    study_id: int | None = None,
+    case_id: int | None = None,
+    purpose: str = "",
+    input_type: str = "text",
+    mode: str = "local",
+    file_count: int = 0,
+    phi_detected: bool = False,
+    deidentified: bool = False,
+    status_value: str = "ok",
+    error: str = "",
+) -> int:
+    ai_state = ai_status()
+    provider = "openai" if mode == "openai" else "local"
+    model = ai_state.get("model", "local-rules") if mode == "openai" else "local-rules"
+    cur = conn.execute(
+        """
+        INSERT INTO ai_audit(
+            user_id, study_id, case_id, provider, model, mode, purpose, input_type,
+            phi_detected, phi_allowed, deidentified, file_count, status, error, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            study_id,
+            case_id,
+            provider,
+            model,
+            mode,
+            purpose[:80],
+            input_type[:40],
+            1 if phi_detected else 0,
+            1 if ai_state.get("phi_allowed") else 0,
+            1 if deidentified else 0,
+            int(file_count or 0),
+            status_value[:40],
+            str(error or "")[:1000],
+            now(),
+        ),
+    )
+    return int(cur.lastrowid)
+
+
 STUDY_AUDIT_FILTER = """
 (
     audit_log.study_id = ?
@@ -606,14 +853,38 @@ STUDY_AUDIT_FILTER = """
     OR (audit_log.entity_type = 'survey_invitation' AND audit_log.entity_id IN (SELECT id FROM survey_invitations WHERE study_id = ?))
     OR (audit_log.entity_type = 'report' AND audit_log.entity_id IN (SELECT id FROM reports WHERE study_id = ?))
     OR (audit_log.entity_type = 'academic_cv_item' AND audit_log.entity_id IN (SELECT id FROM academic_cv_items WHERE study_id = ?))
+    OR (audit_log.entity_type = 'academic_output' AND audit_log.entity_id IN (SELECT id FROM academic_outputs WHERE study_id = ?))
     OR (audit_log.entity_type = 'case_intake' AND audit_log.entity_id IN (SELECT id FROM case_intakes WHERE study_id = ?))
     OR (audit_log.entity_type = 'case_ai_review' AND audit_log.entity_id IN (SELECT id FROM case_ai_reviews WHERE study_id = ?))
+    OR (audit_log.entity_type = 'ai_audit' AND audit_log.entity_id IN (SELECT id FROM ai_audit WHERE study_id = ?))
 )
 """
 
 
 def study_audit_params(study_id: int) -> tuple[int, ...]:
     return (study_id,) * STUDY_AUDIT_FILTER.count("?")
+
+
+def audit_filters(study_id: int, query: dict[str, list[str]] | None = None) -> tuple[str, tuple]:
+    where = [STUDY_AUDIT_FILTER]
+    params: list = list(study_audit_params(study_id))
+    query = query or {}
+    if (query.get("user_id") or [""])[0]:
+        where.append("audit_log.user_id = ?")
+        params.append(int((query.get("user_id") or ["0"])[0]))
+    if (query.get("action") or [""])[0]:
+        where.append("audit_log.action = ?")
+        params.append((query.get("action") or [""])[0])
+    if (query.get("entity_type") or [""])[0]:
+        where.append("audit_log.entity_type = ?")
+        params.append((query.get("entity_type") or [""])[0])
+    if (query.get("date_from") or [""])[0]:
+        where.append("audit_log.created_at >= ?")
+        params.append(int((query.get("date_from") or ["0"])[0]))
+    if (query.get("date_to") or [""])[0]:
+        where.append("audit_log.created_at <= ?")
+        params.append(int((query.get("date_to") or ["0"])[0]))
+    return " AND ".join(f"({item})" for item in where), tuple(params)
 
 
 def migrate() -> None:
@@ -776,6 +1047,9 @@ def migrate() -> None:
                 repeat_instance INTEGER NOT NULL DEFAULT 1,
                 status TEXT NOT NULL DEFAULT 'draft',
                 data_json TEXT NOT NULL DEFAULT '{}',
+                form_version INTEGER NOT NULL DEFAULT 1,
+                schema_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                entry_hash TEXT NOT NULL DEFAULT '',
                 created_by INTEGER REFERENCES users(id),
                 updated_by INTEGER REFERENCES users(id),
                 locked_at INTEGER,
@@ -914,6 +1188,25 @@ def migrate() -> None:
                 created_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS ai_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                study_id INTEGER REFERENCES studies(id) ON DELETE CASCADE,
+                case_id INTEGER REFERENCES case_intakes(id) ON DELETE SET NULL,
+                provider TEXT NOT NULL DEFAULT 'local',
+                model TEXT NOT NULL DEFAULT 'local-rules',
+                mode TEXT NOT NULL DEFAULT 'local',
+                purpose TEXT NOT NULL DEFAULT '',
+                input_type TEXT NOT NULL DEFAULT 'text',
+                phi_detected INTEGER NOT NULL DEFAULT 0,
+                phi_allowed INTEGER NOT NULL DEFAULT 0,
+                deidentified INTEGER NOT NULL DEFAULT 0,
+                file_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'ok',
+                error TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS academic_cv_items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
@@ -925,6 +1218,25 @@ def migrate() -> None:
                 citation TEXT NOT NULL DEFAULT '',
                 notes TEXT NOT NULL DEFAULT '',
                 linked_case_id INTEGER REFERENCES case_intakes(id) ON DELETE SET NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                active INTEGER NOT NULL DEFAULT 1,
+                created_by INTEGER REFERENCES users(id),
+                updated_by INTEGER REFERENCES users(id),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS academic_outputs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+                output_type TEXT NOT NULL DEFAULT 'publication_idea',
+                title TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'idea',
+                linked_case_id INTEGER REFERENCES case_intakes(id) ON DELETE SET NULL,
+                participant_ids_json TEXT NOT NULL DEFAULT '[]',
+                evidence_file_ids_json TEXT NOT NULL DEFAULT '[]',
+                dataset_ref TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
                 metadata_json TEXT NOT NULL DEFAULT '{}',
                 active INTEGER NOT NULL DEFAULT 1,
                 created_by INTEGER REFERENCES users(id),
@@ -973,6 +1285,9 @@ def migrate() -> None:
         add_column(conn, "entries", "locked_by", "INTEGER REFERENCES users(id)")
         add_column(conn, "entries", "lock_reason", "TEXT NOT NULL DEFAULT ''")
         add_column(conn, "entries", "event_id", "INTEGER REFERENCES study_events(id) ON DELETE SET NULL")
+        add_column(conn, "entries", "form_version", "INTEGER NOT NULL DEFAULT 1")
+        add_column(conn, "entries", "schema_snapshot_json", "TEXT NOT NULL DEFAULT '{}'")
+        add_column(conn, "entries", "entry_hash", "TEXT NOT NULL DEFAULT ''")
         add_column(conn, "participants", "data_group_id", "INTEGER REFERENCES data_groups(id) ON DELETE SET NULL")
         add_column(conn, "users", "must_change_password", "INTEGER NOT NULL DEFAULT 0")
         add_column(conn, "users", "failed_login_count", "INTEGER NOT NULL DEFAULT 0")
@@ -989,6 +1304,7 @@ def migrate() -> None:
         add_column(conn, "case_files", "original_filename", "TEXT NOT NULL DEFAULT ''")
         add_column(conn, "case_files", "stored_filename", "TEXT NOT NULL DEFAULT ''")
         add_column(conn, "case_files", "sha256", "TEXT NOT NULL DEFAULT ''")
+        add_column(conn, "academic_outputs", "active", "INTEGER NOT NULL DEFAULT 1")
         migrate_entries_unique_key(conn)
         seed_initial_data(conn)
         add_production_indexes(conn)
@@ -1034,6 +1350,9 @@ def add_production_indexes(conn) -> None:
         "CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON audit_log(created_at)",
         "CREATE INDEX IF NOT EXISTS idx_audit_log_entity ON audit_log(entity_type, entity_id)",
         "CREATE INDEX IF NOT EXISTS idx_academic_cv_items_study_id ON academic_cv_items(study_id)",
+        "CREATE INDEX IF NOT EXISTS idx_academic_outputs_study_id ON academic_outputs(study_id)",
+        "CREATE INDEX IF NOT EXISTS idx_ai_audit_study_id ON ai_audit(study_id)",
+        "CREATE INDEX IF NOT EXISTS idx_ai_audit_user_id ON ai_audit(user_id)",
         "CREATE INDEX IF NOT EXISTS idx_api_tokens_study_id ON api_tokens(study_id)",
         "CREATE INDEX IF NOT EXISTS idx_api_tokens_token_hash ON api_tokens(token_hash)",
     ]
@@ -1129,6 +1448,92 @@ def normalize_code(value: str, fallback: str = "") -> str:
     return normalized or fallback
 
 
+def normalize_choices(value) -> list[dict]:
+    if not value:
+        return []
+    if isinstance(value, list):
+        choices = []
+        for item in value:
+            if isinstance(item, dict):
+                coded_value = str(item.get("value", item.get("code", ""))).strip()
+                label = str(item.get("label", coded_value)).strip()
+            else:
+                text = str(item).strip()
+                if "," in text:
+                    coded_value, label = [part.strip() for part in text.split(",", 1)]
+                else:
+                    coded_value, label = text, text
+            if coded_value:
+                choices.append({"value": coded_value, "label": label or coded_value})
+        return choices
+    text = str(value)
+    parts = [part.strip() for part in re.split(r"\s*[|;]\s*", text) if part.strip()]
+    if len(parts) <= 1 and "," in text:
+        raw_parts = [part.strip() for part in text.split(",") if part.strip()]
+        if len(raw_parts) > 2 or not raw_parts[0].isdigit():
+            parts = raw_parts
+    choices = []
+    for part in parts:
+        if "," in part:
+            coded_value, label = [piece.strip() for piece in part.split(",", 1)]
+        else:
+            coded_value, label = part, part
+        if coded_value:
+            choices.append({"value": coded_value, "label": label or coded_value})
+    return choices
+
+
+def choice_label(field: dict, value) -> str:
+    choices = field.get("choices") or [{"value": option, "label": option} for option in field.get("options", [])]
+    lookup = {str(item.get("value", "")): str(item.get("label", item.get("value", ""))) for item in choices}
+    return lookup.get(str(value), str(value))
+
+
+def evaluate_branching_logic(expression: str, data: dict) -> bool:
+    expression = str(expression or "").strip()
+    if not expression:
+        return True
+
+    def compare(clause: str) -> bool:
+        clause = clause.strip()
+        in_match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)\s+IN\s+\[(.*)\]", clause, flags=re.IGNORECASE)
+        if in_match:
+            field, raw_values = in_match.groups()
+            allowed = [item.strip().strip("'\"") for item in raw_values.split(",") if item.strip()]
+            return str(data.get(field, "")) in allowed
+        match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)\s*(==|=|!=|>=|<=|>|<)\s*(.+)", clause)
+        if not match:
+            return False
+        field, operator, raw_expected = match.groups()
+        actual = data.get(field, "")
+        expected = raw_expected.strip().strip("'\"")
+        if operator in {"=", "=="}:
+            return str(actual) == expected
+        if operator == "!=":
+            return str(actual) != expected
+        try:
+            actual_number = float(actual)
+            expected_number = float(expected)
+        except (TypeError, ValueError):
+            return False
+        if operator == ">=":
+            return actual_number >= expected_number
+        if operator == "<=":
+            return actual_number <= expected_number
+        if operator == ">":
+            return actual_number > expected_number
+        if operator == "<":
+            return actual_number < expected_number
+        return False
+
+    or_groups = re.split(r"\s+OR\s+", expression, flags=re.IGNORECASE)
+    for group in or_groups:
+        clauses = re.split(r"\s+AND\s+", group, flags=re.IGNORECASE)
+        if all(compare(clause) for clause in clauses if clause.strip()):
+            return True
+    return False
+
+
 def normalize_schema(schema: dict) -> dict:
     fields = []
     seen = set()
@@ -1139,7 +1544,10 @@ def normalize_schema(schema: dict) -> dict:
             raise ValueError(f"Duplicate field code: {code}")
         seen.add(code)
         field_type = str(source.get("type", "text")).strip() or "text"
-        if field_type not in {"text", "textarea", "number", "date", "select", "checkbox", "calc", "file"}:
+        aliases = {"dropdown": "select", "calculated": "calc", "calculated field": "calc", "yes/no": "yesno", "section header": "section"}
+        field_type = aliases.get(field_type.lower(), field_type.lower())
+        allowed = {"text", "textarea", "number", "integer", "decimal", "date", "datetime", "select", "radio", "checkbox", "yesno", "calc", "file", "section", "descriptive"}
+        if field_type not in allowed:
             raise ValueError(f"Unsupported field type: {field_type}")
         field = {
             "code": code,
@@ -1147,14 +1555,23 @@ def normalize_schema(schema: dict) -> dict:
             "type": field_type,
             "required": bool(source.get("required", False)),
         }
+        for key in ("help_text", "field_note", "units", "validation_type", "regex", "branching_logic"):
+            if source.get(key) not in (None, ""):
+                field[key] = str(source[key]).strip()
+        if source.get("phi"):
+            field["phi"] = bool(source.get("phi"))
+        if source.get("identifier"):
+            field["identifier"] = bool(source.get("identifier"))
         for key in ("min", "max"):
             if source.get(key) not in (None, ""):
                 field[key] = float(source[key])
-        if field_type in {"select", "checkbox"}:
-            options = source.get("options") or []
-            if isinstance(options, str):
-                options = [item.strip() for item in options.split(",")]
-            field["options"] = [str(item).strip() for item in options if str(item).strip()]
+        if field_type == "yesno":
+            field["choices"] = [{"value": "1", "label": "Yes"}, {"value": "0", "label": "No"}]
+            field["options"] = ["1", "0"]
+        if field_type in {"select", "radio", "checkbox"}:
+            choices = normalize_choices(source.get("choices") or source.get("options") or [])
+            field["choices"] = choices
+            field["options"] = [item["value"] for item in choices]
         if source.get("show_if"):
             show_if = source["show_if"]
             field["show_if"] = {"field": normalize_code(str(show_if.get("field", ""))), "equals": str(show_if.get("equals", ""))}
@@ -1176,7 +1593,12 @@ def validate_entry_data(schema: dict, data: dict) -> tuple[dict, list[dict]]:
         if field.get("show_if"):
             condition = field["show_if"]
             visible = str(data.get(condition["field"], "")) == str(condition["equals"])
+        if visible and field.get("branching_logic"):
+            visible = evaluate_branching_logic(field["branching_logic"], data)
         if not visible:
+            continue
+        if field["type"] in {"section", "descriptive"}:
+            cleaned[code] = ""
             continue
         if isinstance(value, str):
             value = value.strip()
@@ -1187,20 +1609,22 @@ def validate_entry_data(schema: dict, data: dict) -> tuple[dict, list[dict]]:
             continue
         if field["type"] == "calc":
             continue
-        if field["type"] == "number":
+        if field["type"] in {"number", "decimal", "integer"}:
             try:
                 number = float(value)
             except (TypeError, ValueError):
                 issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} must be numeric"})
                 cleaned[code] = value
                 continue
+            if field["type"] == "integer" and not number.is_integer():
+                issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} must be an integer"})
             if "min" in field and number < field["min"]:
                 issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} is below minimum {field['min']}"})
             if "max" in field and number > field["max"]:
                 issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} is above maximum {field['max']}"})
-            cleaned[code] = number
+            cleaned[code] = int(number) if field["type"] == "integer" and number.is_integer() else number
             continue
-        if field["type"] == "select":
+        if field["type"] in {"select", "radio", "yesno"}:
             if field.get("options") and str(value) not in field["options"]:
                 issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} must be one of the coded options"})
             cleaned[code] = str(value)
@@ -1230,6 +1654,8 @@ def validate_entry_data(schema: dict, data: dict) -> tuple[dict, list[dict]]:
                 issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} exceeds 5 MB"})
             cleaned[code] = {"name": filename, "type": content_type, "size": len(raw), "data": data_b64}
             continue
+        if field.get("regex") and not re.fullmatch(str(field["regex"]), str(value)):
+            issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} does not match the required format"})
         cleaned[code] = str(value)
     for field in schema.get("fields", []):
         if field["type"] != "calc":
@@ -1244,6 +1670,52 @@ def validate_entry_data(schema: dict, data: dict) -> tuple[dict, list[dict]]:
         except Exception:
             issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} calculation could not be evaluated"})
     return cleaned, issues
+
+
+def canonical_json(value) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def form_schema_snapshot(form: dict, schema: dict | None = None) -> dict:
+    schema = schema or load_json(form.get("schema_json", "{}"), {"fields": []})
+    return {
+        "form_id": form.get("id"),
+        "form_name": form.get("name", ""),
+        "form_code": form.get("code", ""),
+        "form_version": int(form.get("version") or 1),
+        "repeatable": bool(schema.get("repeatable", False)),
+        "fields": schema.get("fields", []),
+    }
+
+
+def schema_for_entry(entry: dict, fallback_schema: dict | None = None) -> dict:
+    snapshot = load_json(entry.get("schema_snapshot_json", ""), {})
+    if snapshot.get("fields"):
+        return {"fields": snapshot.get("fields", []), "repeatable": bool(snapshot.get("repeatable", False))}
+    return fallback_schema or {"fields": []}
+
+
+def entry_hash(data: dict, form_version: int, schema_snapshot: dict) -> str:
+    payload = {"data": data, "form_version": int(form_version or 1), "schema_snapshot": schema_snapshot}
+    return sha256_bytes(canonical_json(payload).encode("utf-8"))
+
+
+def form_schema_diff(old_schema: dict, new_schema: dict) -> dict:
+    old_fields = {field.get("code"): field for field in old_schema.get("fields", []) if field.get("code")}
+    new_fields = {field.get("code"): field for field in new_schema.get("fields", []) if field.get("code")}
+    added = sorted(set(new_fields) - set(old_fields))
+    removed = sorted(set(old_fields) - set(new_fields))
+    changed = []
+    for code in sorted(set(old_fields) & set(new_fields)):
+        before = old_fields[code]
+        after = new_fields[code]
+        changes = {}
+        for key in ("label", "type", "options", "min", "max", "required", "show_if", "calculation", "units", "validation", "regex"):
+            if before.get(key) != after.get(key):
+                changes[key] = {"before": before.get(key), "after": after.get(key)}
+        if changes:
+            changed.append({"field": code, "changes": changes})
+    return {"fields_added": added, "fields_removed": removed, "fields_changed": changed}
 
 
 def evaluate_calculation(expression: str, values: dict) -> float:
@@ -1735,7 +2207,8 @@ def publication_opportunities(case_items: list[dict]) -> list[dict]:
     return sorted(opportunities, key=lambda item: (-item["case_count"], item["group"]))
 
 
-def academic_cv_markdown(study: dict, cv_items: list[dict], opportunities: list[dict]) -> str:
+def academic_cv_markdown(study: dict, cv_items: list[dict], opportunities: list[dict], outputs: list[dict] | None = None) -> str:
+    outputs = outputs or []
     lines = [
         f"# Academic Portfolio - {study['name']}",
         "",
@@ -1754,6 +2227,13 @@ def academic_cv_markdown(study: dict, cv_items: list[dict], opportunities: list[
             )
     else:
         lines.append("- No case-based publication opportunities have been generated yet.")
+    lines.extend(["", "## Academic Outputs", ""])
+    if outputs:
+        for item in outputs:
+            case_link = f" Linked case: {item.get('linked_case_uid')}." if item.get("linked_case_uid") else ""
+            lines.append(f"- **{item['title']}**. {item['output_type']} / {item['status']}.{case_link} {item.get('notes') or ''}".strip())
+    else:
+        lines.append("- Track publication ideas, abstracts, manuscripts, posters, audits, teaching, and grants here.")
     lines.extend(["", "## CV Items", ""])
     if cv_items:
         for item in cv_items:
@@ -2007,11 +2487,11 @@ def user_membership(conn: sqlite3.Connection, user: dict, study_id: int) -> dict
 
 
 def role_has(role: str, permission: str) -> bool:
-    return permission in ROLE_PERMISSIONS.get(role, set())
+    return authz_role_has(role, permission)
 
 
 def membership_has(membership: dict | None, permission: str) -> bool:
-    return bool(membership and role_has(membership["role"], permission))
+    return authz_membership_has(membership, permission)
 
 
 class App(BaseHTTPRequestHandler):
@@ -2066,7 +2546,15 @@ class App(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def queue_header(self, name: str, value: str) -> None:
+        headers = getattr(self, "_extra_headers", [])
+        headers.append((name, value))
+        self._extra_headers = headers
+
     def end_headers(self) -> None:
+        for name, value in getattr(self, "_extra_headers", []):
+            self.send_header(name, value)
+        self._extra_headers = []
         self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; object-src 'none'; frame-ancestors 'self'; base-uri 'self'; form-action 'self'")
         self.send_header("X-Frame-Options", "SAMEORIGIN")
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -2075,6 +2563,62 @@ class App(BaseHTTPRequestHandler):
         if SETTINGS.require_https or self.headers.get("x-forwarded-proto", "").lower() == "https":
             self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
         super().end_headers()
+
+    def cookies(self) -> dict:
+        parsed = {}
+        for part in self.headers.get("cookie", "").split(";"):
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            parsed[key.strip()] = value.strip()
+        return parsed
+
+    def request_is_https(self) -> bool:
+        return SETTINGS.require_https or SETTINGS.production or self.headers.get("x-forwarded-proto", "").lower() == "https"
+
+    def session_cookie_header(self, token: str, max_age: int = SESSION_TTL_SECONDS) -> str:
+        parts = [f"{SESSION_COOKIE_NAME}={token}", "HttpOnly", "Path=/", "SameSite=Lax", f"Max-Age={max_age}"]
+        if self.request_is_https():
+            parts.append("Secure")
+        return "; ".join(parts)
+
+    def clear_session_cookie(self) -> None:
+        parts = [f"{SESSION_COOKIE_NAME}=", "HttpOnly", "Path=/", "SameSite=Lax", "Max-Age=0"]
+        if self.request_is_https():
+            parts.append("Secure")
+        self.queue_header("Set-Cookie", "; ".join(parts))
+
+    def expected_origins(self) -> set[str]:
+        host = self.headers.get("host", "")
+        scheme = self.headers.get("x-forwarded-proto", "https" if self.request_is_https() else "http")
+        origins = {f"{scheme}://{host}"} if host else set()
+        if SETTINGS.public_base_url:
+            parsed = urlparse(SETTINGS.public_base_url)
+            if parsed.scheme and parsed.netloc:
+                origins.add(f"{parsed.scheme}://{parsed.netloc}")
+        return origins
+
+    def origin_is_allowed(self) -> bool:
+        supplied = self.headers.get("origin") or self.headers.get("referer")
+        if not supplied:
+            return True
+        parsed = urlparse(supplied)
+        if not parsed.scheme or not parsed.netloc:
+            return False
+        return f"{parsed.scheme}://{parsed.netloc}" in self.expected_origins()
+
+    def require_csrf_for_cookie_auth(self) -> bool:
+        if getattr(self, "auth_source", "") != "cookie" or self.command not in {"POST", "PATCH", "DELETE"}:
+            return True
+        if not self.origin_is_allowed():
+            self.send_error_json("CSRF origin check failed", 403)
+            return False
+        token = self.headers.get(CSRF_HEADER_NAME, "")
+        session_digest = getattr(self, "session_digest", "")
+        if not session_digest or not verify_csrf_token(session_digest, token):
+            self.send_error_json("CSRF token required", 403)
+            return False
+        return True
 
     def send_error_json(self, message: str, status: int = 400) -> None:
         self.send_json({"error": message}, status)
@@ -2102,11 +2646,21 @@ class App(BaseHTTPRequestHandler):
         self.wfile.write(content)
 
     def current_user(self, conn: sqlite3.Connection) -> dict | None:
+        self.auth_source = ""
+        self.session_digest = ""
         header = self.headers.get("authorization", "")
-        if not header.startswith("Bearer "):
+        token = ""
+        if header.startswith("Bearer "):
+            token = header.removeprefix("Bearer ").strip()
+            self.auth_source = "bearer"
+        else:
+            token = self.cookies().get(SESSION_COOKIE_NAME, "")
+            if token:
+                self.auth_source = "cookie"
+        if not token:
             return None
-        token = header.removeprefix("Bearer ").strip()
         digest = session_token_digest(token)
+        self.session_digest = digest
         user = row(
             conn,
             """
@@ -2146,6 +2700,10 @@ class App(BaseHTTPRequestHandler):
 
                 user = self.require_user(conn)
                 if not user:
+                    return
+                if path == "/api/csrf" and method == "GET":
+                    return self.send_json({"csrf_token": csrf_token(getattr(self, "session_digest", ""))})
+                if not self.require_csrf_for_cookie_auth():
                     return
                 if user.get("must_change_password") and path not in {"/api/me", "/api/password", "/api/logout"}:
                     self.send_error_json("Password change required before continuing.", 403)
@@ -2217,7 +2775,8 @@ class App(BaseHTTPRequestHandler):
         conn.execute("INSERT INTO sessions(token, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)", (session_token_digest(token), user["id"], now() + SESSION_TTL_SECONDS, now()))
         audit(conn, user["id"], "login", "session", None, None, {"username": username}, **self.audit_context())
         conn.commit()
-        self.send_json({"token": token, "user": {"id": user["id"], "username": user["username"], "display_name": user["display_name"], "role": user["role"], "must_change_password": user.get("must_change_password", 0)}})
+        self.queue_header("Set-Cookie", self.session_cookie_header(token))
+        self.send_json({"token": token, "session": "cookie", "user": {"id": user["id"], "username": user["username"], "display_name": user["display_name"], "role": user["role"], "must_change_password": user.get("must_change_password", 0)}})
 
     def first_run_setup(self, conn: sqlite3.Connection) -> None:
         if not setup_required(conn):
@@ -2252,11 +2811,15 @@ class App(BaseHTTPRequestHandler):
     def logout(self, conn: sqlite3.Connection) -> None:
         header = self.headers.get("authorization", "")
         token = header.removeprefix("Bearer ").strip() if header.startswith("Bearer ") else ""
+        if not token:
+            token = self.cookies().get(SESSION_COOKIE_NAME, "")
         if token:
             digest = session_token_digest(token)
             session = row(conn, "SELECT user_id FROM sessions WHERE token = ?", (digest,))
             conn.execute("DELETE FROM sessions WHERE token = ?", (digest,))
             audit(conn, session["user_id"] if session else None, "logout", "session", None, None, {"logged_out": bool(session)}, **self.audit_context())
+            conn.commit()
+        self.clear_session_cookie()
         self.send_json({"ok": True})
 
     def user_from_api_token(self, conn: sqlite3.Connection, raw_token: str) -> tuple[dict, dict] | tuple[None, None]:
@@ -2562,9 +3125,10 @@ class App(BaseHTTPRequestHandler):
             BACKUPS.mkdir(parents=True, exist_ok=True)
             files = []
             for item in sorted(BACKUPS.iterdir(), key=lambda path: path.stat().st_mtime, reverse=True):
-                if item.is_file() and item.suffix in {".sqlite3", ".cdsenc", ".dump", ".gz"}:
-                    files.append({"name": item.name, "size": item.stat().st_size, "created_at": int(item.stat().st_mtime), "encrypted": item.suffix == ".cdsenc"})
-            self.send_json({"backups": files})
+                if item.is_file() and not item.name.endswith(".verify.json") and item.suffix in {".sqlite3", ".cdsenc", ".dump", ".gz"}:
+                    backup_type = "full" if item.name.startswith("full_") or ".full." in item.name else ("postgres" if item.name.startswith("postgres_") or item.name.endswith(".dump") else "database")
+                    files.append(latest_full_backup_info(item) if backup_type == "full" else backup_file_info(item, backup_type))
+            self.send_json({"backups": files, "summary": health_payload()["backup"]})
             return
         if path == "/api/admin/backup" and method == "POST":
             payload = self.body()
@@ -2572,6 +3136,40 @@ class App(BaseHTTPRequestHandler):
             backup = create_database_backup(str(payload.get("passphrase", "")) or SETTINGS.backup_passphrase)
             audit(conn, user["id"], "create_encrypted" if backup["encrypted"] else "create", "backup", None, None, backup, **self.audit_context())
             self.send_json({"backup": backup}, 201)
+            return
+        if path == "/api/admin/backup/full" and method == "POST":
+            payload = self.body()
+            conn.commit()
+            backup = create_full_backup(str(payload.get("passphrase", "")) or SETTINGS.backup_passphrase)
+            audit(conn, user["id"], "create_full", "backup", None, None, backup, **self.audit_context())
+            self.send_json({"backup": backup}, 201)
+            return
+        if path == "/api/admin/backups/verify" and method == "POST":
+            payload = self.body()
+            filename = Path(str(payload.get("filename", ""))).name
+            target = (BACKUPS / filename).resolve() if filename else (full_backup_candidates()[0] if full_backup_candidates() else None)
+            if not target or not str(target).startswith(str(BACKUPS.resolve())) or not target.exists():
+                self.send_error_json("Full backup not found", 404)
+                return
+            verification = verify_full_backup(target, str(payload.get("passphrase", "")) or SETTINGS.backup_passphrase, record=True)
+            audit(conn, user["id"], "verify", "backup", None, None, {"filename": target.name, "ok": verification["ok"]}, **self.audit_context())
+            self.send_json({"verification": verification})
+            return
+        if len(parts) == 4 and parts[:3] == ["api", "admin", "backups"] and method == "GET":
+            filename = Path(parts[3]).name
+            target = (BACKUPS / filename).resolve()
+            if not str(target).startswith(str(BACKUPS.resolve())) or not target.exists() or target.name.endswith(".verify.json"):
+                self.send_error_json("Backup not found", 404)
+                return
+            content = target.read_bytes()
+            audit(conn, user["id"], "download", "backup", None, None, {"filename": target.name, "size": target.stat().st_size}, **self.audit_context())
+            conn.commit()
+            self.send_response(200)
+            self.send_header("content-type", "application/octet-stream")
+            self.send_header("content-disposition", f"attachment; filename={target.name}")
+            self.send_header("content-length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
             return
         if len(parts) == 5 and parts[:3] == ["api", "admin", "users"] and parts[4] == "reset-password" and method == "POST":
             target_user_id = int(parts[3])
@@ -2631,6 +3229,12 @@ class App(BaseHTTPRequestHandler):
         conn.commit()
         self.send_json({"ok": True})
 
+    def user_can_use_ai_any_project(self, conn: sqlite3.Connection, user: dict) -> bool:
+        if is_super_admin(user):
+            return True
+        memberships = rows(conn, "SELECT role FROM study_memberships WHERE user_id = ? AND active = 1", (user["id"],))
+        return any(membership_has(item, "use_ai") for item in memberships)
+
     def assist_crf(self, conn: sqlite3.Connection, user: dict) -> None:
         payload = self.body()
         text = str(payload.get("text", "")).strip()
@@ -2640,9 +3244,25 @@ class App(BaseHTTPRequestHandler):
         status = ai_status()
         warnings = []
         mode = "local"
+        findings = detect_phi_findings(text)
+        ai_audit_id = None
         if status["external_ai_enabled"]:
-            assert_external_ai_safe(text)
+            if not self.user_can_use_ai_any_project(conn, user):
+                ai_audit_id = record_ai_audit(
+                    conn,
+                    user["id"],
+                    purpose="protocol_to_crf",
+                    input_type="text",
+                    mode="local",
+                    phi_detected=bool(findings),
+                    status_value="blocked",
+                    error="External AI permission required",
+                )
+                audit(conn, user["id"], "ai_request", "ai_audit", ai_audit_id, None, {"purpose": "protocol_to_crf", "status": "blocked"}, **self.audit_context())
+                self.send_error_json("AI permission required", 403)
+                return
             try:
+                assert_external_ai_safe(text)
                 schema = draft_crf_schema_with_openai(text)
                 mode = "openai"
             except Exception as exc:
@@ -2650,18 +3270,179 @@ class App(BaseHTTPRequestHandler):
                 warnings.append(f"External AI drafting failed; local fallback used: {exc}")
         else:
             schema, warnings = draft_crf_schema_locally(text)
-        audit(conn, user["id"], "assist_crf", "ai", None, None, {"mode": mode, "field_count": len(schema["fields"]), "warning_count": len(warnings)})
+        ai_audit_id = record_ai_audit(
+            conn,
+            user["id"],
+            purpose="protocol_to_crf",
+            input_type="text",
+            mode=mode,
+            phi_detected=bool(findings),
+            deidentified=False,
+            status_value="fallback" if warnings and mode == "local" and status["external_ai_enabled"] else "ok",
+            error="; ".join(warnings),
+        )
+        audit(
+            conn,
+            user["id"],
+            "ai_request",
+            "ai_audit",
+            ai_audit_id,
+            None,
+            {"purpose": "protocol_to_crf", "mode": mode, "field_count": len(schema["fields"]), "warning_count": len(warnings), "phi_detected": bool(findings)},
+            **self.audit_context(),
+        )
         self.send_json(
             {
                 "schema": schema,
                 "assistant": {
                     "mode": mode,
+                    "audit_id": ai_audit_id,
                     "field_count": len(schema["fields"]),
                     "warnings": warnings,
+                    "phi_findings": findings,
                     "safety_note": "Review every AI/local draft field before using it for real study data. Do not paste identifiers or PHI into external AI unless your study policy permits it.",
                 },
             }
         )
+
+    def ai_audit_rows(self, conn: sqlite3.Connection, study_id: int) -> list[dict]:
+        data = rows(
+            conn,
+            """
+            SELECT ai_audit.*, users.username, users.display_name, case_intakes.case_uid, case_intakes.title AS case_title
+            FROM ai_audit
+            LEFT JOIN users ON users.id = ai_audit.user_id
+            LEFT JOIN case_intakes ON case_intakes.id = ai_audit.case_id
+            WHERE ai_audit.study_id = ? OR ai_audit.study_id IS NULL
+            ORDER BY ai_audit.id DESC
+            LIMIT 250
+            """,
+            (study_id,),
+        )
+        for item in data:
+            item["phi_detected"] = bool(item.get("phi_detected"))
+            item["phi_allowed"] = bool(item.get("phi_allowed"))
+            item["deidentified"] = bool(item.get("deidentified"))
+        return data
+
+    def local_ai_workbench_result(self, conn, study_id: int, membership: dict, user: dict, purpose: str, text: str = "", case_id: int | None = None) -> dict:
+        purpose = purpose.strip().lower().replace("-", "_")
+        cases = self.case_rows(conn, study_id, membership, user)
+        if purpose == "case_summary":
+            if case_id:
+                case_row = self.case_for_member(conn, study_id, case_id, membership, user)
+                if not case_row:
+                    raise ValueError("Case not found")
+                case_item = self.case_payload(conn, case_row)
+                extracted = case_item.get("extracted", {})
+            else:
+                extracted = extract_case_intelligence(text, "Case note")
+            clinical = extracted.get("clinical", {})
+            return {
+                "purpose": purpose,
+                "summary": " ".join(part for part in [clinical.get("diagnosis", ""), clinical.get("presentation", ""), clinical.get("treatment", ""), clinical.get("outcome", "")] if part) or "Insufficient structured case detail for a reliable local summary.",
+                "structured": extracted,
+                "missing_items": extracted.get("missing_fields", []),
+                "safety_note": "Local summary is rule-based and should be checked against the source record.",
+            }
+        if purpose == "missing_fields":
+            issues = self.quality_issues(conn, study_id, membership)
+            missing = [issue for issue in issues if "missing" in str(issue.get("message", "")).lower() or issue.get("severity") == "warning"]
+            return {"purpose": purpose, "missing_count": len(missing), "items": missing[:100], "safety_note": "Use this as a preparation list before analysis or publication."}
+        if purpose == "inconsistency_detection":
+            issues = self.quality_issues(conn, study_id, membership)
+            errors = [issue for issue in issues if issue.get("severity") == "error"]
+            return {"purpose": purpose, "issue_count": len(errors), "items": errors[:100], "safety_note": "Rule-based checks do not replace clinical review."}
+        if purpose == "publication_idea":
+            return {
+                "purpose": purpose,
+                "opportunities": publication_opportunities(cases),
+                "safety_note": "These are publication angles only. Novelty requires a manual literature search.",
+            }
+        if purpose == "cv_item":
+            extracted = extract_case_intelligence(text, "Academic activity")
+            title = text.splitlines()[0].strip()[:140] if text.strip() else "Academic activity"
+            return {
+                "purpose": purpose,
+                "suggested_item": {
+                    "item_type": "publication" if "manuscript" in text.lower() or "paper" in text.lower() else "teaching" if "teach" in text.lower() else "abstract" if "abstract" in text.lower() else "activity",
+                    "title": title,
+                    "status": "planned",
+                    "notes": "Review and edit before saving to the CV tracker.",
+                },
+                "structured": extracted,
+                "safety_note": "AI/local suggestions are labels, not confirmed academic achievements.",
+            }
+        raise ValueError("Unsupported AI workbench purpose")
+
+    def ai_routes(self, conn, user, method, study_id, parts, membership) -> None:
+        if method == "GET" and len(parts) == 5 and parts[4] == "audit":
+            if not (membership_has(membership, "manage_study") or membership_has(membership, "review_data")):
+                self.send_error_json("AI audit permission required", 403)
+                return
+            self.send_json({"ai_audit": self.ai_audit_rows(conn, study_id), "ai": ai_status()})
+            return
+        if method == "POST" and len(parts) == 5 and parts[4] == "safety-preview":
+            if not membership_has(membership, "use_ai"):
+                self.send_error_json("AI permission required", 403)
+                return
+            payload = self.body()
+            text = str(payload.get("text", ""))
+            replacement = str(payload.get("replacement", "Study participant")) or "Study participant"
+            findings = detect_phi_findings(text)
+            cleaned = deidentify_for_ai(text, replacement)
+            ai_audit_id = record_ai_audit(
+                conn,
+                user["id"],
+                study_id=study_id,
+                purpose="deidentify_preview",
+                input_type="text",
+                mode="local",
+                phi_detected=bool(findings),
+                deidentified=True,
+                status_value="preview",
+            )
+            audit(conn, user["id"], "ai_request", "ai_audit", ai_audit_id, None, {"purpose": "deidentify_preview", "phi_detected": bool(findings)}, study_id=study_id, **self.audit_context())
+            self.send_json(
+                {
+                    "preview": {
+                        "findings": findings,
+                        "deidentified_text": cleaned,
+                        "remaining_findings": detect_phi_findings(cleaned),
+                        "external_ai_blocked": bool(findings and ai_status()["external_ai_enabled"] and not ai_status()["phi_allowed"]),
+                        "requires_admin_confirmation": bool(findings),
+                    },
+                    "ai": ai_status(),
+                    "audit_id": ai_audit_id,
+                }
+            )
+            return
+        if method == "POST" and len(parts) == 5 and parts[4] == "workbench":
+            if not membership_has(membership, "use_ai"):
+                self.send_error_json("AI permission required", 403)
+                return
+            payload = self.body()
+            purpose = str(payload.get("purpose", "")).strip().lower()
+            text = str(payload.get("text", ""))
+            case_id = int(payload.get("case_id") or 0) or None
+            findings = detect_phi_findings(text)
+            result = self.local_ai_workbench_result(conn, study_id, membership, user, purpose, text, case_id)
+            ai_audit_id = record_ai_audit(
+                conn,
+                user["id"],
+                study_id=study_id,
+                case_id=case_id,
+                purpose=purpose,
+                input_type="text",
+                mode="local",
+                phi_detected=bool(findings),
+                deidentified=False,
+                status_value="ok",
+            )
+            audit(conn, user["id"], "ai_request", "ai_audit", ai_audit_id, None, {"purpose": purpose, "mode": "local", "phi_detected": bool(findings)}, study_id=study_id, **self.audit_context())
+            self.send_json({"result": result, "ai": ai_status(), "audit_id": ai_audit_id})
+            return
+        self.send_error_json("Unsupported AI operation", 405)
 
     def create_study(self, conn: sqlite3.Connection, user: dict) -> None:
         if not is_super_admin(user):
@@ -2701,7 +3482,7 @@ class App(BaseHTTPRequestHandler):
             conn,
             """
             SELECT survey_links.*, studies.name AS study_name, studies.protocol_id,
-                   forms.name AS form_name, forms.code AS form_code, forms.schema_json,
+                   forms.name AS form_name, forms.code AS form_code, forms.schema_json, forms.version AS form_version,
                    study_events.name AS event_name, study_events.code AS event_code
             FROM survey_links
             JOIN studies ON studies.id = survey_links.study_id
@@ -2765,22 +3546,29 @@ class App(BaseHTTPRequestHandler):
             audit(conn, None, "public_create", "participant", cur.lastrowid, None, participant)
         event_id = survey.get("event_id")
         event_name = survey.get("event_code") or "Baseline"
+        form_snapshot = form_schema_snapshot(
+            {"id": survey["form_id"], "name": survey["form_name"], "code": survey["form_code"], "version": survey.get("form_version") or 1},
+            schema,
+        )
+        form_version = int(survey.get("form_version") or 1)
+        digest = entry_hash(cleaned, form_version, form_snapshot)
+        snapshot_json = json.dumps(form_snapshot, sort_keys=True)
         existing = row(conn, "SELECT * FROM entries WHERE participant_id = ? AND form_id = ? AND event_name = ? AND repeat_instance = 1", (participant["id"], survey["form_id"], event_name))
         if existing:
             if existing.get("locked_at"):
                 self.send_error_json("This submitted CRF is locked and cannot be updated from the public link", 423)
                 return
             conn.execute(
-                "UPDATE entries SET event_id = ?, data_json = ?, status = 'complete', updated_at = ? WHERE id = ?",
-                (event_id, json.dumps(cleaned), timestamp, existing["id"]),
+                "UPDATE entries SET event_id = ?, data_json = ?, status = 'complete', form_version = ?, schema_snapshot_json = ?, entry_hash = ?, updated_at = ? WHERE id = ?",
+                (event_id, json.dumps(cleaned), form_version, snapshot_json, digest, timestamp, existing["id"]),
             )
             entry_id = existing["id"]
             after = row(conn, "SELECT * FROM entries WHERE id = ?", (entry_id,))
             audit(conn, None, "public_update", "entry", entry_id, existing, after)
         else:
             cur = conn.execute(
-                "INSERT INTO entries(study_id, participant_id, form_id, event_id, event_name, repeat_instance, status, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, 'complete', ?, ?, ?)",
-                (survey["study_id"], participant["id"], survey["form_id"], event_id, event_name, json.dumps(cleaned), timestamp, timestamp),
+                "INSERT INTO entries(study_id, participant_id, form_id, event_id, event_name, repeat_instance, status, data_json, form_version, schema_snapshot_json, entry_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, 'complete', ?, ?, ?, ?, ?, ?)",
+                (survey["study_id"], participant["id"], survey["form_id"], event_id, event_name, json.dumps(cleaned), form_version, snapshot_json, digest, timestamp, timestamp),
             )
             entry_id = cur.lastrowid
             after = row(conn, "SELECT * FROM entries WHERE id = ?", (entry_id,))
@@ -2971,6 +3759,8 @@ class App(BaseHTTPRequestHandler):
                 self.send_error_json("Academic workbench permission required", 403)
                 return
             return self.academic_workbench(conn, user, method, study_id, parts, query, membership)
+        if resource == "ai":
+            return self.ai_routes(conn, user, method, study_id, parts, membership)
         if resource == "backups":
             if not membership_has(membership, "manage_study"):
                 self.send_error_json("Study management permission required", 403)
@@ -3005,31 +3795,55 @@ class App(BaseHTTPRequestHandler):
             if not membership_has(membership, "review_data"):
                 self.send_error_json("Review permission required", 403)
                 return
+            audit_where, audit_params = audit_filters(study_id, query)
             audit_rows = rows(
                 conn,
                 f"""
-                SELECT audit_log.*, users.display_name
+                SELECT audit_log.*, users.username, users.display_name
                 FROM audit_log
                 LEFT JOIN users ON users.id = audit_log.user_id
-                WHERE {STUDY_AUDIT_FILTER}
+                WHERE {audit_where}
                 ORDER BY audit_log.id DESC
                 LIMIT 250
                 """,
-                study_audit_params(study_id),
+                audit_params,
             )
-            return self.send_json({"audit": audit_rows})
+            suspicious_actions = {"failed_login", "export", "download", "create_full", "create_encrypted", "ai_request", "api_request", "sync_conflict"}
+            suspicious = [item for item in audit_rows if item["action"] in suspicious_actions or item["entity_type"] in {"backup", "case_file", "case_ai_review", "ai_audit"}]
+            return self.send_json({"audit": audit_rows, "suspicious": suspicious[:50]})
         if resource == "audit-export" and method == "GET":
             if not membership_has(membership, "review_data"):
                 self.send_error_json("Review permission required", 403)
                 return
             audit(conn, user["id"], "export", "audit", study_id, None, {"format": "csv"}, study_id=study_id, **self.audit_context())
-            return self.export_audit_csv(conn, study_id)
+            return self.export_audit_csv(conn, study_id, query)
         self.send_error_json("Unknown study route", 404)
 
     def forms(self, conn, user, method, study_id, parts) -> None:
         if method == "GET" and len(parts) == 6 and parts[5] == "versions":
             form_id = int(parts[4])
-            versions = rows(conn, "SELECT id, form_id, study_id, version, name, code, saved_by, saved_at FROM form_versions WHERE form_id = ? AND study_id = ? ORDER BY version DESC", (form_id, study_id))
+            current = row(conn, "SELECT * FROM forms WHERE id = ? AND study_id = ?", (form_id, study_id))
+            if not current:
+                self.send_error_json("Form not found", 404)
+                return
+            versions = rows(conn, "SELECT id, form_id, study_id, version, name, code, schema_json, saved_by, saved_at FROM form_versions WHERE form_id = ? AND study_id = ? ORDER BY version DESC", (form_id, study_id))
+            current_schema = load_json(current["schema_json"], {"fields": []})
+            for version in versions:
+                prior_schema = load_json(version.pop("schema_json"), {"fields": []})
+                version["diff_to_current"] = form_schema_diff(prior_schema, current_schema)
+            current_payload = {
+                "id": current["id"],
+                "form_id": current["id"],
+                "study_id": study_id,
+                "version": current["version"],
+                "name": current["name"],
+                "code": current["code"],
+                "saved_by": None,
+                "saved_at": current["updated_at"],
+                "diff_to_current": {"fields_added": [], "fields_removed": [], "fields_changed": []},
+                "current": True,
+            }
+            versions.insert(0, current_payload)
             self.send_json({"versions": versions})
             return
         if method == "GET":
@@ -3333,19 +4147,33 @@ class App(BaseHTTPRequestHandler):
                 },
             )
             field_type = str(raw.get("field_type", "text")).strip() or "text"
-            choices = [item.strip() for item in str(raw.get("choices", "")).replace("|", ",").split(",") if item.strip()]
             field = {
                 "code": raw.get("field_name", ""),
                 "label": raw.get("field_label", ""),
                 "type": field_type,
                 "required": str(raw.get("required", "")).strip().lower() in {"yes", "true", "1"},
             }
+            choices = normalize_choices(raw.get("choices", ""))
             if choices:
-                field["options"] = choices
+                field["choices"] = choices
             if raw.get("validation_min") not in (None, ""):
                 field["min"] = raw.get("validation_min")
             if raw.get("validation_max") not in (None, ""):
                 field["max"] = raw.get("validation_max")
+            for csv_key, field_key in (
+                ("units", "units"),
+                ("field_note", "field_note"),
+                ("help_text", "help_text"),
+                ("validation_type", "validation_type"),
+                ("regex", "regex"),
+                ("branching_logic", "branching_logic"),
+            ):
+                if raw.get(csv_key) not in (None, ""):
+                    field[field_key] = raw.get(csv_key)
+            if str(raw.get("phi", "")).strip().lower() in {"yes", "true", "1"}:
+                field["phi"] = True
+            if str(raw.get("identifier", "")).strip().lower() in {"yes", "true", "1"}:
+                field["identifier"] = True
             if raw.get("calculation"):
                 field["calculation"] = raw.get("calculation")
                 field["type"] = "calc"
@@ -3446,6 +4274,8 @@ class App(BaseHTTPRequestHandler):
                 imported["errors"].append({"row": row_index, "message": "Could not identify CRF/form"})
                 continue
             schema = load_json(form["schema_json"], {"fields": []})
+            form_snapshot = form_schema_snapshot(form, schema)
+            form_version = int(form.get("version") or 1)
             data = {}
             for field in schema.get("fields", []):
                 field_code = field.get("code", "")
@@ -3458,6 +4288,8 @@ class App(BaseHTTPRequestHandler):
             if issues:
                 imported["errors"].append({"row": row_index, "message": "Validation failed", "issues": issues})
                 continue
+            digest = entry_hash(cleaned, form_version, form_snapshot)
+            snapshot_json = json.dumps(form_snapshot, sort_keys=True)
             event_code = normalize_code(str(raw.get("event_code") or raw.get("event_name") or "baseline"))
             event = events_by_code.get(event_code) or events_by_code.get("baseline")
             event_id = event["id"] if event else None
@@ -3469,14 +4301,17 @@ class App(BaseHTTPRequestHandler):
                 if existing.get("locked_at"):
                     imported["errors"].append({"row": row_index, "message": "Existing CRF is locked"})
                     continue
-                conn.execute("UPDATE entries SET event_id = ?, data_json = ?, status = ?, updated_by = ?, updated_at = ? WHERE id = ?", (event_id, json.dumps(cleaned), status, user["id"], timestamp, existing["id"]))
+                conn.execute(
+                    "UPDATE entries SET event_id = ?, data_json = ?, status = ?, form_version = ?, schema_snapshot_json = ?, entry_hash = ?, updated_by = ?, updated_at = ? WHERE id = ?",
+                    (event_id, json.dumps(cleaned), status, form_version, snapshot_json, digest, user["id"], timestamp, existing["id"]),
+                )
                 after = row(conn, "SELECT * FROM entries WHERE id = ?", (existing["id"],))
                 audit(conn, user["id"], "import_update", "entry", existing["id"], existing, after)
                 imported["entries_updated"] += 1
             else:
                 cur = conn.execute(
-                    "INSERT INTO entries(study_id, participant_id, form_id, event_id, event_name, repeat_instance, status, data_json, created_by, updated_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (study_id, participant["id"], form["id"], event_id, event_name, repeat_instance, status, json.dumps(cleaned), user["id"], user["id"], timestamp, timestamp),
+                    "INSERT INTO entries(study_id, participant_id, form_id, event_id, event_name, repeat_instance, status, data_json, form_version, schema_snapshot_json, entry_hash, created_by, updated_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (study_id, participant["id"], form["id"], event_id, event_name, repeat_instance, status, json.dumps(cleaned), form_version, snapshot_json, digest, user["id"], user["id"], timestamp, timestamp),
                 )
                 after = row(conn, "SELECT * FROM entries WHERE id = ?", (cur.lastrowid,))
                 audit(conn, user["id"], "import_create", "entry", cur.lastrowid, None, after)
@@ -3574,6 +4409,7 @@ class App(BaseHTTPRequestHandler):
             entries = rows(conn, sql + " ORDER BY entries.updated_at DESC", params)
             for entry in entries:
                 entry["data"] = load_json(entry.pop("data_json"), {})
+                entry["schema_snapshot"] = load_json(entry.pop("schema_snapshot_json"), {})
             self.send_json({"entries": entries})
             return
         if method == "POST":
@@ -3609,6 +4445,8 @@ class App(BaseHTTPRequestHandler):
                 self.send_error_json("Participant is outside your data access group", 403)
                 return
             schema = load_json(form["schema_json"], {"fields": []})
+            snapshot = form_schema_snapshot(form, schema)
+            form_version = int(form.get("version") or 1)
             if repeat_instance > 1 and not schema.get("repeatable"):
                 self.send_error_json("This CRF is not configured as repeatable", 400)
                 return
@@ -3616,8 +4454,28 @@ class App(BaseHTTPRequestHandler):
             if issues:
                 self.send_json({"errors": issues}, 422)
                 return
+            digest = entry_hash(cleaned, form_version, snapshot)
+            snapshot_json = json.dumps(snapshot, sort_keys=True)
             existing = row(conn, "SELECT * FROM entries WHERE participant_id = ? AND form_id = ? AND event_name = ? AND repeat_instance = ?", (participant_id, form_id, event_name, repeat_instance))
             if existing:
+                if_match_updated_at = payload.get("if_match_updated_at")
+                if_match_entry_hash = str(payload.get("if_match_entry_hash") or "").strip()
+                try:
+                    client_updated_at = int(if_match_updated_at or 0)
+                except (TypeError, ValueError):
+                    client_updated_at = -1
+                stale_timestamp = if_match_updated_at not in (None, "") and client_updated_at != int(existing.get("updated_at") or 0)
+                stale_hash = bool(if_match_entry_hash) and if_match_entry_hash != str(existing.get("entry_hash") or "")
+                if stale_timestamp or stale_hash:
+                    conflict_payload = {
+                        "entry_id": existing["id"],
+                        "updated_at": existing.get("updated_at"),
+                        "entry_hash": existing.get("entry_hash", ""),
+                        "data": load_json(existing.get("data_json"), {}),
+                    }
+                    audit(conn, user["id"], "sync_conflict", "entry", existing["id"], {"if_match_updated_at": if_match_updated_at, "if_match_entry_hash": if_match_entry_hash}, conflict_payload, study_id=study_id, **self.audit_context())
+                    self.send_json({"error": "Entry was changed on the server. Review conflict before syncing.", "server_entry": conflict_payload}, 409)
+                    return
                 if existing.get("locked_at"):
                     reason = str(payload.get("change_reason", "")).strip()
                     if not reason:
@@ -3625,8 +4483,8 @@ class App(BaseHTTPRequestHandler):
                         return
                 before = existing
                 conn.execute(
-                    "UPDATE entries SET event_id = ?, data_json = ?, status = ?, updated_by = ?, updated_at = ?, locked_at = NULL, locked_by = NULL, lock_reason = '' WHERE id = ?",
-                    (event_id, json.dumps(cleaned), status, user["id"], timestamp, existing["id"]),
+                    "UPDATE entries SET event_id = ?, data_json = ?, status = ?, form_version = ?, schema_snapshot_json = ?, entry_hash = ?, updated_by = ?, updated_at = ?, locked_at = NULL, locked_by = NULL, lock_reason = '' WHERE id = ?",
+                    (event_id, json.dumps(cleaned), status, form_version, snapshot_json, digest, user["id"], timestamp, existing["id"]),
                 )
                 after = row(conn, "SELECT * FROM entries WHERE id = ?", (existing["id"],))
                 audit(conn, user["id"], "update", "entry", existing["id"], before, {"entry": after, "change_reason": payload.get("change_reason", "")})
@@ -3634,8 +4492,8 @@ class App(BaseHTTPRequestHandler):
                 self.send_json({"entry": after})
                 return
             cur = conn.execute(
-                "INSERT INTO entries(study_id, participant_id, form_id, event_id, event_name, repeat_instance, status, data_json, created_by, updated_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (study_id, participant_id, form_id, event_id, event_name, repeat_instance, status, json.dumps(cleaned), user["id"], user["id"], timestamp, timestamp),
+                "INSERT INTO entries(study_id, participant_id, form_id, event_id, event_name, repeat_instance, status, data_json, form_version, schema_snapshot_json, entry_hash, created_by, updated_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (study_id, participant_id, form_id, event_id, event_name, repeat_instance, status, json.dumps(cleaned), form_version, snapshot_json, digest, user["id"], user["id"], timestamp, timestamp),
             )
             after = row(conn, "SELECT * FROM entries WHERE id = ?", (cur.lastrowid,))
             audit(conn, user["id"], "create", "entry", cur.lastrowid, None, after)
@@ -3846,6 +4704,8 @@ class App(BaseHTTPRequestHandler):
             case_item = self.case_payload(conn, case_row)
             status = ai_status()
             mode = "local"
+            findings = detect_phi_findings(str(case_item.get("source_text", "")) + "\n" + question)
+            ai_error = ""
             try:
                 if status["external_ai_enabled"]:
                     response = openai_academic_case_review(conn, study_id, case_item, all_cases, question)
@@ -3853,6 +4713,7 @@ class App(BaseHTTPRequestHandler):
                 else:
                     response = local_academic_case_review(case_item, all_cases, question)
             except Exception as exc:
+                ai_error = str(exc)
                 response = local_academic_case_review(case_item, all_cases, question)
                 response["safety_notes"].append(f"External AI review failed; local fallback used: {exc}")
             file_count = len(case_item.get("files", []))
@@ -3865,7 +4726,42 @@ class App(BaseHTTPRequestHandler):
                 (case_id, study_id, question, mode, json.dumps(response), file_count, user["id"], timestamp),
             )
             review = row(conn, "SELECT id, user_prompt, mode, response_json, file_count, created_by, created_at FROM case_ai_reviews WHERE id = ?", (cur.lastrowid,))
-            audit(conn, user["id"], "academic_ai_review", "case_ai_review", cur.lastrowid, None, {"case_id": case_id, "mode": mode, "file_count": file_count})
+            ai_audit_id = record_ai_audit(
+                conn,
+                user["id"],
+                study_id=study_id,
+                case_id=case_id,
+                purpose="case_publication_review",
+                input_type="mixed" if file_count else "text",
+                mode=mode,
+                file_count=file_count,
+                phi_detected=bool(findings),
+                deidentified=mode == "openai" and not status["phi_allowed"],
+                status_value="fallback" if ai_error else "ok",
+                error=ai_error,
+            )
+            audit(
+                conn,
+                user["id"],
+                "academic_ai_review",
+                "case_ai_review",
+                cur.lastrowid,
+                None,
+                {"case_id": case_id, "mode": mode, "file_count": file_count, "ai_audit_id": ai_audit_id},
+                study_id=study_id,
+                **self.audit_context(),
+            )
+            audit(
+                conn,
+                user["id"],
+                "ai_request",
+                "ai_audit",
+                ai_audit_id,
+                None,
+                {"purpose": "case_publication_review", "case_id": case_id, "mode": mode, "file_count": file_count, "phi_detected": bool(findings)},
+                study_id=study_id,
+                **self.audit_context(),
+            )
             conn.commit()
             review["response"] = load_json(review.pop("response_json"), {})
             self.send_json({"review": review, "ai": status}, 201)
@@ -4079,6 +4975,8 @@ class App(BaseHTTPRequestHandler):
                 """,
                 (study_id,),
             )
+            for membership in memberships:
+                membership["effective_permissions"] = sorted(ROLE_PERMISSIONS.get(safe_role(membership.get("role", "")), set()))
             self.send_json({"memberships": memberships})
             return
         if method == "POST":
@@ -4505,7 +5403,7 @@ class App(BaseHTTPRequestHandler):
         )
         issues = []
         for entry in entries:
-            schema = load_json(entry["schema_json"], {"fields": []})
+            schema = schema_for_entry(entry, load_json(entry["schema_json"], {"fields": []}))
             data = load_json(entry["data_json"], {})
             _, entry_issues = validate_entry_data(schema, data)
             for issue in entry_issues:
@@ -4562,7 +5460,7 @@ class App(BaseHTTPRequestHandler):
         for entry in entries:
             if entry["status"] == "complete":
                 completed += 1
-            schema = load_json(entry["schema_json"], {"fields": []})
+            schema = schema_for_entry(entry, load_json(entry["schema_json"], {"fields": []}))
             data = load_json(entry["data_json"], {})
             for field in schema.get("fields", []):
                 code = field.get("code")
@@ -4616,7 +5514,7 @@ class App(BaseHTTPRequestHandler):
         quality_rows = rows(
             conn,
             f"""
-            SELECT entries.data_json, forms.schema_json
+            SELECT entries.data_json, entries.schema_snapshot_json, forms.schema_json
             FROM entries
             JOIN forms ON forms.id = entries.form_id
             {group_join}
@@ -4625,7 +5523,7 @@ class App(BaseHTTPRequestHandler):
             tuple(params),
         )
         for entry in quality_rows:
-            _, issues = validate_entry_data(load_json(entry["schema_json"], {"fields": []}), load_json(entry["data_json"], {}))
+            _, issues = validate_entry_data(schema_for_entry(entry, load_json(entry["schema_json"], {"fields": []})), load_json(entry["data_json"], {}))
             issue_count += len(issues)
         warnings = []
         if open_queries:
@@ -4661,16 +5559,15 @@ class App(BaseHTTPRequestHandler):
         if query:
             value = (query.get("deidentified") or query.get("deidentified_export") or [""])[0].strip().lower()
             deidentified = deidentified or value in {"1", "true", "yes", "on"}
+        choice_format = ((query or {}).get("choice_format") or ["raw"])[0].strip().lower()
+        if choice_format not in {"raw", "labels", "both"}:
+            choice_format = "raw"
         filename = "clinical_data_deidentified_export.csv" if deidentified else "clinical_data_export.csv"
-        return self.export_entries_csv(conn, study_id, membership, {"deidentified": deidentified}, filename)
+        return self.export_entries_csv(conn, study_id, membership, {"deidentified": deidentified, "choice_format": choice_format}, filename)
 
     def record_payload(self, conn, study_id: int, membership, filters: dict) -> list[dict]:
         deidentified = bool(filters.get("deidentified")) or membership.get("role") == "analyst"
-        forms = rows(conn, "SELECT * FROM forms WHERE study_id = ? ORDER BY id", (study_id,))
-        field_codes = []
-        for form in forms:
-            for field in load_json(form["schema_json"], {"fields": []}).get("fields", []):
-                field_codes.append(f"{form['code']}__{field.get('code')}")
+        choice_format = str(filters.get("choice_format") or "raw")
         where = ["entries.study_id = ?"]
         params: list = [study_id]
         if filters.get("participant_status"):
@@ -4690,7 +5587,7 @@ class App(BaseHTTPRequestHandler):
             params.append(membership["data_group_id"])
         sql = f"""
             SELECT entries.*, participants.study_uid, participants.initials, participants.status AS participant_status,
-                   forms.name AS form_name, forms.code AS form_code,
+                   forms.name AS form_name, forms.code AS form_code, forms.schema_json, forms.version AS current_form_version,
                    study_events.name AS mapped_event_name, study_events.code AS event_code
             FROM entries
             JOIN participants ON participants.id = entries.participant_id
@@ -4703,6 +5600,11 @@ class App(BaseHTTPRequestHandler):
         export_ids: dict[int, str] = {}
         for entry in rows(conn, sql, tuple(params)):
             data = load_json(entry["data_json"], {})
+            snapshot = load_json(entry.get("schema_snapshot_json"), {})
+            schema = schema_for_entry(entry, load_json(entry["schema_json"], {"fields": []}))
+            form_code = snapshot.get("form_code") or entry["form_code"]
+            captured_version = int(entry.get("form_version") or snapshot.get("form_version") or 1)
+            current_version = int(entry.get("current_form_version") or captured_version)
             export_ids.setdefault(entry["participant_id"], f"EXP{len(export_ids) + 1:05d}")
             record = {
                 "study_uid": export_ids[entry["participant_id"]] if deidentified else entry["study_uid"],
@@ -4712,19 +5614,33 @@ class App(BaseHTTPRequestHandler):
                 "event_code": entry.get("event_code") or entry["event_name"],
                 "repeat_instance": entry["repeat_instance"],
                 "form_name": entry["form_name"],
+                "form_version": captured_version,
+                "form_version_warning": "older_form_version" if captured_version < current_version else "",
                 "entry_status": entry["status"],
                 "locked": "yes" if entry["locked_at"] else "no",
             }
-            for code in field_codes:
-                prefix, field_code = code.split("__", 1)
-                value = data.get(field_code, "") if prefix == entry["form_code"] else ""
+            for field in schema.get("fields", []):
+                field_code = field.get("code", "")
+                if not field_code:
+                    continue
+                code = f"{form_code}__{field_code}"
+                value = data.get(field_code, "")
+                if field.get("choices") and choice_format in {"labels", "both"}:
+                    if isinstance(value, list):
+                        labels = [choice_label(field, item) for item in value]
+                    else:
+                        labels = choice_label(field, value) if value not in (None, "") else ""
+                    if choice_format == "labels":
+                        value = "; ".join(labels) if isinstance(labels, list) else labels
+                    else:
+                        record[f"{code}__label"] = "; ".join(labels) if isinstance(labels, list) else labels
                 record[code] = deidentify_for_ai(str(value), record["study_uid"]) if deidentified and isinstance(value, str) else value
             payload.append(record)
         return payload
 
     def export_entries_csv(self, conn, study_id: int, membership, filters: dict, filename: str) -> None:
         records = self.record_payload(conn, study_id, membership, filters)
-        fieldnames = list(records[0].keys()) if records else ["study_uid", "initials", "participant_status", "event_name", "event_code", "repeat_instance", "form_name", "entry_status", "locked"]
+        fieldnames = list(dict.fromkeys(key for record in records for key in record.keys())) if records else ["study_uid", "initials", "participant_status", "event_name", "event_code", "repeat_instance", "form_name", "form_version", "form_version_warning", "entry_status", "locked"]
         text_lines = []
         class Sink:
             def write(self, value):
@@ -4741,21 +5657,24 @@ class App(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
 
-    def export_audit_csv(self, conn, study_id: int) -> None:
+    def export_audit_csv(self, conn, study_id: int, query: dict[str, list[str]] | None = None) -> None:
+        audit_where, audit_params = audit_filters(study_id, query)
         audit_rows = rows(
             conn,
             f"""
             SELECT audit_log.id, audit_log.created_at, users.username, users.display_name,
-                   audit_log.action, audit_log.entity_type, audit_log.entity_id, audit_log.before_json, audit_log.after_json
+                   audit_log.action, audit_log.entity_type, audit_log.entity_id,
+                   audit_log.study_id, audit_log.ip_address, audit_log.user_agent, audit_log.request_id,
+                   audit_log.before_json, audit_log.after_json
             FROM audit_log
             LEFT JOIN users ON users.id = audit_log.user_id
-            WHERE {STUDY_AUDIT_FILTER}
+            WHERE {audit_where}
             ORDER BY audit_log.id DESC
             LIMIT 5000
             """,
-            study_audit_params(study_id),
+            audit_params,
         )
-        fieldnames = ["id", "created_at", "username", "display_name", "action", "entity_type", "entity_id", "before_json", "after_json"]
+        fieldnames = ["id", "created_at", "username", "display_name", "action", "entity_type", "entity_id", "study_id", "ip_address", "user_agent", "request_id", "before_json", "after_json"]
         text_lines = []
         class Sink:
             def write(self, value):
@@ -4823,24 +5742,56 @@ class App(BaseHTTPRequestHandler):
             item["metadata"] = load_json(item.pop("metadata_json"), {})
         return data
 
+    def academic_output_rows(self, conn, study_id: int) -> list[dict]:
+        data = rows(
+            conn,
+            """
+            SELECT academic_outputs.*, case_intakes.case_uid AS linked_case_uid, case_intakes.title AS linked_case_title, users.display_name AS updated_by_name
+            FROM academic_outputs
+            LEFT JOIN case_intakes ON case_intakes.id = academic_outputs.linked_case_id
+            LEFT JOIN users ON users.id = academic_outputs.updated_by
+            WHERE academic_outputs.study_id = ? AND academic_outputs.active = 1
+            ORDER BY academic_outputs.updated_at DESC, academic_outputs.id DESC
+            """,
+            (study_id,),
+        )
+        for item in data:
+            item["participant_ids"] = load_json(item.pop("participant_ids_json"), [])
+            item["evidence_file_ids"] = load_json(item.pop("evidence_file_ids_json"), [])
+            item["metadata"] = load_json(item.pop("metadata_json"), {})
+        return data
+
     def academic_payload(self, conn, study_id: int, membership: dict | None = None, user: dict | None = None) -> dict:
         study = row(conn, "SELECT * FROM studies WHERE id = ?", (study_id,))
         cases = self.case_rows(conn, study_id, membership, user)
         cv_items = self.academic_cv_rows(conn, study_id)
+        outputs = self.academic_output_rows(conn, study_id)
         opportunities = publication_opportunities(cases)
         ai_review_count = row(conn, "SELECT COUNT(*) AS count FROM case_ai_reviews WHERE study_id = ?", (study_id,))["count"]
         report_count = row(conn, "SELECT COUNT(*) AS count FROM reports WHERE study_id = ?", (study_id,))["count"]
+        ai_audit = self.ai_audit_rows(conn, study_id) if membership and (membership_has(membership, "manage_study") or membership_has(membership, "review_data")) else []
         return {
             "metrics": {
                 "case_count": len(cases),
                 "opportunity_count": len(opportunities),
                 "cv_item_count": len(cv_items),
+                "output_count": len(outputs),
                 "ai_review_count": ai_review_count,
                 "report_count": report_count,
             },
             "opportunities": opportunities,
             "cv_items": cv_items,
-            "cv_markdown": academic_cv_markdown(study, cv_items, opportunities),
+            "outputs": outputs,
+            "output_types": sorted(ACADEMIC_OUTPUT_TYPES),
+            "ai_audit": ai_audit,
+            "prompt_templates": [
+                {"purpose": "case_summary", "label": "Case note to structured summary"},
+                {"purpose": "missing_fields", "label": "Dataset missing field check"},
+                {"purpose": "inconsistency_detection", "label": "Dataset inconsistency check"},
+                {"purpose": "publication_idea", "label": "Case set publication ideas"},
+                {"purpose": "cv_item", "label": "Academic activity to CV item"},
+            ],
+            "cv_markdown": academic_cv_markdown(study, cv_items, opportunities, outputs),
             "ai": ai_status(),
             "guidance": [
                 "Use Case Intake for messy notes, photos, audio, PDFs, and scanned case details.",
@@ -4883,6 +5834,108 @@ class App(BaseHTTPRequestHandler):
             self.send_header("content-length", str(len(content)))
             self.end_headers()
             self.wfile.write(content)
+            return
+        if method == "POST" and len(parts) == 5 and parts[4] == "outputs":
+            payload = self.body()
+            timestamp = now()
+            title = str(payload.get("title", "")).strip()
+            if not title:
+                self.send_error_json("Academic output title is required", 400)
+                return
+            output_type = normalize_code(str(payload.get("output_type", "publication_idea"))) or "publication_idea"
+            if output_type not in ACADEMIC_OUTPUT_TYPES:
+                self.send_error_json("Unsupported academic output type", 400)
+                return
+            linked_case_id = int(payload.get("linked_case_id") or 0) or None
+            if linked_case_id and not row(conn, "SELECT id FROM case_intakes WHERE id = ? AND study_id = ?", (linked_case_id, study_id)):
+                self.send_error_json("Linked case not found", 404)
+                return
+            participant_ids = [int(value) for value in payload.get("participant_ids", []) if str(value).strip().isdigit()]
+            evidence_file_ids = [int(value) for value in payload.get("evidence_file_ids", []) if str(value).strip().isdigit()]
+            if participant_ids:
+                found = row(conn, f"SELECT COUNT(*) AS count FROM participants WHERE study_id = ? AND id IN ({','.join('?' for _ in participant_ids)})", tuple([study_id, *participant_ids]))["count"]
+                if found != len(set(participant_ids)):
+                    self.send_error_json("One or more linked participants were not found", 404)
+                    return
+            if evidence_file_ids:
+                found = row(conn, f"SELECT COUNT(*) AS count FROM case_files WHERE study_id = ? AND id IN ({','.join('?' for _ in evidence_file_ids)})", tuple([study_id, *evidence_file_ids]))["count"]
+                if found != len(set(evidence_file_ids)):
+                    self.send_error_json("One or more linked evidence files were not found", 404)
+                    return
+            cur = conn.execute(
+                """
+                INSERT INTO academic_outputs(
+                    study_id, output_type, title, status, linked_case_id, participant_ids_json,
+                    evidence_file_ids_json, dataset_ref, notes, metadata_json, active, created_by, updated_by, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                """,
+                (
+                    study_id,
+                    output_type,
+                    title,
+                    normalize_code(str(payload.get("status", "idea")))[:40] or "idea",
+                    linked_case_id,
+                    json.dumps(sorted(set(participant_ids))),
+                    json.dumps(sorted(set(evidence_file_ids))),
+                    str(payload.get("dataset_ref", "")).strip()[:240],
+                    str(payload.get("notes", "")).strip(),
+                    json.dumps(payload.get("metadata", {})),
+                    user["id"],
+                    user["id"],
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            after = row(conn, "SELECT * FROM academic_outputs WHERE id = ?", (cur.lastrowid,))
+            audit(conn, user["id"], "create", "academic_output", cur.lastrowid, None, after, study_id=study_id, **self.audit_context())
+            conn.commit()
+            output = self.academic_output_rows(conn, study_id)[0]
+            self.send_json({"output": output}, 201)
+            return
+        if method == "PATCH" and len(parts) == 6 and parts[4] == "outputs":
+            output_id = int(parts[5])
+            before = row(conn, "SELECT * FROM academic_outputs WHERE id = ? AND study_id = ?", (output_id, study_id))
+            if not before:
+                self.send_error_json("Academic output not found", 404)
+                return
+            payload = self.body()
+            output_type = normalize_code(str(payload.get("output_type", before["output_type"]))) or before["output_type"]
+            if output_type not in ACADEMIC_OUTPUT_TYPES:
+                self.send_error_json("Unsupported academic output type", 400)
+                return
+            linked_case_id = payload.get("linked_case_id", before.get("linked_case_id"))
+            linked_case_id = int(linked_case_id or 0) or None
+            if linked_case_id and not row(conn, "SELECT id FROM case_intakes WHERE id = ? AND study_id = ?", (linked_case_id, study_id)):
+                self.send_error_json("Linked case not found", 404)
+                return
+            timestamp = now()
+            conn.execute(
+                """
+                UPDATE academic_outputs
+                SET output_type = ?, title = ?, status = ?, linked_case_id = ?, dataset_ref = ?, notes = ?, metadata_json = ?, active = ?, updated_by = ?, updated_at = ?
+                WHERE id = ? AND study_id = ?
+                """,
+                (
+                    output_type,
+                    str(payload.get("title", before["title"])).strip() or before["title"],
+                    normalize_code(str(payload.get("status", before["status"])))[:40] or before["status"],
+                    linked_case_id,
+                    str(payload.get("dataset_ref", before["dataset_ref"])).strip()[:240],
+                    str(payload.get("notes", before["notes"])).strip(),
+                    json.dumps(payload.get("metadata", load_json(before["metadata_json"], {}))),
+                    1 if payload.get("active", bool(before["active"])) else 0,
+                    user["id"],
+                    timestamp,
+                    output_id,
+                    study_id,
+                ),
+            )
+            after = row(conn, "SELECT * FROM academic_outputs WHERE id = ?", (output_id,))
+            audit(conn, user["id"], "update", "academic_output", output_id, before, after, study_id=study_id, **self.audit_context())
+            conn.commit()
+            output = next((item for item in self.academic_output_rows(conn, study_id) if item["id"] == output_id), after)
+            self.send_json({"output": output})
             return
         if method == "POST" and len(parts) == 5 and parts[4] == "cv-items":
             payload = self.body()
@@ -5077,14 +6130,20 @@ class App(BaseHTTPRequestHandler):
         events_by_form: dict[int, list[str]] = {}
         for item in form_event_rows:
             events_by_form.setdefault(item["form_id"], []).append(item["event_code"])
-        output = [["instrument_name", "instrument_label", "events", "field_order", "field_name", "field_label", "field_type", "required", "choices", "validation_min", "validation_max", "branching_logic", "calculation", "repeatable"]]
+        output = [[
+            "instrument_name", "instrument_label", "events", "field_order", "field_name", "field_label",
+            "field_type", "required", "choices", "validation_min", "validation_max", "validation_type",
+            "regex", "units", "field_note", "branching_logic", "calculation", "phi", "identifier", "repeatable",
+        ]]
         for form in forms:
             schema = load_json(form["schema_json"], {"fields": []})
             for order, field in enumerate(schema.get("fields", []), start=1):
-                choices = " | ".join(field.get("options", []))
+                choices = " | ".join(f"{choice['value']}, {choice['label']}" for choice in normalize_choices(field.get("choices") or field.get("options") or []))
                 branching = ""
                 if field.get("show_if"):
                     branching = f"[{field['show_if']['field']}] = '{field['show_if']['equals']}'"
+                if field.get("branching_logic"):
+                    branching = field["branching_logic"]
                 output.append(
                     [
                         form["code"],
@@ -5098,8 +6157,14 @@ class App(BaseHTTPRequestHandler):
                         choices,
                         field.get("min", ""),
                         field.get("max", ""),
+                        field.get("validation_type", ""),
+                        field.get("regex", ""),
+                        field.get("units", ""),
+                        field.get("field_note") or field.get("help_text", ""),
                         branching,
                         field.get("calculation", ""),
+                        "yes" if field.get("phi") else "no",
+                        "yes" if field.get("identifier") else "no",
                         "yes" if schema.get("repeatable") else "no",
                     ]
                 )
@@ -5197,6 +6262,19 @@ def handle_cli(argv: list[str]) -> bool:
         backup = create_database_backup(SETTINGS.backup_passphrase)
         print(json.dumps({"backup": backup}, indent=2))
         return True
+    if command == "backup-full":
+        backup = create_full_backup(SETTINGS.backup_passphrase)
+        print(json.dumps({"backup": backup}, indent=2))
+        return True
+    if command in {"verify-backup", "restore-full-dry-run"}:
+        if len(argv) < 3:
+            raise SystemExit(f"Usage: python server.py {command} <full_backup_file_or_name>")
+        backup_path = Path(argv[2])
+        if not backup_path.is_absolute():
+            backup_path = BACKUPS / backup_path.name
+        verification = verify_full_backup(backup_path, SETTINGS.backup_passphrase, record=command == "verify-backup")
+        print(json.dumps({"verification": verification, "dry_run": True}, indent=2))
+        raise SystemExit(0 if verification["ok"] else 1)
     if command == "restore":
         if len(argv) < 3:
             raise SystemExit("Usage: python server.py restore <backup_file>")

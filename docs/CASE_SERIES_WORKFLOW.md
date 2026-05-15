@@ -37,6 +37,6 @@ References:
 ## Privacy Rules
 
 - Do not paste names, hospital numbers, phone numbers, addresses, or full dates of birth into external AI.
-- Keep original evidence inside the local study database and encrypted backups.
+- Keep original evidence in the configured uploads folder and include it in encrypted full backups.
 - Publish only de-identified summaries.
 - Keep consent/ethics decisions outside the app in your study records.

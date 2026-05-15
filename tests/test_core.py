@@ -1,10 +1,14 @@
+import json
 import tempfile
 import unittest
+import zipfile
 from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
 import config
+import authz
 import server
 
 
@@ -32,6 +36,38 @@ class CoreEdcTests(unittest.TestCase):
         cleaned, issues = server.validate_entry_data(schema, {"weight": "50"})
         self.assertEqual(issues, [])
         self.assertEqual(cleaned["double_weight"], 100)
+
+    def test_redcap_style_choices_metadata_and_branching(self):
+        schema = server.normalize_schema(
+            {
+                "fields": [
+                    {"code": "age", "label": "Age", "type": "integer", "min": 0, "max": 120, "units": "years"},
+                    {"code": "sex", "label": "Sex", "type": "radio", "choices": "1, Male | 2, Female | 3, Other"},
+                    {"code": "pregnant", "label": "Pregnant", "type": "yesno", "branching_logic": "age >= 18 AND sex == 2"},
+                    {"code": "note", "label": "Note", "type": "descriptive", "help_text": "Shown only as text"},
+                ]
+            }
+        )
+        self.assertEqual(schema["fields"][1]["choices"][1], {"value": "2", "label": "Female"})
+        self.assertEqual(schema["fields"][2]["options"], ["1", "0"])
+        cleaned, issues = server.validate_entry_data(schema, {"age": "21", "sex": "2", "pregnant": "1"})
+        self.assertEqual(issues, [])
+        self.assertEqual(cleaned["age"], 21)
+        self.assertEqual(cleaned["sex"], "2")
+        self.assertEqual(cleaned["pregnant"], "1")
+        cleaned_hidden, issues = server.validate_entry_data(schema, {"age": "12", "sex": "2", "pregnant": "1"})
+        self.assertEqual(issues, [])
+        self.assertNotIn("pregnant", cleaned_hidden)
+        self.assertEqual(server.choice_label(schema["fields"][1], "2"), "Female")
+
+    def test_authz_denies_unknown_roles_and_actions(self):
+        user = {"id": 10, "role": "data_entry"}
+        membership = {"role": "data_entry", "data_group_id": 1}
+        self.assertTrue(authz.can(user, "entries.create", membership, {"data_group_id": 1}))
+        self.assertFalse(authz.can(user, "export.read", membership))
+        self.assertFalse(authz.can({"id": 11, "role": "unknown"}, "entries.create", {"role": "unknown"}))
+        self.assertFalse(authz.can(user, "unknown.action", membership))
+        self.assertFalse(authz.can(user, "entries.create", membership, {"data_group_id": 2}))
 
     def test_local_crf_assistant_detects_types_and_choices(self):
         schema, warnings = server.draft_crf_schema_locally("Age\nVisit date\nSex (Female, Male, Unknown)\nAny adverse event?")
@@ -183,6 +219,69 @@ class CoreEdcTests(unittest.TestCase):
         self.assertEqual(status["provider"], "local")
         self.assertFalse(status["external_ai_enabled"])
         self.assertFalse(status["multimodal_enabled"])
+
+    def test_full_backup_includes_database_uploads_and_verifies(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            original_data = server.DATA
+            original_backups = server.BACKUPS
+            original_uploads = server.UPLOADS
+            original_db = server.DB_PATH
+            original_backend = server.DATABASE_BACKEND
+            try:
+                root = Path(tmp)
+                server.DATA = root / "data"
+                server.BACKUPS = root / "backups"
+                server.UPLOADS = root / "uploads"
+                server.DB_PATH = server.DATA / "test.sqlite3"
+                server.DATABASE_BACKEND = "sqlite"
+                server.migrate()
+                upload_file = server.UPLOADS / "studies" / "1" / "cases" / "1" / "note.txt"
+                upload_file.parent.mkdir(parents=True, exist_ok=True)
+                upload_file.write_text("case evidence", encoding="utf-8")
+
+                backup = server.create_full_backup("LongLocalPassphrase123")
+                self.assertTrue(backup["name"].endswith(".full.cdsenc"))
+                verification = server.verify_full_backup(server.BACKUPS / backup["name"], "LongLocalPassphrase123", record=True)
+
+                self.assertTrue(verification["ok"], verification["errors"])
+                self.assertIn("manifest.json", verification["contents"])
+                self.assertIn("SHA256SUMS.txt", verification["contents"])
+                self.assertIn("uploads.zip", verification["contents"])
+                self.assertTrue(verification["database_dump"])
+                self.assertEqual(verification["upload_file_count"], 1)
+                self.assertTrue(server.latest_full_backup_info()["verified"])
+                health = server.health_payload()
+                self.assertTrue(health["backup"]["latest_full_backup_verified"])
+                self.assertEqual(health["backup"]["uploads"]["file_count"], 1)
+            finally:
+                server.DATA = original_data
+                server.BACKUPS = original_backups
+                server.UPLOADS = original_uploads
+                server.DB_PATH = original_db
+                server.DATABASE_BACKEND = original_backend
+
+    def test_full_backup_verification_fails_without_upload_archive(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            original_backups = server.BACKUPS
+            try:
+                server.BACKUPS = Path(tmp)
+                server.BACKUPS.mkdir(parents=True, exist_ok=True)
+                payload = BytesIO()
+                with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive:
+                    archive.writestr("postgres.dump", b"dump")
+                    archive.writestr("manifest.json", json.dumps({"backup_type": "full", "database_dump": "postgres.dump", "uploads_archive": "uploads.zip"}))
+                    archive.writestr("SHA256SUMS.txt", f"{server.sha256_bytes(b'dump')}  postgres.dump\n")
+                broken = server.BACKUPS / "full_broken.full.cdsenc"
+                broken.write_bytes(server.encrypted_archive_bytes(payload.getvalue(), "LongLocalPassphrase123"))
+                verification = server.verify_full_backup(broken, "LongLocalPassphrase123")
+                self.assertFalse(verification["ok"])
+                self.assertTrue(any("Uploads archive" in item or "uploads.zip" in item for item in verification["errors"]))
+            finally:
+                server.BACKUPS = original_backups
+
+    def test_env_example_quotes_display_name_with_spaces(self):
+        env_text = (server.ROOT / ".env.example").read_text(encoding="utf-8")
+        self.assertIn('CDS_ADMIN_DISPLAY_NAME="Study Administrator"', env_text)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,11 @@
+import csv
 import json
 import tempfile
 import threading
 import unittest
 from contextlib import closing
 from http.server import ThreadingHTTPServer
+from io import StringIO
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urlencode
@@ -53,17 +55,37 @@ class ApiSmokeTests(unittest.TestCase):
         with urlopen(request, timeout=10) as response:
             return json.loads(response.read().decode("utf-8"))
 
-    def request_raw(self, path, method="GET", payload=None, token=None, content_type="application/json"):
+    def request_raw(self, path, method="GET", payload=None, token=None, content_type="application/json", headers=None):
         if isinstance(payload, dict) and content_type == "application/x-www-form-urlencoded":
             body = urlencode(payload).encode("utf-8")
         else:
             body = None if payload is None else json.dumps(payload).encode("utf-8")
-        headers = {"Content-Type": content_type}
+        headers = {"Content-Type": content_type, **(headers or {})}
         if token:
             headers["Authorization"] = f"Bearer {token}"
         request = Request(f"{self.base_url}{path}", data=body, headers=headers, method=method)
         with urlopen(request, timeout=10) as response:
             return response.status, response.headers.get("content-type", ""), response.read()
+
+    def request_with_headers(self, path, method="GET", payload=None, headers=None, content_type="application/json"):
+        body = None if payload is None else json.dumps(payload).encode("utf-8")
+        request_headers = {"Content-Type": content_type, **(headers or {})}
+        request = Request(f"{self.base_url}{path}", data=body, headers=request_headers, method=method)
+        with urlopen(request, timeout=10) as response:
+            return response.status, response.headers, response.read()
+
+    def login_cookie(self, extra_headers=None):
+        status, headers, body = self.request_with_headers(
+            "/api/login",
+            "POST",
+            {"username": "admin", "password": "admin123"},
+            headers=extra_headers,
+        )
+        self.assertEqual(status, 200)
+        payload = json.loads(body.decode("utf-8"))
+        cookie = headers.get("Set-Cookie")
+        self.assertIsNotNone(cookie)
+        return payload, cookie
 
     def response_headers(self, path):
         request = Request(f"{self.base_url}{path}")
@@ -127,6 +149,17 @@ class ApiSmokeTests(unittest.TestCase):
         backup = self.request_json("/api/admin/backup", "POST", {"passphrase": "LongLocalPassphrase123"}, token)["backup"]
         self.assertTrue(backup["encrypted"])
         self.assertTrue(backup["name"].startswith("system_"))
+        full_backup = self.request_json("/api/admin/backup/full", "POST", {"passphrase": "LongLocalPassphrase123"}, token)["backup"]
+        self.assertEqual(full_backup["backup_type"], "full")
+        verified = self.request_json("/api/admin/backups/verify", "POST", {"filename": full_backup["name"], "passphrase": "LongLocalPassphrase123"}, token)["verification"]
+        self.assertTrue(verified["ok"], verified["errors"])
+        backups = self.request_json("/api/admin/backups", token=token)
+        self.assertTrue(backups["summary"]["latest_full_backup_verified"])
+        self.assertTrue(any(item["name"] == full_backup["name"] for item in backups["backups"]))
+        status, content_type, body = self.request_raw(f"/api/admin/backups/{full_backup['name']}", token=token)
+        self.assertEqual(status, 200)
+        self.assertIn("application/octet-stream", content_type)
+        self.assertGreater(len(body), 100)
 
     def test_short_archive_passphrase_is_rejected(self):
         token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]
@@ -206,6 +239,66 @@ class ApiSmokeTests(unittest.TestCase):
             remaining = server.row(conn, "SELECT token FROM sessions WHERE token = ?", (server.session_token_digest(token),))
         self.assertIsNone(remaining)
 
+    def test_browser_session_cookie_and_csrf_flow(self):
+        login, cookie = self.login_cookie()
+        self.assertEqual(login["session"], "cookie")
+        self.assertIn("cds_session=", cookie)
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("SameSite=Lax", cookie)
+        self.assertIn("Path=/", cookie)
+        self.assertIn("Max-Age=", cookie)
+        with closing(server.db()) as conn:
+            stored_tokens = [item["token"] for item in server.rows(conn, "SELECT token FROM sessions")]
+        self.assertNotIn(login["token"], stored_tokens)
+
+        me_status, _, me_body = self.request_with_headers("/api/me", headers={"Cookie": cookie})
+        self.assertEqual(me_status, 200)
+        self.assertEqual(json.loads(me_body.decode("utf-8"))["user"]["username"], "admin")
+
+        with self.assertRaises(HTTPError) as missing_csrf:
+            self.request_with_headers(
+                "/api/studies",
+                "POST",
+                {"name": "Blocked Cookie Study", "protocol_id": "CSRF-BLOCK"},
+                headers={"Cookie": cookie},
+            )
+        self.assertEqual(missing_csrf.exception.code, 403)
+        self.assertIn("CSRF token required", missing_csrf.exception.read().decode("utf-8"))
+        missing_csrf.exception.close()
+
+        csrf_status, _, csrf_body = self.request_with_headers("/api/csrf", headers={"Cookie": cookie})
+        self.assertEqual(csrf_status, 200)
+        csrf = json.loads(csrf_body.decode("utf-8"))["csrf_token"]
+        created_status, _, created_body = self.request_with_headers(
+            "/api/studies",
+            "POST",
+            {"name": "Cookie CSRF Study", "protocol_id": "CSRF-OK"},
+            headers={"Cookie": cookie, "X-CSRF-Token": csrf, "Origin": self.base_url},
+        )
+        self.assertEqual(created_status, 201)
+        self.assertEqual(json.loads(created_body.decode("utf-8"))["study"]["protocol_id"], "CSRF-OK")
+
+        with self.assertRaises(HTTPError) as bad_origin:
+            self.request_with_headers(
+                "/api/studies",
+                "POST",
+                {"name": "Bad Origin", "protocol_id": "CSRF-BAD"},
+                headers={"Cookie": cookie, "X-CSRF-Token": csrf, "Origin": "https://attacker.example"},
+            )
+        self.assertEqual(bad_origin.exception.code, 403)
+        bad_origin.exception.close()
+
+        logout_status, logout_headers, logout_body = self.request_with_headers("/api/logout", "POST", {}, headers={"Cookie": cookie})
+        self.assertEqual(logout_status, 200)
+        self.assertTrue(json.loads(logout_body.decode("utf-8"))["ok"])
+        cleared_cookie = logout_headers.get("Set-Cookie")
+        self.assertIn("cds_session=", cleared_cookie)
+        self.assertIn("Max-Age=0", cleared_cookie)
+
+    def test_secure_cookie_is_used_behind_https_proxy(self):
+        _, cookie = self.login_cookie({"X-Forwarded-Proto": "https"})
+        self.assertIn("Secure", cookie)
+
     def test_security_headers_are_present(self):
         headers = self.response_headers("/api/health")
         self.assertIn("default-src 'self'", headers.get("Content-Security-Policy"))
@@ -228,6 +321,168 @@ class ApiSmokeTests(unittest.TestCase):
         entry = next(item for item in entries if item["study_uid"] == "P900")
         history = self.request_json(f"/api/studies/{study_id}/entries/{entry['id']}/history", token=token)
         self.assertTrue(history["history"])
+
+    def test_entry_schema_snapshot_survives_crf_version_change_and_export(self):
+        token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]
+        study_id = self.request_json("/api/studies", token=token)["studies"][0]["id"]
+        form = self.request_json(
+            f"/api/studies/{study_id}/forms",
+            "POST",
+            {
+                "name": "Versioned CRF",
+                "code": "versioned_crf",
+                "schema": {"fields": [{"code": "old_field", "label": "Old Field", "type": "text", "required": True}]},
+            },
+            token,
+        )["form"]
+        participant_one = self.request_json(
+            f"/api/studies/{study_id}/participants",
+            "POST",
+            {"study_uid": "VERS001", "initials": "V1", "status": "enrolled"},
+            token,
+        )["participant"]
+        old_entry = self.request_json(
+            f"/api/studies/{study_id}/entries",
+            "POST",
+            {"participant_id": participant_one["id"], "form_id": form["id"], "status": "complete", "data": {"old_field": "kept value"}},
+            token,
+        )["entry"]
+        self.assertEqual(old_entry["form_version"], 1)
+        with closing(server.db()) as conn:
+            stored_old = server.row(conn, "SELECT form_version, schema_snapshot_json, entry_hash FROM entries WHERE id = ?", (old_entry["id"],))
+        self.assertEqual(stored_old["form_version"], 1)
+        self.assertIn("old_field", stored_old["schema_snapshot_json"])
+        self.assertTrue(stored_old["entry_hash"])
+
+        self.request_json(
+            f"/api/studies/{study_id}/forms/{form['id']}",
+            "PATCH",
+            {
+                "name": "Versioned CRF",
+                "code": "versioned_crf",
+                "schema": {"fields": [{"code": "new_field", "label": "New Field", "type": "text", "required": False}]},
+            },
+            token,
+        )
+        participant_two = self.request_json(
+            f"/api/studies/{study_id}/participants",
+            "POST",
+            {"study_uid": "VERS002", "initials": "V2", "status": "enrolled"},
+            token,
+        )["participant"]
+        new_entry = self.request_json(
+            f"/api/studies/{study_id}/entries",
+            "POST",
+            {"participant_id": participant_two["id"], "form_id": form["id"], "status": "complete", "data": {"new_field": "new value"}},
+            token,
+        )["entry"]
+        self.assertEqual(new_entry["form_version"], 2)
+
+        entries = self.request_json(f"/api/studies/{study_id}/entries", token=token)["entries"]
+        rendered_old = next(item for item in entries if item["id"] == old_entry["id"])
+        rendered_new = next(item for item in entries if item["id"] == new_entry["id"])
+        self.assertEqual(rendered_old["schema_snapshot"]["fields"][0]["code"], "old_field")
+        self.assertEqual(rendered_new["schema_snapshot"]["fields"][0]["code"], "new_field")
+
+        versions = self.request_json(f"/api/studies/{study_id}/forms/{form['id']}/versions", token=token)["versions"]
+        self.assertTrue(any("old_field" in item["diff_to_current"]["fields_removed"] for item in versions if not item.get("current")))
+        _, csv_type, csv_body = self.request_raw(f"/api/studies/{study_id}/export", token=token)
+        csv_text = csv_body.decode("utf-8-sig")
+        self.assertIn("text/csv", csv_type)
+        self.assertIn("versioned_crf__old_field", csv_text)
+        self.assertIn("versioned_crf__new_field", csv_text)
+        self.assertIn("kept value", csv_text)
+        self.assertIn("older_form_version", csv_text)
+
+    def test_data_dictionary_coded_choices_round_trip_and_label_export(self):
+        token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]
+        study_id = self.request_json("/api/studies", token=token)["studies"][0]["id"]
+        dictionary_buffer = StringIO()
+        headers = [
+            "instrument_name", "instrument_label", "field_order", "field_name", "field_label", "field_type",
+            "required", "choices", "validation_min", "validation_max", "validation_type", "regex",
+            "units", "field_note", "branching_logic", "calculation", "phi", "identifier", "repeatable",
+        ]
+        writer = csv.DictWriter(dictionary_buffer, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(
+            [
+                {"instrument_name": "coded_demo", "instrument_label": "Coded Demo", "field_order": 1, "field_name": "age", "field_label": "Age", "field_type": "integer", "required": "yes", "validation_min": 0, "validation_max": 120, "units": "years", "field_note": "Age at entry", "repeatable": "no"},
+                {"instrument_name": "coded_demo", "instrument_label": "Coded Demo", "field_order": 2, "field_name": "sex", "field_label": "Sex", "field_type": "radio", "required": "yes", "choices": "1, Male | 2, Female | 3, Other", "phi": "yes", "identifier": "yes", "repeatable": "no"},
+                {"instrument_name": "coded_demo", "instrument_label": "Coded Demo", "field_order": 3, "field_name": "pregnant", "field_label": "Pregnant", "field_type": "yesno", "required": "no", "branching_logic": "age >= 18 AND sex == 2", "repeatable": "no"},
+            ]
+        )
+        dictionary = dictionary_buffer.getvalue()
+        imported = self.request_json(f"/api/studies/{study_id}/dictionary", "POST", {"csv": dictionary}, token)["imported"]
+        form_id = imported[0]["form_id"]
+        form = next(item for item in self.request_json(f"/api/studies/{study_id}/forms", token=token)["forms"] if item["id"] == form_id)
+        sex_field = next(field for field in form["schema"]["fields"] if field["code"] == "sex")
+        self.assertEqual(sex_field["choices"][1], {"value": "2", "label": "Female"})
+        participant = self.request_json(
+            f"/api/studies/{study_id}/participants",
+            "POST",
+            {"study_uid": "CHOICE001", "initials": "CH", "status": "enrolled"},
+            token,
+        )["participant"]
+        self.request_json(
+            f"/api/studies/{study_id}/entries",
+            "POST",
+            {"participant_id": participant["id"], "form_id": form_id, "status": "complete", "data": {"age": "24", "sex": "2", "pregnant": "1"}},
+            token,
+        )
+        _, raw_type, raw_body = self.request_raw(f"/api/studies/{study_id}/export", token=token)
+        self.assertIn("text/csv", raw_type)
+        self.assertIn("coded_demo__sex", raw_body.decode("utf-8-sig"))
+        _, label_type, label_body = self.request_raw(f"/api/studies/{study_id}/export?choice_format=labels", token=token)
+        self.assertIn("text/csv", label_type)
+        self.assertIn("Female", label_body.decode("utf-8-sig"))
+        _, codebook_type, codebook_body = self.request_raw(f"/api/studies/{study_id}/codebook", token=token)
+        self.assertIn("text/csv", codebook_type)
+        self.assertIn("1, Male | 2, Female", codebook_body.decode("utf-8-sig"))
+
+    def test_stale_offline_entry_save_returns_conflict_and_audit(self):
+        token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]
+        study_id = self.request_json("/api/studies", token=token)["studies"][0]["id"]
+        form_id = self.request_json(f"/api/studies/{study_id}/forms", token=token)["forms"][0]["id"]
+        participant = self.request_json(
+            f"/api/studies/{study_id}/participants",
+            "POST",
+            {"study_uid": "OFFLINE001", "initials": "OF", "status": "enrolled"},
+            token,
+        )["participant"]
+        created = self.request_json(
+            f"/api/studies/{study_id}/entries",
+            "POST",
+            {"participant_id": participant["id"], "form_id": form_id, "status": "draft", "data": {"age": "40", "sex": "Male", "consent_date": "2026-05-10", "diagnosis": "Initial"}},
+            token,
+        )["entry"]
+        self.request_json(
+            f"/api/studies/{study_id}/entries",
+            "POST",
+            {"participant_id": participant["id"], "form_id": form_id, "status": "draft", "data": {"age": "41", "sex": "Male", "consent_date": "2026-05-10", "diagnosis": "Server change"}},
+            token,
+        )
+        with self.assertRaises(HTTPError) as conflict:
+            self.request_json(
+                f"/api/studies/{study_id}/entries",
+                "POST",
+                {
+                    "participant_id": participant["id"],
+                    "form_id": form_id,
+                    "status": "draft",
+                    "if_match_updated_at": created["updated_at"],
+                    "if_match_entry_hash": created["entry_hash"],
+                    "data": {"age": "42", "sex": "Male", "consent_date": "2026-05-10", "diagnosis": "Offline stale"},
+                },
+                token,
+            )
+        self.assertEqual(conflict.exception.code, 409)
+        body = json.loads(conflict.exception.read().decode("utf-8"))
+        self.assertIn("server_entry", body)
+        self.assertEqual(body["server_entry"]["data"]["diagnosis"], "Server change")
+        conflict.exception.close()
+        audit_rows = self.request_json(f"/api/studies/{study_id}/audit", token=token)["audit"]
+        self.assertTrue(any(item["action"] == "sync_conflict" for item in audit_rows))
 
     def test_case_intake_groups_unstructured_cases_and_exports(self):
         token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]
@@ -278,6 +533,20 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertEqual(academic["metrics"]["case_count"], 1)
         self.assertTrue(academic["opportunities"])
         self.assertIn("cv_markdown", academic)
+        output = self.request_json(
+            f"/api/studies/{study_id}/academic/outputs",
+            "POST",
+            {
+                "output_type": "abstract_draft",
+                "title": "Influenza pneumonia retrospective abstract",
+                "status": "drafting",
+                "linked_case_id": created["id"],
+                "dataset_ref": "case_intake_export",
+                "notes": "Novelty requires manual literature review.",
+            },
+            token,
+        )["output"]
+        self.assertEqual(output["output_type"], "abstract_draft")
         cv_item = self.request_json(
             f"/api/studies/{study_id}/academic/cv-items",
             "POST",
@@ -294,9 +563,88 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertEqual(cv_item["title"], "Influenza pneumonia case report")
         updated_academic = self.request_json(f"/api/studies/{study_id}/academic", token=token)["academic"]
         self.assertEqual(updated_academic["metrics"]["cv_item_count"], 1)
+        self.assertEqual(updated_academic["metrics"]["output_count"], 1)
+        self.assertIn("abstract_draft", {item["output_type"] for item in updated_academic["outputs"]})
         _, md_type, md_body = self.request_raw(f"/api/studies/{study_id}/academic/export?format=md", token=token)
         self.assertIn("text/markdown", md_type)
         self.assertIn(b"Influenza pneumonia case report", md_body)
+        self.assertIn(b"Influenza pneumonia retrospective abstract", md_body)
+
+    def test_ai_safety_workbench_audit_and_permissions(self):
+        token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]
+        study_id = self.request_json("/api/studies", token=token)["studies"][0]["id"]
+        preview = self.request_json(
+            f"/api/studies/{study_id}/ai/safety-preview",
+            "POST",
+            {"text": "Patient name: John Doe\nPhone: 9999999999\nDiagnosis: influenza pneumonia"},
+            token,
+        )
+        self.assertIn("patient_name_label", preview["preview"]["findings"])
+        self.assertIn("[phone removed]", preview["preview"]["deidentified_text"])
+        workbench = self.request_json(
+            f"/api/studies/{study_id}/ai/workbench",
+            "POST",
+            {"purpose": "cv_item", "text": "Presented an influenza case report abstract at local conference"},
+            token,
+        )
+        self.assertEqual(workbench["result"]["purpose"], "cv_item")
+        self.assertIn("suggested_item", workbench["result"])
+        ai_audit = self.request_json(f"/api/studies/{study_id}/ai/audit", token=token)["ai_audit"]
+        purposes = {item["purpose"] for item in ai_audit}
+        self.assertTrue({"deidentify_preview", "cv_item"}.issubset(purposes))
+        audit_payload = self.request_json(f"/api/studies/{study_id}/audit?action=ai_request", token=token)
+        self.assertTrue(audit_payload["audit"])
+
+        data_user = self.request_json(
+            "/api/users",
+            "POST",
+            {"username": "ai.entry", "display_name": "AI Entry", "password": "Temporary12345", "role": "data_entry"},
+            token,
+        )["user"]
+        self.request_json(f"/api/studies/{study_id}/memberships", "POST", {"user_id": data_user["id"], "role": "data_entry", "active": True}, token)
+        data_token = self.request_json("/api/login", "POST", {"username": "ai.entry", "password": "Temporary12345"})["token"]
+        self.request_json("/api/password", "POST", {"current_password": "Temporary12345", "new_password": "DataEntryStrong123"}, data_token)
+        with self.assertRaises(HTTPError) as denied:
+            self.request_json(f"/api/studies/{study_id}/ai/workbench", "POST", {"purpose": "case_summary", "text": "deidentified note"}, data_token)
+        self.assertEqual(denied.exception.code, 403)
+        denied.exception.close()
+
+    def test_sensitive_actions_are_audited_and_filterable(self):
+        login = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})
+        token = login["token"]
+        study_id = self.request_json("/api/studies", token=token)["studies"][0]["id"]
+        form = self.request_json(f"/api/studies/{study_id}/forms", token=token)["forms"][0]
+        schema = form["schema"]
+        schema["fields"].append({"code": "audit_note", "label": "Audit Note", "type": "text"})
+        self.request_json(f"/api/studies/{study_id}/forms/{form['id']}", "PATCH", {"name": form["name"], "code": form["code"], "schema": schema}, token)
+        data_user = self.request_json(
+            "/api/users",
+            "POST",
+            {"username": "audit.entry", "display_name": "Audit Entry", "password": "Temporary12345", "role": "data_entry"},
+            token,
+        )["user"]
+        self.request_json(f"/api/studies/{study_id}/memberships", "POST", {"user_id": data_user["id"], "role": "data_entry", "active": True}, token)
+        backup = self.request_json(f"/api/studies/{study_id}/backups", "POST", {"passphrase": "LongLocalPassphrase123"}, token)["backup"]
+        self.assertTrue(backup["encrypted"])
+        case = self.request_json(
+            f"/api/studies/{study_id}/case-intake",
+            "POST",
+            {"case_uid": "AUDIT-CASE-001", "title": "Audit case", "source_text": "Deidentified note.", "files": [{"name": "audit.txt", "type": "text/plain", "data": "YXVkaXQ="}]},
+            token,
+        )["case"]
+        self.request_raw(f"/api/studies/{study_id}/case-intake/{case['id']}/files/{case['files'][0]['id']}", token=token)
+        self.request_raw(f"/api/studies/{study_id}/export", token=token)
+        audit_payload = self.request_json(f"/api/studies/{study_id}/audit?action=export", token=token)
+        self.assertTrue(audit_payload["audit"])
+        all_audit = self.request_json(f"/api/studies/{study_id}/audit", token=token)
+        actions = {item["action"] for item in all_audit["audit"]}
+        self.assertTrue({"update", "create", "create_encrypted", "download", "export"}.issubset(actions))
+        self.assertTrue(all_audit["suspicious"])
+        _, audit_type, audit_body = self.request_raw(f"/api/studies/{study_id}/audit-export?action=download", token=token)
+        audit_text = audit_body.decode("utf-8-sig")
+        self.assertIn("text/csv", audit_type)
+        self.assertIn("ip_address", audit_text)
+        self.assertIn("download", audit_text)
 
     def test_public_survey_with_consent_and_file_upload(self):
         token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]
@@ -476,11 +824,28 @@ class ApiSmokeTests(unittest.TestCase):
             {"username": "analyst.user", "display_name": "Analyst User", "password": "Temporary12345", "role": "analyst"},
             admin_token,
         )["user"]
+        viewer_user = self.request_json(
+            "/api/users",
+            "POST",
+            {"username": "viewer.user", "display_name": "Viewer User", "password": "Temporary12345", "role": "viewer"},
+            admin_token,
+        )["user"]
+        unassigned_user = self.request_json(
+            "/api/users",
+            "POST",
+            {"username": "unassigned.user", "display_name": "Unassigned User", "password": "Temporary12345", "role": "data_entry"},
+            admin_token,
+        )["user"]
         group_a = self.request_json(f"/api/studies/{study_id}/groups", "POST", {"name": "Site A", "code": "site_a"}, admin_token)["group"]
         group_b = self.request_json(f"/api/studies/{study_id}/groups", "POST", {"name": "Site B", "code": "site_b"}, admin_token)["group"]
         self.request_json(f"/api/studies/{study_id}/memberships", "POST", {"user_id": data_user["id"], "role": "data_entry", "data_group_id": group_a["id"], "active": True}, admin_token)
         self.request_json(f"/api/studies/{study_id}/memberships", "POST", {"user_id": other_data_user["id"], "role": "data_entry", "data_group_id": group_b["id"], "active": True}, admin_token)
         self.request_json(f"/api/studies/{study_id}/memberships", "POST", {"user_id": analyst_user["id"], "role": "analyst", "active": True}, admin_token)
+        self.request_json(f"/api/studies/{study_id}/memberships", "POST", {"user_id": viewer_user["id"], "role": "viewer", "active": True}, admin_token)
+        memberships = self.request_json(f"/api/studies/{study_id}/memberships", token=admin_token)["memberships"]
+        viewer_membership = next(item for item in memberships if item["user_id"] == viewer_user["id"])
+        self.assertIn("view_analysis", viewer_membership["effective_permissions"])
+        self.assertNotIn("enter_data", viewer_membership["effective_permissions"])
 
         entry_token = self.request_json("/api/login", "POST", {"username": "entry.user", "password": "Temporary12345"})["token"]
         self.request_json("/api/password", "POST", {"current_password": "Temporary12345", "new_password": "EntryUserStrong123"}, entry_token)
@@ -539,6 +904,21 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("text/csv", content_type)
         self.assertIn(b"EXP00001", body)
+
+        viewer_token = self.request_json("/api/login", "POST", {"username": "viewer.user", "password": "Temporary12345"})["token"]
+        self.request_json("/api/password", "POST", {"current_password": "Temporary12345", "new_password": "ViewerStrong123"}, viewer_token)
+        with self.assertRaises(HTTPError) as viewer_edit_denied:
+            self.request_json(f"/api/studies/{study_id}/participants", "POST", {"study_uid": "VIEW001"}, viewer_token)
+        self.assertEqual(viewer_edit_denied.exception.code, 403)
+        viewer_edit_denied.exception.close()
+
+        unassigned_token = self.request_json("/api/login", "POST", {"username": "unassigned.user", "password": "Temporary12345"})["token"]
+        self.request_json("/api/password", "POST", {"current_password": "Temporary12345", "new_password": "UnassignedStrong123"}, unassigned_token)
+        self.assertEqual(self.request_json("/api/studies", token=unassigned_token)["studies"], [])
+        with self.assertRaises(HTTPError) as unassigned_denied:
+            self.request_json(f"/api/studies/{study_id}/participants", token=unassigned_token)
+        self.assertEqual(unassigned_denied.exception.code, 403)
+        unassigned_denied.exception.close()
 
         scoped_token = self.request_json(
             f"/api/studies/{study_id}/api-tokens",

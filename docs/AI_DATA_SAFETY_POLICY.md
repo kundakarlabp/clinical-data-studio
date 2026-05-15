@@ -46,4 +46,32 @@ Prefer:
 
 ## Audit
 
-Every AI request is recorded in the audit trail with mode and file count. AI suggestions are review aids, not final clinical interpretation.
+Every AI request is recorded in the audit trail and in the AI audit table with:
+
+- user
+- study
+- linked case when available
+- provider and model
+- local or external mode
+- purpose
+- file count
+- whether PHI was detected
+- whether PHI was allowed
+- status and error if any
+
+## Current Safe AI Features
+
+Low-risk helpers are available inside **Academic Workbench**:
+
+- protocol or pasted text to CRF draft
+- case note to structured summary
+- dataset missing-field check
+- dataset inconsistency check
+- case set publication idea
+- academic activity to CV item suggestion
+
+Photo, PDF, and audio interpretation by external AI must stay behind admin enablement, PHI safety checks, and explicit confirmation. Do not make external AI automatic.
+
+## Publication And Novelty
+
+AI may suggest publication angles, missing data, titles, and abstract structure. It must not be treated as proof of novelty. Novelty requires a manual literature search and supervisor or co-author review.

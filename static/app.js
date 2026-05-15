@@ -1,6 +1,6 @@
 const state = {
-  token: localStorage.getItem("cds_token") || "",
   user: null,
+  csrfToken: "",
   setupRequired: false,
   studies: [],
   memberships: [],
@@ -31,6 +31,7 @@ const state = {
   readiness: null,
   adminStatus: null,
   adminLogs: [],
+  adminBackups: { backups: [], summary: null },
   view: "dashboard",
   selectedParticipantId: 0,
   participantSearch: "",
@@ -59,16 +60,39 @@ const ROLE_LABELS = {
 };
 
 async function api(path, options = {}) {
+  const method = (options.method || "GET").toUpperCase();
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
-  if (state.token) headers.Authorization = `Bearer ${state.token}`;
-  const response = await fetch(path, { ...options, headers });
+  if (!["GET", "HEAD", "OPTIONS"].includes(method) && !["/api/login", "/api/setup"].includes(path)) {
+    await ensureCsrf();
+    if (state.csrfToken) headers["X-CSRF-Token"] = state.csrfToken;
+  }
+  const response = await fetch(path, { ...options, headers, credentials: "same-origin" });
   if (!response.ok) {
     const payload = await response.json().catch(() => ({ error: response.statusText }));
-    throw new Error(payload.error || response.statusText);
+    const error = new Error(payload.error || response.statusText);
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
   }
   const type = response.headers.get("content-type") || "";
   if (type.includes("application/json")) return response.json();
   return response.text();
+}
+
+async function refreshCsrf() {
+  const response = await fetch("/api/csrf", { credentials: "same-origin" });
+  if (!response.ok) {
+    state.csrfToken = "";
+    return "";
+  }
+  const payload = await response.json();
+  state.csrfToken = payload.csrf_token || "";
+  return state.csrfToken;
+}
+
+async function ensureCsrf() {
+  if (state.csrfToken) return state.csrfToken;
+  return refreshCsrf();
 }
 
 function escapeHtml(value) {
@@ -92,11 +116,11 @@ async function loadAll() {
   const setup = await api("/api/setup").catch(() => ({ required: false }));
   state.setupRequired = Boolean(setup.required);
   if (state.setupRequired) return renderSetup();
-  if (!state.token) return renderLogin();
   try {
     const me = await api("/api/me");
     state.user = me.user;
     state.memberships = me.memberships || [];
+    await refreshCsrf();
     if (state.user?.must_change_password) return renderPasswordChangeRequired();
     const studies = await api("/api/studies");
     state.studies = studies.studies;
@@ -104,9 +128,10 @@ async function loadAll() {
     localStorage.setItem("cds_study_id", String(state.studyId || ""));
     await loadStudy();
   } catch (error) {
-    state.token = "";
-    localStorage.removeItem("cds_token");
-    state.error = error.message;
+    state.user = null;
+    state.csrfToken = "";
+    state.error = error.message === "Login required" ? "" : error.message;
+    return renderLogin();
   }
   render();
 }
@@ -116,7 +141,7 @@ async function loadStudy() {
   const manageUsers = can("manage_users");
   const viewAnalysis = can("view_analysis") || can("review_data");
   const readinessAllowed = can("manage_study") || can("review_data") || can("view_analysis");
-  const [forms, events, formEvents, surveyLinks, invitations, reports, academic, caseIntake, backups, participants, entries, queries, quality, analysis, assistantSummary, readiness, audit, groups, studyMembers, apiTokens, randomization, users, adminStatus, adminLogs] = await Promise.all([
+  const [forms, events, formEvents, surveyLinks, invitations, reports, academic, caseIntake, backups, participants, entries, queries, quality, analysis, assistantSummary, readiness, audit, groups, studyMembers, apiTokens, randomization, users, adminStatus, adminLogs, adminBackups] = await Promise.all([
     api(`/api/studies/${state.studyId}/forms`),
     api(`/api/studies/${state.studyId}/events`),
     api(`/api/studies/${state.studyId}/form-events`),
@@ -141,6 +166,7 @@ async function loadStudy() {
     isSuperAdmin() ? api("/api/users") : Promise.resolve({ users: [] }),
     isSuperAdmin() ? api("/api/admin/status") : Promise.resolve(null),
     isSuperAdmin() ? api("/api/admin/logs") : Promise.resolve({ lines: [] }),
+    isSuperAdmin() ? api("/api/admin/backups") : Promise.resolve({ backups: [], summary: null }),
   ]);
   state.forms = forms.forms;
   state.events = events.events;
@@ -169,6 +195,7 @@ async function loadStudy() {
   state.users = users.users;
   state.adminStatus = adminStatus;
   state.adminLogs = adminLogs.lines || [];
+  state.adminBackups = adminBackups;
 }
 
 function isSuperAdmin() {
@@ -183,11 +210,11 @@ function currentMembership() {
 function can(permission) {
   const role = currentMembership()?.role || "";
   const permissions = {
-    admin: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis"],
-    super_admin: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis"],
-    owner: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis"],
-    project_admin: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis"],
-    pi: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis"],
+    admin: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis", "use_ai", "manage_backups"],
+    super_admin: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis", "use_ai", "manage_backups"],
+    owner: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis", "use_ai", "manage_backups"],
+    project_admin: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis", "use_ai", "manage_backups"],
+    pi: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis", "use_ai", "manage_backups"],
     data_entry: ["enter_data"],
     reviewer: ["review_data", "view_analysis"],
     analyst: ["export_data", "view_analysis"],
@@ -202,7 +229,7 @@ function roleLabel(role) {
 }
 
 function render() {
-  if (!state.token) return renderLogin();
+  if (!state.user) return renderLogin();
   if (state.user?.must_change_password) return renderPasswordChangeRequired();
   const study = activeStudy();
   app.innerHTML = `
@@ -541,22 +568,25 @@ function dataView() {
 
 function entryCard(participant, form, selectedEvent) {
   const existing = state.entries.find((entry) => entry.participant_id === participant.id && entry.form_id === form.id && (entry.event_id === selectedEvent?.id || (!entry.event_id && entry.event_name === (selectedEvent?.code || "Baseline")))) || { data: {}, status: "draft", event_name: selectedEvent?.code || "Baseline", event_id: selectedEvent?.id || null, repeat_instance: 1 };
+  const schema = existing.schema_snapshot?.fields?.length ? { fields: existing.schema_snapshot.fields, repeatable: existing.schema_snapshot.repeatable } : form.schema;
   const locked = Boolean(existing.locked_at);
   const draftKey = window.CDSOfflineDrafts?.entryKey({ studyId: state.studyId, participantId: participant.id, formId: form.id, eventId: selectedEvent?.id || null, repeatInstance: existing.repeat_instance || 1 }) || "";
   return `
-    <form class="card stack entry-form" data-form-id="${form.id}" data-participant-id="${participant.id}" data-entry-id="${existing.id || ""}" data-entry-updated-at="${existing.updated_at || 0}" data-draft-key="${escapeHtml(draftKey)}">
+    <form class="card stack entry-form" data-form-id="${form.id}" data-participant-id="${participant.id}" data-entry-id="${existing.id || ""}" data-entry-updated-at="${existing.updated_at || 0}" data-entry-hash="${escapeHtml(existing.entry_hash || "")}" data-draft-key="${escapeHtml(draftKey)}">
       <div class="row">
         <div>
           <h3>${escapeHtml(form.name)}</h3>
           <span class="pill ${existing.status === "complete" ? "ok" : "warn"}">${escapeHtml(existing.status)}</span>
+          <span class="pill">CRF v${escapeHtml(existing.form_version || form.version || 1)}</span>
+          ${existing.form_version && form.version && existing.form_version < form.version ? `<span class="pill warn">older schema</span>` : ""}
           ${locked ? `<span class="pill ok">locked</span>` : ""}
           <span class="pill draft-status" data-draft-status>Synced</span>
         </div>
         <label>Event<input name="event_name" value="${escapeHtml(selectedEvent?.name || existing.event_name || "Baseline")}" readonly /></label>
       </div>
       <input type="hidden" name="event_id" value="${escapeHtml(selectedEvent?.id || "")}" />
-      <label>Repeat instance<input name="repeat_instance" type="number" min="1" value="${escapeHtml(existing.repeat_instance || 1)}" ${form.schema.repeatable ? "" : "readonly"} /></label>
-      ${form.schema.fields.map((field) => fieldInput(field, existing.data)).join("")}
+      <label>Repeat instance<input name="repeat_instance" type="number" min="1" value="${escapeHtml(existing.repeat_instance || 1)}" ${schema.repeatable ? "" : "readonly"} /></label>
+      ${schema.fields.map((field) => fieldInput(field, existing.data)).join("")}
       <label>Status
         <select name="status">
           <option value="draft" ${existing.status === "draft" ? "selected" : ""}>draft</option>
@@ -568,7 +598,7 @@ function entryCard(participant, form, selectedEvent) {
         <div class="form-grid">
           <label>Field review
             <select name="review_field_code">
-              ${form.schema.fields.map((field) => `<option value="${field.code}">${escapeHtml(field.label)}</option>`).join("")}
+              ${schema.fields.map((field) => `<option value="${field.code}">${escapeHtml(field.label)}</option>`).join("")}
             </select>
           </label>
           <label>Reason<input name="field_state_reason" placeholder="Review note" /></label>
@@ -586,36 +616,54 @@ function entryCard(participant, form, selectedEvent) {
   `;
 }
 
+function fieldChoices(field) {
+  if (field.choices?.length) return field.choices;
+  return (field.options || []).map((option) => ({ value: option, label: option }));
+}
+
 function fieldInput(field, data) {
   const value = data[field.code] ?? "";
   const required = field.required ? "required" : "";
-  const visibility = field.show_if ? `data-show-field="${escapeHtml(field.show_if.field)}" data-show-value="${escapeHtml(field.show_if.equals)}"` : "";
+  const visibility = [
+    field.show_if ? `data-show-field="${escapeHtml(field.show_if.field)}" data-show-value="${escapeHtml(field.show_if.equals)}"` : "",
+    field.branching_logic ? `data-branching-logic="${escapeHtml(field.branching_logic)}"` : "",
+  ].filter(Boolean).join(" ");
+  const note = field.help_text || field.field_note || field.units ? `<span class="small">${escapeHtml([field.help_text || field.field_note || "", field.units ? `Units: ${field.units}` : ""].filter(Boolean).join(" "))}</span>` : "";
+  if (field.type === "section" || field.type === "descriptive") {
+    return `<div class="notice" ${visibility}><strong>${escapeHtml(field.label)}</strong>${note}</div>`;
+  }
   if (field.type === "textarea") {
-    return `<label ${visibility}>${escapeHtml(field.label)}<textarea name="${escapeHtml(field.code)}" ${required}>${escapeHtml(value)}</textarea></label>`;
+    return `<label ${visibility}>${escapeHtml(field.label)}<textarea name="${escapeHtml(field.code)}" ${required}>${escapeHtml(value)}</textarea>${note}</label>`;
   }
   if (field.type === "select") {
-    return `<label ${visibility}>${escapeHtml(field.label)}<select name="${escapeHtml(field.code)}" ${required}><option value=""></option>${(field.options || []).map((option) => `<option ${option === value ? "selected" : ""}>${escapeHtml(option)}</option>`).join("")}</select></label>`;
+    return `<label ${visibility}>${escapeHtml(field.label)}<select name="${escapeHtml(field.code)}" ${required}><option value=""></option>${fieldChoices(field).map((option) => `<option value="${escapeHtml(option.value)}" ${option.value === value ? "selected" : ""}>${escapeHtml(option.label)}</option>`).join("")}</select>${note}</label>`;
+  }
+  if (field.type === "radio" || field.type === "yesno") {
+    return `<fieldset ${visibility}><legend>${escapeHtml(field.label)}</legend>${fieldChoices(field).map((option) => `<label class="check"><input type="radio" name="${escapeHtml(field.code)}" value="${escapeHtml(option.value)}" ${option.value === value ? "checked" : ""} ${required} />${escapeHtml(option.label)}</label>`).join("")}${note}</fieldset>`;
   }
   if (field.type === "checkbox") {
     const selected = Array.isArray(value) ? value : [];
-    return `<fieldset ${visibility}><legend>${escapeHtml(field.label)}</legend>${(field.options || []).map((option) => `<label class="check"><input type="checkbox" name="${escapeHtml(field.code)}" value="${escapeHtml(option)}" ${selected.includes(option) ? "checked" : ""} />${escapeHtml(option)}</label>`).join("")}</fieldset>`;
+    return `<fieldset ${visibility}><legend>${escapeHtml(field.label)}</legend>${fieldChoices(field).map((option) => `<label class="check"><input type="checkbox" name="${escapeHtml(field.code)}" value="${escapeHtml(option.value)}" ${selected.includes(option.value) ? "checked" : ""} />${escapeHtml(option.label)}</label>`).join("")}${note}</fieldset>`;
   }
   if (field.type === "calc") {
-    return `<label ${visibility}>${escapeHtml(field.label)}<input name="${escapeHtml(field.code)}" value="${escapeHtml(value)}" readonly placeholder="${escapeHtml(field.calculation || "Calculated on save")}" /></label>`;
+    return `<label ${visibility}>${escapeHtml(field.label)}<input name="${escapeHtml(field.code)}" value="${escapeHtml(value)}" readonly placeholder="${escapeHtml(field.calculation || "Calculated on save")}" />${note}</label>`;
   }
   if (field.type === "file") {
     const fileName = value?.name ? `<span class="small">Current file: ${escapeHtml(value.name)} (${Math.round((value.size || 0) / 1024)} KB)</span>` : "";
-    return `<label ${visibility}>${escapeHtml(field.label)}<input name="${escapeHtml(field.code)}" type="file" ${required} />${fileName}</label>`;
+    return `<label ${visibility}>${escapeHtml(field.label)}<input name="${escapeHtml(field.code)}" type="file" ${required} />${fileName}${note}</label>`;
   }
   const attrs = [`name="${escapeHtml(field.code)}"`, `value="${escapeHtml(value)}"`, required];
-  if (field.type === "number") {
-    attrs.push('type="number"', field.min !== undefined ? `min="${field.min}"` : "", field.max !== undefined ? `max="${field.max}"` : "", "step='any'");
+  if (["number", "integer", "decimal"].includes(field.type)) {
+    attrs.push('type="number"', field.min !== undefined ? `min="${field.min}"` : "", field.max !== undefined ? `max="${field.max}"` : "", field.type === "integer" ? "step='1'" : "step='any'");
   } else if (field.type === "date") {
     attrs.push('type="date"');
+  } else if (field.type === "datetime") {
+    attrs.push('type="datetime-local"');
   } else {
     attrs.push('type="text"');
   }
-  return `<label ${visibility}>${escapeHtml(field.label)}<input ${attrs.join(" ")} /></label>`;
+  if (field.regex) attrs.push(`pattern="${escapeHtml(field.regex)}"`);
+  return `<label ${visibility}>${escapeHtml(field.label)}<input ${attrs.filter(Boolean).join(" ")} />${note}</label>`;
 }
 
 function formsView() {
@@ -868,17 +916,24 @@ function fieldEditorRow(field = null) {
       <label>Code<input name="field_code" required placeholder="systolic_bp" value="${escapeHtml(field?.code || "")}" /></label>
       <label>Type
         <select name="field_type">
-          ${["text", "number", "date", "select", "checkbox", "textarea", "calc", "file"].map((type) => `<option value="${type}" ${field?.type === type ? "selected" : ""}>${type}</option>`).join("")}
+          ${["text", "textarea", "integer", "decimal", "number", "date", "datetime", "select", "radio", "checkbox", "yesno", "calc", "file", "section", "descriptive"].map((type) => `<option value="${type}" ${field?.type === type ? "selected" : ""}>${type}</option>`).join("")}
         </select>
       </label>
       <label>Required<select name="field_required"><option value="false" ${field?.required ? "" : "selected"}>No</option><option value="true" ${field?.required ? "selected" : ""}>Yes</option></select></label>
       <button type="button" class="secondary icon" data-remove-field title="Remove">X</button>
-      <label class="full">Options for select or checkbox fields<input name="field_options" placeholder="No, Yes" value="${escapeHtml((field?.options || []).join(", "))}" /></label>
+      <label class="full">Coded choices<input name="field_options" placeholder="1, Male | 2, Female | 3, Other" value="${escapeHtml((field?.choices || []).map((choice) => `${choice.value}, ${choice.label}`).join(" | ") || (field?.options || []).join(", "))}" /></label>
       <label>Min<input name="field_min" type="number" step="any" value="${escapeHtml(field?.min ?? "")}" /></label>
       <label>Max<input name="field_max" type="number" step="any" value="${escapeHtml(field?.max ?? "")}" /></label>
+      <label>Units<input name="field_units" placeholder="kg, mmHg, days" value="${escapeHtml(field?.units || "")}" /></label>
+      <label>Validation<input name="field_validation_type" placeholder="email, phone, custom" value="${escapeHtml(field?.validation_type || "")}" /></label>
+      <label class="full">Help text<input name="field_help_text" placeholder="Short instruction shown during data entry" value="${escapeHtml(field?.help_text || field?.field_note || "")}" /></label>
+      <label class="full">Regex<input name="field_regex" placeholder="^[A-Z0-9-]+$" value="${escapeHtml(field?.regex || "")}" /></label>
       <label class="full">Calculation<input name="field_calculation" placeholder="age + 10" value="${escapeHtml(field?.calculation || "")}" /></label>
       <label>Show if field<input name="field_show_if_field" placeholder="adverse_event" value="${escapeHtml(field?.show_if?.field || "")}" /></label>
-      <label>Equals<input name="field_show_if_equals" placeholder="Yes" value="${escapeHtml(field?.show_if?.equals || "")}" /></label>
+      <label>Equals<input name="field_show_if_equals" placeholder="1" value="${escapeHtml(field?.show_if?.equals || "")}" /></label>
+      <label class="full">Branching logic<input name="field_branching_logic" placeholder='age >= 18 AND pregnant == 1' value="${escapeHtml(field?.branching_logic || "")}" /></label>
+      <label class="check"><input type="checkbox" name="field_phi" value="true" ${field?.phi ? "checked" : ""} />PHI-sensitive</label>
+      <label class="check"><input type="checkbox" name="field_identifier" value="true" ${field?.identifier ? "checked" : ""} />Identifier</label>
     </div>
   `;
 }
@@ -1251,10 +1306,16 @@ function academicView() {
   const metrics = academic.metrics || {};
   const opportunities = academic.opportunities || [];
   const cvItems = academic.cv_items || [];
+  const outputs = academic.outputs || [];
+  const outputTypes = academic.output_types || [];
+  const aiAudit = academic.ai_audit || [];
+  const promptTemplates = academic.prompt_templates || [];
+  const ai = academic.ai || { provider: "local", model: "local-rules", external_ai_enabled: false, phi_allowed: false, multimodal_enabled: false };
   return `
     <section class="metrics-grid">
       ${metric("Captured Cases", metrics.case_count || 0, "Messy evidence organized")}
       ${metric("Opportunities", metrics.opportunity_count || 0, "Case report/series leads")}
+      ${metric("Academic Outputs", metrics.output_count || 0, "Ideas, abstracts, posters, audits")}
       ${metric("CV Items", metrics.cv_item_count || 0, "Academic outputs tracked")}
       ${metric("AI Reviews", metrics.ai_review_count || 0, "Audited academic AI reviews")}
     </section>
@@ -1270,9 +1331,50 @@ function academicView() {
         </div>
       </div>
       <div class="grid two">
-        <div class="notice">AI mode: ${escapeHtml(academic.ai?.provider || "local")} / ${escapeHtml(academic.ai?.model || "local-rules")}. ${academic.ai?.external_ai_enabled ? "External OpenAI enabled." : "External AI off or local fallback active."}</div>
+        <div class="notice">AI mode: ${escapeHtml(ai.provider || "local")} / ${escapeHtml(ai.model || "local-rules")}. ${ai.external_ai_enabled ? (ai.phi_allowed ? "External enabled, PHI allowed by policy." : "External enabled, PHI blocked.") : "External AI off or local fallback active."} ${ai.multimodal_enabled ? "Multimodal enabled." : "Photo/audio AI is not automatic."}</div>
         <div class="notice">${escapeHtml((academic.guidance || []).join(" "))}</div>
       </div>
+    </section>
+    <section class="panel">
+      <h2>AI Safety and Prompts</h2>
+      <div class="grid two">
+        <form id="ai-safety-form" class="form-grid">
+          <label class="full">De-identification preview<textarea name="text" placeholder="Paste text here before considering external AI. Identifiers will be detected and removed in preview."></textarea></label>
+          <div class="full"><button class="secondary" ${can("use_ai") ? "" : "disabled"}>Preview PHI Safety</button></div>
+          <label class="full">Safety result<textarea id="ai-safety-result" readonly></textarea></label>
+        </form>
+        <form id="ai-workbench-form" class="form-grid">
+          <label>Template
+            <select name="purpose">
+              ${promptTemplates.map((item) => `<option value="${escapeHtml(item.purpose)}">${escapeHtml(item.label)}</option>`).join("")}
+            </select>
+          </label>
+          <label class="full">Text or activity note<textarea name="text" placeholder="Paste de-identified protocol text, case note, or academic activity. Dataset checks can run without text."></textarea></label>
+          <div class="full"><button class="secondary" ${can("use_ai") ? "" : "disabled"}>Run Local AI Helper</button></div>
+          <label class="full">AI helper result<textarea id="ai-workbench-result" readonly></textarea></label>
+        </form>
+      </div>
+      ${can("use_ai") ? "" : `<div class="notice warn">AI helpers are available only to System Admin and Project Admin / PI roles.</div>`}
+      <div class="notice">Novelty is never assumed here. Use generated search terms and ideas as planning aids, then verify with a manual literature search.</div>
+      ${aiAudit.length ? `
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Time</th><th>User</th><th>Purpose</th><th>Mode</th><th>PHI</th><th>Status</th></tr></thead>
+            <tbody>
+              ${aiAudit.slice(0, 20).map((item) => `
+                <tr>
+                  <td>${fmtTime(item.created_at)}</td>
+                  <td>${escapeHtml(item.display_name || item.username || "")}</td>
+                  <td>${escapeHtml(item.purpose || "")}${item.case_uid ? `<br><span class="small">${escapeHtml(item.case_uid)}</span>` : ""}</td>
+                  <td>${escapeHtml(item.mode || "local")}<br><span class="small">${escapeHtml(item.model || "")}</span></td>
+                  <td>${item.phi_detected ? '<span class="pill warn">detected</span>' : '<span class="pill ok">not detected</span>'}</td>
+                  <td>${escapeHtml(item.status || "")}${item.error ? `<br><span class="small">${escapeHtml(item.error)}</span>` : ""}</td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+      ` : `<p>No AI audit events for this study yet.</p>`}
     </section>
     <section class="panel">
       <h2>Publication Opportunities</h2>
@@ -1293,6 +1395,47 @@ function academicView() {
                 </td>
               </tr>
             `).join("") || `<tr><td colspan="5">Add cases in Case Intake to generate publication opportunities.</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+    </section>
+    <section class="panel">
+      <h2>Academic Output Tracker</h2>
+      <form id="academic-output-form" class="form-grid">
+        <label>Output type
+          <select name="output_type">
+            ${outputTypes.map((value) => `<option value="${value}">${escapeHtml(value.replaceAll("_", " "))}</option>`).join("")}
+          </select>
+        </label>
+        <label>Title<input name="title" required placeholder="Retrospective influenza pneumonia case series" /></label>
+        <label>Status
+          <select name="status">
+            ${["idea", "planning", "drafting", "submitted", "accepted", "completed"].map((value) => `<option value="${value}">${escapeHtml(value)}</option>`).join("")}
+          </select>
+        </label>
+        <label>Linked case
+          <select name="linked_case_id">
+            <option value="">Not linked</option>
+            ${(state.caseIntake?.cases || []).map((item) => `<option value="${item.id}">${escapeHtml(item.case_uid)} - ${escapeHtml(item.title)}</option>`).join("")}
+          </select>
+        </label>
+        <label class="full">Dataset / export reference<input name="dataset_ref" placeholder="Dataset name, export date, registry subset, or analysis table" /></label>
+        <label class="full">Notes<textarea name="notes" placeholder="Missing data, ethics/consent, target conference, journal category, next action"></textarea></label>
+        <div class="full"><button class="secondary">Save Academic Output</button></div>
+      </form>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Output</th><th>Status</th><th>Linked Case</th><th>Dataset</th><th>Notes</th></tr></thead>
+          <tbody>
+            ${outputs.map((item) => `
+              <tr>
+                <td><strong>${escapeHtml(item.title)}</strong><br><span class="small">${escapeHtml((item.output_type || "").replaceAll("_", " "))}</span></td>
+                <td><span class="pill">${escapeHtml(item.status || "")}</span></td>
+                <td>${escapeHtml(item.linked_case_uid || "")}</td>
+                <td>${escapeHtml(item.dataset_ref || "")}</td>
+                <td>${escapeHtml(item.notes || "")}<br><span class="small">${escapeHtml(item.updated_by_name || "")} ${fmtTime(item.updated_at)}</span></td>
+              </tr>
+            `).join("") || `<tr><td colspan="5">No academic outputs yet.</td></tr>`}
           </tbody>
         </table>
       </div>
@@ -1387,18 +1530,22 @@ async function renderDraftList() {
     const participant = state.participants.find((item) => item.id === draft.participantId);
     const form = state.forms.find((item) => item.id === draft.formId);
     const serverEntry = state.entries.find((entry) => entry.participant_id === draft.participantId && entry.form_id === draft.formId && Number(entry.repeat_instance || 1) === Number(draft.repeatInstance || 1));
-    const conflict = serverEntry?.updated_at && draft.baselineUpdatedAt && serverEntry.updated_at !== draft.baselineUpdatedAt;
+    const baseUpdatedAt = draft.baseServerUpdatedAt || draft.baselineUpdatedAt || 0;
+    const conflict = draft.syncStatus === "conflict" || (serverEntry?.updated_at && baseUpdatedAt && serverEntry.updated_at !== baseUpdatedAt);
+    const status = conflict ? "conflict" : (draft.syncStatus || "pending");
     return `
       <article class="card">
         <div class="row">
           <div>
             <h3>${escapeHtml(form?.name || `Form ${draft.formId}`)}</h3>
-            <p>${escapeHtml(participant?.study_uid || `Participant ${draft.participantId}`)} - saved ${new Date(draft.updatedAt).toLocaleString()}</p>
+            <p>${escapeHtml(participant?.study_uid || `Participant ${draft.participantId}`)} - saved ${new Date(draft.localUpdatedAt || draft.updatedAt).toLocaleString()}</p>
           </div>
-          <span class="pill ${conflict ? "bad" : "warn"}">${conflict ? "conflict" : "pending"}</span>
+          <span class="pill ${conflict ? "bad" : "warn"}">${escapeHtml(status)}</span>
         </div>
-        ${conflict ? `<div class="notice error">Server record changed after this draft started. Compare before syncing.</div>` : ""}
+        ${conflict ? `<div class="notice error">Server record changed after this draft started. Review before choosing whether to sync or discard.</div>` : ""}
+        ${draft.syncError ? `<div class="notice error">${escapeHtml(draft.syncError)}</div>` : ""}
         <pre class="draft-preview">${escapeHtml(JSON.stringify(draft.payload.data || {}, null, 2))}</pre>
+        ${draft.conflictServerPayload ? `<pre class="draft-preview">${escapeHtml(JSON.stringify(draft.conflictServerPayload.data || {}, null, 2))}</pre>` : ""}
         <div class="split-actions">
           <button type="button" data-sync-draft="${escapeHtml(draft.key)}">Sync Now</button>
           <button type="button" class="secondary" data-delete-draft="${escapeHtml(draft.key)}">Discard Draft</button>
@@ -1411,13 +1558,59 @@ async function renderDraftList() {
 }
 
 function backupsView() {
+  const backupSummary = state.adminBackups?.summary || state.adminStatus?.health?.backup || {};
+  const latestFull = backupSummary.latest_full_backup;
+  const latestPostgres = backupSummary.latest_postgres_backup;
+  const fullBackups = state.adminBackups?.backups?.filter((item) => item.backup_type === "full") || [];
   return `
+    ${isSuperAdmin() ? `
+    <section class="panel">
+      <div class="row">
+        <div>
+          <h2>Full App Backup</h2>
+          <p class="small">Full backup includes PostgreSQL database plus uploaded evidence files. Use this for real Lightsail study protection.</p>
+        </div>
+        <div class="split-actions">
+          <button id="full-backup-create">Create Full Backup</button>
+          <button class="secondary" id="full-backup-verify">Verify Latest Backup</button>
+          ${latestFull ? `<button class="secondary" id="full-backup-download">Download Full Backup</button>` : ""}
+        </div>
+      </div>
+      ${latestFull?.verified ? `<div class="notice ok">Latest full backup verified at ${fmtTime(latestFull.verified_at)}.</div>` : `<div class="notice warn">No verified full backup is recorded. Create and verify a full backup before relying on this deployment.</div>`}
+      <div class="grid three">
+        <div><span class="small">Latest PostgreSQL backup</span><strong>${latestPostgres ? `${escapeHtml(latestPostgres.name)} (${Math.round(latestPostgres.size / 1024)} KB)` : "Not found"}</strong></div>
+        <div><span class="small">Latest full backup</span><strong>${latestFull ? `${escapeHtml(latestFull.name)} (${Math.round(latestFull.size / 1024)} KB)` : "Not found"}</strong></div>
+        <div><span class="small">Uploads included</span><strong>${latestFull?.uploads_included ? "Yes" : "No verified full backup"}</strong></div>
+        <div><span class="small">Uploads folder</span><strong>${backupSummary.uploads?.exists ? `${backupSummary.uploads.file_count || 0} file(s)` : "Missing"}</strong></div>
+        <div><span class="small">Backup directory</span><strong>${escapeHtml(backupSummary.directory || "")}</strong></div>
+        <div><span class="small">Verification</span><strong>${latestFull?.verified ? "Passed" : "Needs verification"}</strong></div>
+      </div>
+      ${fullBackups.length ? `
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Full backup</th><th>Size</th><th>Created</th><th>Verified</th><th></th></tr></thead>
+            <tbody>
+              ${fullBackups.map((backup) => `
+                <tr>
+                  <td>${escapeHtml(backup.name)} <span class="pill ok">encrypted</span></td>
+                  <td>${Math.round(backup.size / 1024)} KB</td>
+                  <td>${fmtTime(backup.created_at)}</td>
+                  <td>${backup.verified ? `Yes (${fmtTime(backup.verified_at)})` : "No"}</td>
+                  <td><button class="secondary" data-download-admin-backup="${escapeHtml(backup.name)}">Download</button></td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+      ` : ""}
+    </section>
+    ` : ""}
     <section class="panel">
       <div class="row">
         <h2>Backups</h2>
         <button id="backup-create">Create Backup</button>
       </div>
-      <p>Backups are local SQLite snapshots stored under the app data folder. Keep copies on an encrypted external drive for real studies.</p>
+      <p>Project database backups protect structured data. Full app backups also include uploaded case evidence files.</p>
       <form id="encrypted-backup-form" class="form-grid">
         <label>Archive passphrase<input name="passphrase" type="password" minlength="12" placeholder="12+ characters" /></label>
         <div><button class="secondary">Create Encrypted Archive</button></div>
@@ -1532,13 +1725,14 @@ function accessView() {
       </form>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>User</th><th>Role</th><th>Group</th><th>Active</th></tr></thead>
+          <thead><tr><th>User</th><th>Role</th><th>Group</th><th>Effective Permissions</th><th>Active</th></tr></thead>
           <tbody>
             ${state.studyMembers.map((item) => `
               <tr>
                 <td>${escapeHtml(item.username)}<br><span class="small">${escapeHtml(item.display_name)}</span></td>
                 <td><span class="pill">${escapeHtml(roleLabel(item.role))}</span></td>
                 <td>${escapeHtml(item.data_group_name || "All groups")}</td>
+                <td><span class="small">${escapeHtml((item.effective_permissions || []).join(", "))}</span></td>
                 <td>${item.active ? "Yes" : "No"}</td>
               </tr>
             `).join("")}
@@ -1666,8 +1860,8 @@ function bindShell() {
   });
   document.querySelector("#logout")?.addEventListener("click", async () => {
     await api("/api/logout", { method: "POST", body: "{}" }).catch(() => {});
-    state.token = "";
-    localStorage.removeItem("cds_token");
+    state.user = null;
+    state.csrfToken = "";
     renderLogin();
   });
   document.querySelector("#export-csv")?.addEventListener("click", () => downloadApi(`/api/studies/${state.studyId}/export${currentMembership()?.role === "analyst" ? "?deidentified=1" : ""}`, "clinical_data_export.csv"));
@@ -1705,7 +1899,10 @@ function bindRoute() {
   document.querySelector("#invitation-form")?.addEventListener("submit", submitInvitation);
   document.querySelectorAll("[data-invitation-action]").forEach((button) => button.addEventListener("click", () => updateInvitation(button.dataset.invitationId, button.dataset.invitationAction)));
   document.querySelector("#report-form")?.addEventListener("submit", submitReport);
+  document.querySelector("#academic-output-form")?.addEventListener("submit", submitAcademicOutput);
   document.querySelector("#academic-cv-form")?.addEventListener("submit", submitAcademicCvItem);
+  document.querySelector("#ai-safety-form")?.addEventListener("submit", submitAiSafetyPreview);
+  document.querySelector("#ai-workbench-form")?.addEventListener("submit", submitAiWorkbench);
   document.querySelector("#academic-export-md")?.addEventListener("click", () => downloadApi(`/api/studies/${state.studyId}/academic/export?format=md`, "academic_portfolio.md"));
   document.querySelector("#academic-export-csv")?.addEventListener("click", () => downloadApi(`/api/studies/${state.studyId}/academic/export?format=csv`, "academic_cv_tracker.csv"));
   document.querySelector("#refresh-drafts")?.addEventListener("click", renderDraftList);
@@ -1721,6 +1918,12 @@ function bindRoute() {
     button.addEventListener("click", () => requestCaseAiReview(button.dataset.caseAi));
   });
   document.querySelector("#backup-create")?.addEventListener("click", createBackup);
+  document.querySelector("#full-backup-create")?.addEventListener("click", createFullBackup);
+  document.querySelector("#full-backup-verify")?.addEventListener("click", verifyLatestFullBackup);
+  document.querySelector("#full-backup-download")?.addEventListener("click", downloadLatestFullBackup);
+  document.querySelectorAll("[data-download-admin-backup]").forEach((button) => {
+    button.addEventListener("click", () => downloadApi(`/api/admin/backups/${encodeURIComponent(button.dataset.downloadAdminBackup)}`, button.dataset.downloadAdminBackup));
+  });
   document.querySelector("#encrypted-backup-form")?.addEventListener("submit", createEncryptedBackup);
   document.querySelectorAll("[data-restore-backup]").forEach((button) => button.addEventListener("click", () => restoreBackup(button.dataset.restoreBackup, button.dataset.encrypted === "true")));
   document.querySelector("#form-builder")?.addEventListener("submit", submitFormDefinition);
@@ -1786,11 +1989,51 @@ function bindRoute() {
 }
 
 function applyBranching(form) {
-  form.querySelectorAll("[data-show-field]").forEach((label) => {
-    const source = form.elements[label.dataset.showField];
-    const visible = source && source.value === label.dataset.showValue;
+  form.querySelectorAll("[data-show-field], [data-branching-logic]").forEach((label) => {
+    let visible = true;
+    if (label.dataset.showField) {
+      const source = form.elements[label.dataset.showField];
+      visible = Boolean(source) && source.value === label.dataset.showValue;
+    }
+    if (visible && label.dataset.branchingLogic) {
+      visible = evaluateBranchingExpression(label.dataset.branchingLogic, form);
+    }
     label.classList.toggle("hidden", !visible);
   });
+}
+
+function fieldValueForBranching(form, field) {
+  const item = form.elements[field];
+  if (!item) return "";
+  if (item instanceof RadioNodeList) return item.value;
+  return item.value;
+}
+
+function evaluateBranchingExpression(expression, form) {
+  const compare = (clause) => {
+    const inMatch = clause.trim().match(/^([A-Za-z_][A-Za-z0-9_]*)\s+IN\s+\[(.*)\]$/i);
+    if (inMatch) {
+      const [, field, values] = inMatch;
+      const allowed = values.split(",").map((item) => item.trim().replace(/^['"]|['"]$/g, ""));
+      return allowed.includes(String(fieldValueForBranching(form, field)));
+    }
+    const match = clause.trim().match(/^([A-Za-z_][A-Za-z0-9_]*)\s*(==|=|!=|>=|<=|>|<)\s*(.+)$/);
+    if (!match) return false;
+    const [, field, operator, rawExpected] = match;
+    const actual = fieldValueForBranching(form, field);
+    const expected = rawExpected.trim().replace(/^['"]|['"]$/g, "");
+    if (operator === "=" || operator === "==") return String(actual) === expected;
+    if (operator === "!=") return String(actual) !== expected;
+    const left = Number(actual);
+    const right = Number(expected);
+    if (Number.isNaN(left) || Number.isNaN(right)) return false;
+    if (operator === ">=") return left >= right;
+    if (operator === "<=") return left <= right;
+    if (operator === ">") return left > right;
+    if (operator === "<") return left < right;
+    return false;
+  };
+  return expression.split(/\s+OR\s+/i).some((group) => group.split(/\s+AND\s+/i).every(compare));
 }
 
 async function submitParticipant(event) {
@@ -2113,6 +2356,63 @@ async function submitAcademicCvItem(event) {
   }
 }
 
+async function submitAcademicOutput(event) {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(event.target));
+  try {
+    await api(`/api/studies/${state.studyId}/academic/outputs`, {
+      method: "POST",
+      body: JSON.stringify({
+        output_type: data.output_type,
+        title: data.title,
+        status: data.status,
+        linked_case_id: data.linked_case_id ? Number(data.linked_case_id) : null,
+        dataset_ref: data.dataset_ref || "",
+        notes: data.notes || "",
+      }),
+    });
+    event.target.reset();
+    state.error = "Academic output saved.";
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function submitAiSafetyPreview(event) {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(event.target));
+  const output = document.querySelector("#ai-safety-result");
+  try {
+    const result = await api(`/api/studies/${state.studyId}/ai/safety-preview`, {
+      method: "POST",
+      body: JSON.stringify({ text: data.text || "", replacement: "Study participant" }),
+    });
+    if (output) output.value = JSON.stringify(result.preview, null, 2);
+  } catch (error) {
+    if (output) output.value = error.message;
+    state.error = error.message;
+  }
+}
+
+async function submitAiWorkbench(event) {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(event.target));
+  const output = document.querySelector("#ai-workbench-result");
+  try {
+    const result = await api(`/api/studies/${state.studyId}/ai/workbench`, {
+      method: "POST",
+      body: JSON.stringify({ purpose: data.purpose, text: data.text || "" }),
+    });
+    if (output) output.value = JSON.stringify(result.result, null, 2);
+  } catch (error) {
+    if (output) output.value = error.message;
+    state.error = error.message;
+  }
+}
+
 async function submitCaseIntake(event) {
   event.preventDefault();
   const form = event.target;
@@ -2194,7 +2494,7 @@ async function requestCaseAiReview(caseId) {
 
 async function downloadApi(path, filename) {
   try {
-    const response = await fetch(path, { headers: { Authorization: `Bearer ${state.token}` } });
+    const response = await fetch(path, { credentials: "same-origin" });
     if (!response.ok) {
       const payload = await response.json().catch(() => ({ error: response.statusText }));
       throw new Error(payload.error || response.statusText);
@@ -2219,18 +2519,32 @@ async function syncLocalDraft(key) {
     const draft = await window.CDSOfflineDrafts.getDraft(key);
     if (!draft) return;
     const serverEntry = state.entries.find((entry) => entry.participant_id === draft.participantId && entry.form_id === draft.formId && Number(entry.repeat_instance || 1) === Number(draft.repeatInstance || 1));
-    if (serverEntry?.updated_at && draft.baselineUpdatedAt && serverEntry.updated_at !== draft.baselineUpdatedAt && !confirm("The server record changed after this draft started. Replace the server record with this local draft?")) {
+    const baseUpdatedAt = draft.baseServerUpdatedAt || draft.baselineUpdatedAt || 0;
+    if (serverEntry?.updated_at && baseUpdatedAt && serverEntry.updated_at !== baseUpdatedAt && !confirm("The server record changed after this draft started. Try syncing anyway and let the server verify the conflict?")) {
       return;
     }
+    const payload = {
+      ...draft.payload,
+      if_match_updated_at: baseUpdatedAt || null,
+      if_match_entry_hash: draft.baseEntryHash || "",
+    };
     await api(`/api/studies/${state.studyId}/entries`, {
       method: "POST",
-      body: JSON.stringify(draft.payload),
+      body: JSON.stringify(payload),
     });
     await window.CDSOfflineDrafts.deleteDraft(key);
     await loadStudy();
     state.error = "Local draft synced.";
     render();
   } catch (error) {
+    if (error.status === 409 && window.CDSOfflineDrafts) {
+      await window.CDSOfflineDrafts.updateDraft(key, {
+        syncStatus: "conflict",
+        syncError: error.message,
+        conflictServerPayload: error.payload?.server_entry || null,
+        conflictDetectedAt: Date.now(),
+      }).catch(() => null);
+    }
     state.error = error.message;
     render();
   }
@@ -2251,6 +2565,36 @@ async function createBackup() {
     state.error = error.message;
     render();
   }
+}
+
+async function createFullBackup() {
+  try {
+    await api("/api/admin/backup/full", { method: "POST", body: "{}" });
+    await loadStudy();
+    state.error = "Full encrypted backup created. Verify it before relying on it.";
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function verifyLatestFullBackup() {
+  try {
+    const result = await api("/api/admin/backups/verify", { method: "POST", body: "{}" });
+    await loadStudy();
+    state.error = result.verification?.ok ? "Latest full backup verified." : `Full backup verification failed: ${(result.verification?.errors || []).join("; ")}`;
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+function downloadLatestFullBackup() {
+  const latest = state.adminBackups?.summary?.latest_full_backup || state.adminStatus?.health?.backup?.latest_full_backup;
+  if (!latest?.name) return;
+  downloadApi(`/api/admin/backups/${encodeURIComponent(latest.name)}`, latest.name);
 }
 
 async function createEncryptedBackup(event) {
@@ -2280,16 +2624,31 @@ async function submitFormDefinition(event) {
       required: get("field_required") === "true",
     };
     const options = get("field_options");
-    if ((field.type === "select" || field.type === "checkbox") && options) field.options = options.split(",").map((item) => item.trim()).filter(Boolean);
+    if (["select", "radio", "checkbox"].includes(field.type) && options) field.choices = options.split("|").map((item) => {
+      const [value, ...labelParts] = item.split(",");
+      return { value: value.trim(), label: (labelParts.join(",").trim() || value.trim()) };
+    }).filter((item) => item.value);
     const min = get("field_min");
     const max = get("field_max");
     if (min !== "") field.min = Number(min);
     if (max !== "") field.max = Number(max);
+    const units = get("field_units");
+    if (units) field.units = units;
+    const validationType = get("field_validation_type");
+    if (validationType) field.validation_type = validationType;
+    const helpText = get("field_help_text");
+    if (helpText) field.help_text = helpText;
+    const regex = get("field_regex");
+    if (regex) field.regex = regex;
     const calculation = get("field_calculation");
     if (calculation) field.calculation = calculation;
     const showIfField = get("field_show_if_field");
     const showIfEquals = get("field_show_if_equals");
     if (showIfField && showIfEquals) field.show_if = { field: showIfField, equals: showIfEquals };
+    const branchingLogic = get("field_branching_logic");
+    if (branchingLogic) field.branching_logic = branchingLogic;
+    field.phi = Boolean(editor.querySelector(`[name="field_phi"]`)?.checked);
+    field.identifier = Boolean(editor.querySelector(`[name="field_identifier"]`)?.checked);
     return field;
   });
   try {
@@ -2389,7 +2748,13 @@ async function showEntryHistory(entryId) {
 async function showFormVersions(formId) {
   try {
     const result = await api(`/api/studies/${state.studyId}/forms/${formId}/versions`);
-    const lines = result.versions.map((item) => `v${item.version} saved ${fmtTime(item.saved_at)}`).join("\\n");
+    const lines = result.versions.map((item) => {
+      const diff = item.diff_to_current || {};
+      const added = (diff.fields_added || []).length ? ` added: ${(diff.fields_added || []).join(", ")}` : "";
+      const removed = (diff.fields_removed || []).length ? ` removed: ${(diff.fields_removed || []).join(", ")}` : "";
+      const changed = (diff.fields_changed || []).length ? ` changed: ${(diff.fields_changed || []).map((change) => change.field).join(", ")}` : "";
+      return `v${item.version}${item.current ? " current" : ""} saved ${fmtTime(item.saved_at)}${added}${removed}${changed}`;
+    }).join("\\n");
     alert(lines || "No prior versions saved.");
   } catch (error) {
     state.error = error.message;
@@ -2420,7 +2785,9 @@ async function collectEntryPayload(form) {
   const data = {};
   const payload = Object.fromEntries(new FormData(form));
   const formDef = state.forms.find((item) => item.id === Number(form.dataset.formId));
-  for (const field of formDef.schema.fields) {
+  const existing = state.entries.find((entry) => entry.participant_id === Number(form.dataset.participantId) && entry.form_id === Number(form.dataset.formId));
+  const schema = existing?.schema_snapshot?.fields?.length ? { fields: existing.schema_snapshot.fields, repeatable: existing.schema_snapshot.repeatable } : formDef.schema;
+  for (const field of schema.fields) {
     if (!form.querySelector(`[name="${field.code}"]`)?.closest(".hidden")) {
       if (field.type === "checkbox") {
         data[field.code] = [...form.querySelectorAll(`[name="${field.code}"]:checked`)].map((item) => item.value);
@@ -2429,7 +2796,6 @@ async function collectEntryPayload(form) {
         if (file) {
           data[field.code] = await fileToPayload(file);
         } else {
-          const existing = state.entries.find((entry) => entry.participant_id === Number(form.dataset.participantId) && entry.form_id === Number(form.dataset.formId));
           data[field.code] = existing?.data?.[field.code] || "";
         }
       } else {
@@ -2445,6 +2811,8 @@ async function collectEntryPayload(form) {
     repeat_instance: Number(payload.repeat_instance || 1),
     status: payload.status || "draft",
     change_reason: payload.change_reason || "",
+    if_match_updated_at: form.dataset.entryId ? Number(form.dataset.entryUpdatedAt || 0) : null,
+    if_match_entry_hash: form.dataset.entryId ? (form.dataset.entryHash || "") : "",
     data,
   };
 }
@@ -2464,7 +2832,14 @@ async function saveLocalDraft(form) {
     formId: Number(form.dataset.formId),
     eventId: payload.event_id,
     repeatInstance: payload.repeat_instance,
+    baseEntryId: form.dataset.entryId ? Number(form.dataset.entryId) : null,
+    baseServerUpdatedAt: Number(form.dataset.entryUpdatedAt || 0),
+    baseEntryHash: form.dataset.entryHash || "",
     baselineUpdatedAt: Number(form.dataset.entryUpdatedAt || 0),
+    syncStatus: "draft",
+    syncError: "",
+    conflictServerPayload: null,
+    conflictDetectedAt: null,
     payload,
   });
   markDraftStatus(form, "Draft saved");
@@ -2481,7 +2856,8 @@ async function restoreLocalDraft(form) {
   const draft = await window.CDSOfflineDrafts.getDraft(form.dataset.draftKey).catch(() => null);
   if (!draft) return;
   const serverUpdatedAt = Number(form.dataset.entryUpdatedAt || 0);
-  if (serverUpdatedAt && draft.baselineUpdatedAt && serverUpdatedAt !== draft.baselineUpdatedAt) {
+  const baseUpdatedAt = draft.baseServerUpdatedAt || draft.baselineUpdatedAt || 0;
+  if (serverUpdatedAt && baseUpdatedAt && serverUpdatedAt !== baseUpdatedAt) {
     form.insertAdjacentHTML("afterbegin", `<div class="notice error">Local draft exists, but the server record changed after the draft started. Open Local Drafts to compare before syncing.</div>`);
     markDraftStatus(form, "Conflict");
     return;
@@ -2612,10 +2988,9 @@ function renderLogin() {
     const data = Object.fromEntries(new FormData(event.target));
     try {
       const result = await api("/api/login", { method: "POST", body: JSON.stringify(data) });
-      state.token = result.token;
       state.user = result.user;
       state.error = "";
-      localStorage.setItem("cds_token", state.token);
+      await refreshCsrf();
       if (state.user?.must_change_password) return renderPasswordChangeRequired();
       await loadAll();
     } catch (error) {
@@ -2656,9 +3031,8 @@ function renderPasswordChangeRequired() {
   });
   document.querySelector("#forced-logout").addEventListener("click", async () => {
     await api("/api/logout", { method: "POST", body: "{}" }).catch(() => {});
-    state.token = "";
     state.user = null;
-    localStorage.removeItem("cds_token");
+    state.csrfToken = "";
     renderLogin();
   });
 }

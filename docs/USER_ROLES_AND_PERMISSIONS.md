@@ -7,7 +7,7 @@ Use named accounts. Do not share passwords.
 | Role | Intended user | Main permissions |
 | --- | --- | --- |
 | `super_admin` | System owner | All studies, all users, deployment status |
-| `project_admin` | Study PI/admin | Manage assigned study, forms, users, exports |
+| `project_admin` | Study PI/admin | Manage assigned study, forms, users, exports, backups, AI helpers |
 | `pi` | Principal investigator | Same project permissions as project admin |
 | `data_entry` | Data entry staff | Create and update unlocked CRFs in assigned study/group |
 | `reviewer` | Monitor/reviewer | Queries, review, lock/freeze, audit view |
@@ -41,3 +41,11 @@ The user must change the password after login.
 ## Data Access Groups
 
 Use data groups when different sites should see only their own participants. Assign the data entry user to the correct data group in Access.
+
+## Practical Rules
+
+- Data Entry users cannot export data, manage CRFs, manage users, or run AI helpers.
+- Analysts can view analysis and export de-identified data, but cannot edit clinical records.
+- Reviewers can review records, queries, and AI audit events, but should not create users.
+- Project Admin / PI users can run AI helpers for the assigned project, but external AI remains blocked unless the server owner enables it.
+- Use one named account per person. Shared accounts make the audit trail unreliable.

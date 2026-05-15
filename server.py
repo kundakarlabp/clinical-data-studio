@@ -768,6 +768,9 @@ def migrate_entries_unique_key(conn: sqlite3.Connection) -> None:
             repeat_instance INTEGER NOT NULL DEFAULT 1,
             status TEXT NOT NULL DEFAULT 'draft',
             data_json TEXT NOT NULL DEFAULT '{}',
+            form_version INTEGER NOT NULL DEFAULT 1,
+            schema_snapshot_json TEXT NOT NULL DEFAULT '{}',
+            entry_hash TEXT NOT NULL DEFAULT '',
             created_by INTEGER REFERENCES users(id),
             updated_by INTEGER REFERENCES users(id),
             locked_at INTEGER,
@@ -779,11 +782,11 @@ def migrate_entries_unique_key(conn: sqlite3.Connection) -> None:
         );
         INSERT INTO entries(
             id, study_id, participant_id, form_id, event_id, event_name, repeat_instance, status,
-            data_json, created_by, updated_by, locked_at, locked_by, lock_reason, created_at, updated_at
+            data_json, form_version, schema_snapshot_json, entry_hash, created_by, updated_by, locked_at, locked_by, lock_reason, created_at, updated_at
         )
         SELECT
             id, study_id, participant_id, form_id, event_id, event_name,
-            COALESCE(repeat_instance, 1), status, data_json, created_by, updated_by,
+            COALESCE(repeat_instance, 1), status, data_json, COALESCE(form_version, 1), COALESCE(schema_snapshot_json, '{}'), COALESCE(entry_hash, ''), created_by, updated_by,
             locked_at, locked_by, COALESCE(lock_reason, ''), created_at, updated_at
         FROM entries_old;
         DROP TABLE entries_old;
@@ -1016,6 +1019,9 @@ def migrate() -> None:
                 repeat_instance INTEGER NOT NULL DEFAULT 1,
                 status TEXT NOT NULL DEFAULT 'draft',
                 data_json TEXT NOT NULL DEFAULT '{}',
+                form_version INTEGER NOT NULL DEFAULT 1,
+                schema_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                entry_hash TEXT NOT NULL DEFAULT '',
                 created_by INTEGER REFERENCES users(id),
                 updated_by INTEGER REFERENCES users(id),
                 locked_at INTEGER,
@@ -1213,6 +1219,9 @@ def migrate() -> None:
         add_column(conn, "entries", "locked_by", "INTEGER REFERENCES users(id)")
         add_column(conn, "entries", "lock_reason", "TEXT NOT NULL DEFAULT ''")
         add_column(conn, "entries", "event_id", "INTEGER REFERENCES study_events(id) ON DELETE SET NULL")
+        add_column(conn, "entries", "form_version", "INTEGER NOT NULL DEFAULT 1")
+        add_column(conn, "entries", "schema_snapshot_json", "TEXT NOT NULL DEFAULT '{}'")
+        add_column(conn, "entries", "entry_hash", "TEXT NOT NULL DEFAULT ''")
         add_column(conn, "participants", "data_group_id", "INTEGER REFERENCES data_groups(id) ON DELETE SET NULL")
         add_column(conn, "users", "must_change_password", "INTEGER NOT NULL DEFAULT 0")
         add_column(conn, "users", "failed_login_count", "INTEGER NOT NULL DEFAULT 0")
@@ -1484,6 +1493,52 @@ def validate_entry_data(schema: dict, data: dict) -> tuple[dict, list[dict]]:
         except Exception:
             issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} calculation could not be evaluated"})
     return cleaned, issues
+
+
+def canonical_json(value) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def form_schema_snapshot(form: dict, schema: dict | None = None) -> dict:
+    schema = schema or load_json(form.get("schema_json", "{}"), {"fields": []})
+    return {
+        "form_id": form.get("id"),
+        "form_name": form.get("name", ""),
+        "form_code": form.get("code", ""),
+        "form_version": int(form.get("version") or 1),
+        "repeatable": bool(schema.get("repeatable", False)),
+        "fields": schema.get("fields", []),
+    }
+
+
+def schema_for_entry(entry: dict, fallback_schema: dict | None = None) -> dict:
+    snapshot = load_json(entry.get("schema_snapshot_json", ""), {})
+    if snapshot.get("fields"):
+        return {"fields": snapshot.get("fields", []), "repeatable": bool(snapshot.get("repeatable", False))}
+    return fallback_schema or {"fields": []}
+
+
+def entry_hash(data: dict, form_version: int, schema_snapshot: dict) -> str:
+    payload = {"data": data, "form_version": int(form_version or 1), "schema_snapshot": schema_snapshot}
+    return sha256_bytes(canonical_json(payload).encode("utf-8"))
+
+
+def form_schema_diff(old_schema: dict, new_schema: dict) -> dict:
+    old_fields = {field.get("code"): field for field in old_schema.get("fields", []) if field.get("code")}
+    new_fields = {field.get("code"): field for field in new_schema.get("fields", []) if field.get("code")}
+    added = sorted(set(new_fields) - set(old_fields))
+    removed = sorted(set(old_fields) - set(new_fields))
+    changed = []
+    for code in sorted(set(old_fields) & set(new_fields)):
+        before = old_fields[code]
+        after = new_fields[code]
+        changes = {}
+        for key in ("label", "type", "options", "min", "max", "required", "show_if", "calculation", "units", "validation", "regex"):
+            if before.get(key) != after.get(key):
+                changes[key] = {"before": before.get(key), "after": after.get(key)}
+        if changes:
+            changed.append({"field": code, "changes": changes})
+    return {"fields_added": added, "fields_removed": removed, "fields_changed": changed}
 
 
 def evaluate_calculation(expression: str, values: dict) -> float:
@@ -3059,7 +3114,7 @@ class App(BaseHTTPRequestHandler):
             conn,
             """
             SELECT survey_links.*, studies.name AS study_name, studies.protocol_id,
-                   forms.name AS form_name, forms.code AS form_code, forms.schema_json,
+                   forms.name AS form_name, forms.code AS form_code, forms.schema_json, forms.version AS form_version,
                    study_events.name AS event_name, study_events.code AS event_code
             FROM survey_links
             JOIN studies ON studies.id = survey_links.study_id
@@ -3123,22 +3178,29 @@ class App(BaseHTTPRequestHandler):
             audit(conn, None, "public_create", "participant", cur.lastrowid, None, participant)
         event_id = survey.get("event_id")
         event_name = survey.get("event_code") or "Baseline"
+        form_snapshot = form_schema_snapshot(
+            {"id": survey["form_id"], "name": survey["form_name"], "code": survey["form_code"], "version": survey.get("form_version") or 1},
+            schema,
+        )
+        form_version = int(survey.get("form_version") or 1)
+        digest = entry_hash(cleaned, form_version, form_snapshot)
+        snapshot_json = json.dumps(form_snapshot, sort_keys=True)
         existing = row(conn, "SELECT * FROM entries WHERE participant_id = ? AND form_id = ? AND event_name = ? AND repeat_instance = 1", (participant["id"], survey["form_id"], event_name))
         if existing:
             if existing.get("locked_at"):
                 self.send_error_json("This submitted CRF is locked and cannot be updated from the public link", 423)
                 return
             conn.execute(
-                "UPDATE entries SET event_id = ?, data_json = ?, status = 'complete', updated_at = ? WHERE id = ?",
-                (event_id, json.dumps(cleaned), timestamp, existing["id"]),
+                "UPDATE entries SET event_id = ?, data_json = ?, status = 'complete', form_version = ?, schema_snapshot_json = ?, entry_hash = ?, updated_at = ? WHERE id = ?",
+                (event_id, json.dumps(cleaned), form_version, snapshot_json, digest, timestamp, existing["id"]),
             )
             entry_id = existing["id"]
             after = row(conn, "SELECT * FROM entries WHERE id = ?", (entry_id,))
             audit(conn, None, "public_update", "entry", entry_id, existing, after)
         else:
             cur = conn.execute(
-                "INSERT INTO entries(study_id, participant_id, form_id, event_id, event_name, repeat_instance, status, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, 'complete', ?, ?, ?)",
-                (survey["study_id"], participant["id"], survey["form_id"], event_id, event_name, json.dumps(cleaned), timestamp, timestamp),
+                "INSERT INTO entries(study_id, participant_id, form_id, event_id, event_name, repeat_instance, status, data_json, form_version, schema_snapshot_json, entry_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, 'complete', ?, ?, ?, ?, ?, ?)",
+                (survey["study_id"], participant["id"], survey["form_id"], event_id, event_name, json.dumps(cleaned), form_version, snapshot_json, digest, timestamp, timestamp),
             )
             entry_id = cur.lastrowid
             after = row(conn, "SELECT * FROM entries WHERE id = ?", (entry_id,))
@@ -3387,7 +3449,28 @@ class App(BaseHTTPRequestHandler):
     def forms(self, conn, user, method, study_id, parts) -> None:
         if method == "GET" and len(parts) == 6 and parts[5] == "versions":
             form_id = int(parts[4])
-            versions = rows(conn, "SELECT id, form_id, study_id, version, name, code, saved_by, saved_at FROM form_versions WHERE form_id = ? AND study_id = ? ORDER BY version DESC", (form_id, study_id))
+            current = row(conn, "SELECT * FROM forms WHERE id = ? AND study_id = ?", (form_id, study_id))
+            if not current:
+                self.send_error_json("Form not found", 404)
+                return
+            versions = rows(conn, "SELECT id, form_id, study_id, version, name, code, schema_json, saved_by, saved_at FROM form_versions WHERE form_id = ? AND study_id = ? ORDER BY version DESC", (form_id, study_id))
+            current_schema = load_json(current["schema_json"], {"fields": []})
+            for version in versions:
+                prior_schema = load_json(version.pop("schema_json"), {"fields": []})
+                version["diff_to_current"] = form_schema_diff(prior_schema, current_schema)
+            current_payload = {
+                "id": current["id"],
+                "form_id": current["id"],
+                "study_id": study_id,
+                "version": current["version"],
+                "name": current["name"],
+                "code": current["code"],
+                "saved_by": None,
+                "saved_at": current["updated_at"],
+                "diff_to_current": {"fields_added": [], "fields_removed": [], "fields_changed": []},
+                "current": True,
+            }
+            versions.insert(0, current_payload)
             self.send_json({"versions": versions})
             return
         if method == "GET":
@@ -3804,6 +3887,8 @@ class App(BaseHTTPRequestHandler):
                 imported["errors"].append({"row": row_index, "message": "Could not identify CRF/form"})
                 continue
             schema = load_json(form["schema_json"], {"fields": []})
+            form_snapshot = form_schema_snapshot(form, schema)
+            form_version = int(form.get("version") or 1)
             data = {}
             for field in schema.get("fields", []):
                 field_code = field.get("code", "")
@@ -3816,6 +3901,8 @@ class App(BaseHTTPRequestHandler):
             if issues:
                 imported["errors"].append({"row": row_index, "message": "Validation failed", "issues": issues})
                 continue
+            digest = entry_hash(cleaned, form_version, form_snapshot)
+            snapshot_json = json.dumps(form_snapshot, sort_keys=True)
             event_code = normalize_code(str(raw.get("event_code") or raw.get("event_name") or "baseline"))
             event = events_by_code.get(event_code) or events_by_code.get("baseline")
             event_id = event["id"] if event else None
@@ -3827,14 +3914,17 @@ class App(BaseHTTPRequestHandler):
                 if existing.get("locked_at"):
                     imported["errors"].append({"row": row_index, "message": "Existing CRF is locked"})
                     continue
-                conn.execute("UPDATE entries SET event_id = ?, data_json = ?, status = ?, updated_by = ?, updated_at = ? WHERE id = ?", (event_id, json.dumps(cleaned), status, user["id"], timestamp, existing["id"]))
+                conn.execute(
+                    "UPDATE entries SET event_id = ?, data_json = ?, status = ?, form_version = ?, schema_snapshot_json = ?, entry_hash = ?, updated_by = ?, updated_at = ? WHERE id = ?",
+                    (event_id, json.dumps(cleaned), status, form_version, snapshot_json, digest, user["id"], timestamp, existing["id"]),
+                )
                 after = row(conn, "SELECT * FROM entries WHERE id = ?", (existing["id"],))
                 audit(conn, user["id"], "import_update", "entry", existing["id"], existing, after)
                 imported["entries_updated"] += 1
             else:
                 cur = conn.execute(
-                    "INSERT INTO entries(study_id, participant_id, form_id, event_id, event_name, repeat_instance, status, data_json, created_by, updated_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (study_id, participant["id"], form["id"], event_id, event_name, repeat_instance, status, json.dumps(cleaned), user["id"], user["id"], timestamp, timestamp),
+                    "INSERT INTO entries(study_id, participant_id, form_id, event_id, event_name, repeat_instance, status, data_json, form_version, schema_snapshot_json, entry_hash, created_by, updated_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (study_id, participant["id"], form["id"], event_id, event_name, repeat_instance, status, json.dumps(cleaned), form_version, snapshot_json, digest, user["id"], user["id"], timestamp, timestamp),
                 )
                 after = row(conn, "SELECT * FROM entries WHERE id = ?", (cur.lastrowid,))
                 audit(conn, user["id"], "import_create", "entry", cur.lastrowid, None, after)
@@ -3932,6 +4022,7 @@ class App(BaseHTTPRequestHandler):
             entries = rows(conn, sql + " ORDER BY entries.updated_at DESC", params)
             for entry in entries:
                 entry["data"] = load_json(entry.pop("data_json"), {})
+                entry["schema_snapshot"] = load_json(entry.pop("schema_snapshot_json"), {})
             self.send_json({"entries": entries})
             return
         if method == "POST":
@@ -3967,6 +4058,8 @@ class App(BaseHTTPRequestHandler):
                 self.send_error_json("Participant is outside your data access group", 403)
                 return
             schema = load_json(form["schema_json"], {"fields": []})
+            snapshot = form_schema_snapshot(form, schema)
+            form_version = int(form.get("version") or 1)
             if repeat_instance > 1 and not schema.get("repeatable"):
                 self.send_error_json("This CRF is not configured as repeatable", 400)
                 return
@@ -3974,6 +4067,8 @@ class App(BaseHTTPRequestHandler):
             if issues:
                 self.send_json({"errors": issues}, 422)
                 return
+            digest = entry_hash(cleaned, form_version, snapshot)
+            snapshot_json = json.dumps(snapshot, sort_keys=True)
             existing = row(conn, "SELECT * FROM entries WHERE participant_id = ? AND form_id = ? AND event_name = ? AND repeat_instance = ?", (participant_id, form_id, event_name, repeat_instance))
             if existing:
                 if existing.get("locked_at"):
@@ -3983,8 +4078,8 @@ class App(BaseHTTPRequestHandler):
                         return
                 before = existing
                 conn.execute(
-                    "UPDATE entries SET event_id = ?, data_json = ?, status = ?, updated_by = ?, updated_at = ?, locked_at = NULL, locked_by = NULL, lock_reason = '' WHERE id = ?",
-                    (event_id, json.dumps(cleaned), status, user["id"], timestamp, existing["id"]),
+                    "UPDATE entries SET event_id = ?, data_json = ?, status = ?, form_version = ?, schema_snapshot_json = ?, entry_hash = ?, updated_by = ?, updated_at = ?, locked_at = NULL, locked_by = NULL, lock_reason = '' WHERE id = ?",
+                    (event_id, json.dumps(cleaned), status, form_version, snapshot_json, digest, user["id"], timestamp, existing["id"]),
                 )
                 after = row(conn, "SELECT * FROM entries WHERE id = ?", (existing["id"],))
                 audit(conn, user["id"], "update", "entry", existing["id"], before, {"entry": after, "change_reason": payload.get("change_reason", "")})
@@ -3992,8 +4087,8 @@ class App(BaseHTTPRequestHandler):
                 self.send_json({"entry": after})
                 return
             cur = conn.execute(
-                "INSERT INTO entries(study_id, participant_id, form_id, event_id, event_name, repeat_instance, status, data_json, created_by, updated_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (study_id, participant_id, form_id, event_id, event_name, repeat_instance, status, json.dumps(cleaned), user["id"], user["id"], timestamp, timestamp),
+                "INSERT INTO entries(study_id, participant_id, form_id, event_id, event_name, repeat_instance, status, data_json, form_version, schema_snapshot_json, entry_hash, created_by, updated_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (study_id, participant_id, form_id, event_id, event_name, repeat_instance, status, json.dumps(cleaned), form_version, snapshot_json, digest, user["id"], user["id"], timestamp, timestamp),
             )
             after = row(conn, "SELECT * FROM entries WHERE id = ?", (cur.lastrowid,))
             audit(conn, user["id"], "create", "entry", cur.lastrowid, None, after)
@@ -4863,7 +4958,7 @@ class App(BaseHTTPRequestHandler):
         )
         issues = []
         for entry in entries:
-            schema = load_json(entry["schema_json"], {"fields": []})
+            schema = schema_for_entry(entry, load_json(entry["schema_json"], {"fields": []}))
             data = load_json(entry["data_json"], {})
             _, entry_issues = validate_entry_data(schema, data)
             for issue in entry_issues:
@@ -4920,7 +5015,7 @@ class App(BaseHTTPRequestHandler):
         for entry in entries:
             if entry["status"] == "complete":
                 completed += 1
-            schema = load_json(entry["schema_json"], {"fields": []})
+            schema = schema_for_entry(entry, load_json(entry["schema_json"], {"fields": []}))
             data = load_json(entry["data_json"], {})
             for field in schema.get("fields", []):
                 code = field.get("code")
@@ -4974,7 +5069,7 @@ class App(BaseHTTPRequestHandler):
         quality_rows = rows(
             conn,
             f"""
-            SELECT entries.data_json, forms.schema_json
+            SELECT entries.data_json, entries.schema_snapshot_json, forms.schema_json
             FROM entries
             JOIN forms ON forms.id = entries.form_id
             {group_join}
@@ -4983,7 +5078,7 @@ class App(BaseHTTPRequestHandler):
             tuple(params),
         )
         for entry in quality_rows:
-            _, issues = validate_entry_data(load_json(entry["schema_json"], {"fields": []}), load_json(entry["data_json"], {}))
+            _, issues = validate_entry_data(schema_for_entry(entry, load_json(entry["schema_json"], {"fields": []})), load_json(entry["data_json"], {}))
             issue_count += len(issues)
         warnings = []
         if open_queries:
@@ -5024,11 +5119,6 @@ class App(BaseHTTPRequestHandler):
 
     def record_payload(self, conn, study_id: int, membership, filters: dict) -> list[dict]:
         deidentified = bool(filters.get("deidentified")) or membership.get("role") == "analyst"
-        forms = rows(conn, "SELECT * FROM forms WHERE study_id = ? ORDER BY id", (study_id,))
-        field_codes = []
-        for form in forms:
-            for field in load_json(form["schema_json"], {"fields": []}).get("fields", []):
-                field_codes.append(f"{form['code']}__{field.get('code')}")
         where = ["entries.study_id = ?"]
         params: list = [study_id]
         if filters.get("participant_status"):
@@ -5048,7 +5138,7 @@ class App(BaseHTTPRequestHandler):
             params.append(membership["data_group_id"])
         sql = f"""
             SELECT entries.*, participants.study_uid, participants.initials, participants.status AS participant_status,
-                   forms.name AS form_name, forms.code AS form_code,
+                   forms.name AS form_name, forms.code AS form_code, forms.schema_json, forms.version AS current_form_version,
                    study_events.name AS mapped_event_name, study_events.code AS event_code
             FROM entries
             JOIN participants ON participants.id = entries.participant_id
@@ -5061,6 +5151,11 @@ class App(BaseHTTPRequestHandler):
         export_ids: dict[int, str] = {}
         for entry in rows(conn, sql, tuple(params)):
             data = load_json(entry["data_json"], {})
+            snapshot = load_json(entry.get("schema_snapshot_json"), {})
+            schema = schema_for_entry(entry, load_json(entry["schema_json"], {"fields": []}))
+            form_code = snapshot.get("form_code") or entry["form_code"]
+            captured_version = int(entry.get("form_version") or snapshot.get("form_version") or 1)
+            current_version = int(entry.get("current_form_version") or captured_version)
             export_ids.setdefault(entry["participant_id"], f"EXP{len(export_ids) + 1:05d}")
             record = {
                 "study_uid": export_ids[entry["participant_id"]] if deidentified else entry["study_uid"],
@@ -5070,19 +5165,24 @@ class App(BaseHTTPRequestHandler):
                 "event_code": entry.get("event_code") or entry["event_name"],
                 "repeat_instance": entry["repeat_instance"],
                 "form_name": entry["form_name"],
+                "form_version": captured_version,
+                "form_version_warning": "older_form_version" if captured_version < current_version else "",
                 "entry_status": entry["status"],
                 "locked": "yes" if entry["locked_at"] else "no",
             }
-            for code in field_codes:
-                prefix, field_code = code.split("__", 1)
-                value = data.get(field_code, "") if prefix == entry["form_code"] else ""
+            for field in schema.get("fields", []):
+                field_code = field.get("code", "")
+                if not field_code:
+                    continue
+                code = f"{form_code}__{field_code}"
+                value = data.get(field_code, "")
                 record[code] = deidentify_for_ai(str(value), record["study_uid"]) if deidentified and isinstance(value, str) else value
             payload.append(record)
         return payload
 
     def export_entries_csv(self, conn, study_id: int, membership, filters: dict, filename: str) -> None:
         records = self.record_payload(conn, study_id, membership, filters)
-        fieldnames = list(records[0].keys()) if records else ["study_uid", "initials", "participant_status", "event_name", "event_code", "repeat_instance", "form_name", "entry_status", "locked"]
+        fieldnames = list(dict.fromkeys(key for record in records for key in record.keys())) if records else ["study_uid", "initials", "participant_status", "event_name", "event_code", "repeat_instance", "form_name", "form_version", "form_version_warning", "entry_status", "locked"]
         text_lines = []
         class Sink:
             def write(self, value):

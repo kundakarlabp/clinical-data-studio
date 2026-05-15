@@ -565,6 +565,7 @@ function dataView() {
 
 function entryCard(participant, form, selectedEvent) {
   const existing = state.entries.find((entry) => entry.participant_id === participant.id && entry.form_id === form.id && (entry.event_id === selectedEvent?.id || (!entry.event_id && entry.event_name === (selectedEvent?.code || "Baseline")))) || { data: {}, status: "draft", event_name: selectedEvent?.code || "Baseline", event_id: selectedEvent?.id || null, repeat_instance: 1 };
+  const schema = existing.schema_snapshot?.fields?.length ? { fields: existing.schema_snapshot.fields, repeatable: existing.schema_snapshot.repeatable } : form.schema;
   const locked = Boolean(existing.locked_at);
   const draftKey = window.CDSOfflineDrafts?.entryKey({ studyId: state.studyId, participantId: participant.id, formId: form.id, eventId: selectedEvent?.id || null, repeatInstance: existing.repeat_instance || 1 }) || "";
   return `
@@ -573,14 +574,16 @@ function entryCard(participant, form, selectedEvent) {
         <div>
           <h3>${escapeHtml(form.name)}</h3>
           <span class="pill ${existing.status === "complete" ? "ok" : "warn"}">${escapeHtml(existing.status)}</span>
+          <span class="pill">CRF v${escapeHtml(existing.form_version || form.version || 1)}</span>
+          ${existing.form_version && form.version && existing.form_version < form.version ? `<span class="pill warn">older schema</span>` : ""}
           ${locked ? `<span class="pill ok">locked</span>` : ""}
           <span class="pill draft-status" data-draft-status>Synced</span>
         </div>
         <label>Event<input name="event_name" value="${escapeHtml(selectedEvent?.name || existing.event_name || "Baseline")}" readonly /></label>
       </div>
       <input type="hidden" name="event_id" value="${escapeHtml(selectedEvent?.id || "")}" />
-      <label>Repeat instance<input name="repeat_instance" type="number" min="1" value="${escapeHtml(existing.repeat_instance || 1)}" ${form.schema.repeatable ? "" : "readonly"} /></label>
-      ${form.schema.fields.map((field) => fieldInput(field, existing.data)).join("")}
+      <label>Repeat instance<input name="repeat_instance" type="number" min="1" value="${escapeHtml(existing.repeat_instance || 1)}" ${schema.repeatable ? "" : "readonly"} /></label>
+      ${schema.fields.map((field) => fieldInput(field, existing.data)).join("")}
       <label>Status
         <select name="status">
           <option value="draft" ${existing.status === "draft" ? "selected" : ""}>draft</option>
@@ -592,7 +595,7 @@ function entryCard(participant, form, selectedEvent) {
         <div class="form-grid">
           <label>Field review
             <select name="review_field_code">
-              ${form.schema.fields.map((field) => `<option value="${field.code}">${escapeHtml(field.label)}</option>`).join("")}
+              ${schema.fields.map((field) => `<option value="${field.code}">${escapeHtml(field.label)}</option>`).join("")}
             </select>
           </label>
           <label>Reason<input name="field_state_reason" placeholder="Review note" /></label>
@@ -2495,7 +2498,13 @@ async function showEntryHistory(entryId) {
 async function showFormVersions(formId) {
   try {
     const result = await api(`/api/studies/${state.studyId}/forms/${formId}/versions`);
-    const lines = result.versions.map((item) => `v${item.version} saved ${fmtTime(item.saved_at)}`).join("\\n");
+    const lines = result.versions.map((item) => {
+      const diff = item.diff_to_current || {};
+      const added = (diff.fields_added || []).length ? ` added: ${(diff.fields_added || []).join(", ")}` : "";
+      const removed = (diff.fields_removed || []).length ? ` removed: ${(diff.fields_removed || []).join(", ")}` : "";
+      const changed = (diff.fields_changed || []).length ? ` changed: ${(diff.fields_changed || []).map((change) => change.field).join(", ")}` : "";
+      return `v${item.version}${item.current ? " current" : ""} saved ${fmtTime(item.saved_at)}${added}${removed}${changed}`;
+    }).join("\\n");
     alert(lines || "No prior versions saved.");
   } catch (error) {
     state.error = error.message;
@@ -2526,7 +2535,9 @@ async function collectEntryPayload(form) {
   const data = {};
   const payload = Object.fromEntries(new FormData(form));
   const formDef = state.forms.find((item) => item.id === Number(form.dataset.formId));
-  for (const field of formDef.schema.fields) {
+  const existing = state.entries.find((entry) => entry.participant_id === Number(form.dataset.participantId) && entry.form_id === Number(form.dataset.formId));
+  const schema = existing?.schema_snapshot?.fields?.length ? { fields: existing.schema_snapshot.fields, repeatable: existing.schema_snapshot.repeatable } : formDef.schema;
+  for (const field of schema.fields) {
     if (!form.querySelector(`[name="${field.code}"]`)?.closest(".hidden")) {
       if (field.type === "checkbox") {
         data[field.code] = [...form.querySelectorAll(`[name="${field.code}"]:checked`)].map((item) => item.value);
@@ -2535,7 +2546,6 @@ async function collectEntryPayload(form) {
         if (file) {
           data[field.code] = await fileToPayload(file);
         } else {
-          const existing = state.entries.find((entry) => entry.participant_id === Number(form.dataset.participantId) && entry.form_id === Number(form.dataset.formId));
           data[field.code] = existing?.data?.[field.code] || "";
         }
       } else {

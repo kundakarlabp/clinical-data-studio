@@ -320,6 +320,78 @@ class ApiSmokeTests(unittest.TestCase):
         history = self.request_json(f"/api/studies/{study_id}/entries/{entry['id']}/history", token=token)
         self.assertTrue(history["history"])
 
+    def test_entry_schema_snapshot_survives_crf_version_change_and_export(self):
+        token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]
+        study_id = self.request_json("/api/studies", token=token)["studies"][0]["id"]
+        form = self.request_json(
+            f"/api/studies/{study_id}/forms",
+            "POST",
+            {
+                "name": "Versioned CRF",
+                "code": "versioned_crf",
+                "schema": {"fields": [{"code": "old_field", "label": "Old Field", "type": "text", "required": True}]},
+            },
+            token,
+        )["form"]
+        participant_one = self.request_json(
+            f"/api/studies/{study_id}/participants",
+            "POST",
+            {"study_uid": "VERS001", "initials": "V1", "status": "enrolled"},
+            token,
+        )["participant"]
+        old_entry = self.request_json(
+            f"/api/studies/{study_id}/entries",
+            "POST",
+            {"participant_id": participant_one["id"], "form_id": form["id"], "status": "complete", "data": {"old_field": "kept value"}},
+            token,
+        )["entry"]
+        self.assertEqual(old_entry["form_version"], 1)
+        with closing(server.db()) as conn:
+            stored_old = server.row(conn, "SELECT form_version, schema_snapshot_json, entry_hash FROM entries WHERE id = ?", (old_entry["id"],))
+        self.assertEqual(stored_old["form_version"], 1)
+        self.assertIn("old_field", stored_old["schema_snapshot_json"])
+        self.assertTrue(stored_old["entry_hash"])
+
+        self.request_json(
+            f"/api/studies/{study_id}/forms/{form['id']}",
+            "PATCH",
+            {
+                "name": "Versioned CRF",
+                "code": "versioned_crf",
+                "schema": {"fields": [{"code": "new_field", "label": "New Field", "type": "text", "required": False}]},
+            },
+            token,
+        )
+        participant_two = self.request_json(
+            f"/api/studies/{study_id}/participants",
+            "POST",
+            {"study_uid": "VERS002", "initials": "V2", "status": "enrolled"},
+            token,
+        )["participant"]
+        new_entry = self.request_json(
+            f"/api/studies/{study_id}/entries",
+            "POST",
+            {"participant_id": participant_two["id"], "form_id": form["id"], "status": "complete", "data": {"new_field": "new value"}},
+            token,
+        )["entry"]
+        self.assertEqual(new_entry["form_version"], 2)
+
+        entries = self.request_json(f"/api/studies/{study_id}/entries", token=token)["entries"]
+        rendered_old = next(item for item in entries if item["id"] == old_entry["id"])
+        rendered_new = next(item for item in entries if item["id"] == new_entry["id"])
+        self.assertEqual(rendered_old["schema_snapshot"]["fields"][0]["code"], "old_field")
+        self.assertEqual(rendered_new["schema_snapshot"]["fields"][0]["code"], "new_field")
+
+        versions = self.request_json(f"/api/studies/{study_id}/forms/{form['id']}/versions", token=token)["versions"]
+        self.assertTrue(any("old_field" in item["diff_to_current"]["fields_removed"] for item in versions if not item.get("current")))
+        _, csv_type, csv_body = self.request_raw(f"/api/studies/{study_id}/export", token=token)
+        csv_text = csv_body.decode("utf-8-sig")
+        self.assertIn("text/csv", csv_type)
+        self.assertIn("versioned_crf__old_field", csv_text)
+        self.assertIn("versioned_crf__new_field", csv_text)
+        self.assertIn("kept value", csv_text)
+        self.assertIn("older_form_version", csv_text)
+
     def test_case_intake_groups_unstructured_cases_and_exports(self):
         token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]
         study_id = self.request_json("/api/studies", token=token)["studies"][0]["id"]

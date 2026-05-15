@@ -533,6 +533,20 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertEqual(academic["metrics"]["case_count"], 1)
         self.assertTrue(academic["opportunities"])
         self.assertIn("cv_markdown", academic)
+        output = self.request_json(
+            f"/api/studies/{study_id}/academic/outputs",
+            "POST",
+            {
+                "output_type": "abstract_draft",
+                "title": "Influenza pneumonia retrospective abstract",
+                "status": "drafting",
+                "linked_case_id": created["id"],
+                "dataset_ref": "case_intake_export",
+                "notes": "Novelty requires manual literature review.",
+            },
+            token,
+        )["output"]
+        self.assertEqual(output["output_type"], "abstract_draft")
         cv_item = self.request_json(
             f"/api/studies/{study_id}/academic/cv-items",
             "POST",
@@ -549,9 +563,12 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertEqual(cv_item["title"], "Influenza pneumonia case report")
         updated_academic = self.request_json(f"/api/studies/{study_id}/academic", token=token)["academic"]
         self.assertEqual(updated_academic["metrics"]["cv_item_count"], 1)
+        self.assertEqual(updated_academic["metrics"]["output_count"], 1)
+        self.assertIn("abstract_draft", {item["output_type"] for item in updated_academic["outputs"]})
         _, md_type, md_body = self.request_raw(f"/api/studies/{study_id}/academic/export?format=md", token=token)
         self.assertIn("text/markdown", md_type)
         self.assertIn(b"Influenza pneumonia case report", md_body)
+        self.assertIn(b"Influenza pneumonia retrospective abstract", md_body)
 
     def test_ai_safety_workbench_audit_and_permissions(self):
         token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]

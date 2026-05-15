@@ -26,6 +26,7 @@ INSERT_ID_TABLES = {
     "audit_log",
     "reports",
     "academic_cv_items",
+    "academic_outputs",
     "case_intakes",
     "case_files",
     "case_ai_reviews",
@@ -465,6 +466,24 @@ CREATE TABLE IF NOT EXISTS academic_cv_items (
     created_at BIGINT NOT NULL,
     updated_at BIGINT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS academic_outputs (
+    id BIGSERIAL PRIMARY KEY,
+    study_id BIGINT NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+    output_type TEXT NOT NULL DEFAULT 'publication_idea',
+    title TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'idea',
+    linked_case_id BIGINT REFERENCES case_intakes(id) ON DELETE SET NULL,
+    participant_ids_json TEXT NOT NULL DEFAULT '[]',
+    evidence_file_ids_json TEXT NOT NULL DEFAULT '[]',
+    dataset_ref TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    active INTEGER NOT NULL DEFAULT 1,
+    created_by BIGINT REFERENCES users(id),
+    updated_by BIGINT REFERENCES users(id),
+    created_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS api_tokens (
     id BIGSERIAL PRIMARY KEY,
     study_id BIGINT NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
@@ -513,6 +532,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_user_id ON audit_log(user_id);
 CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON audit_log(created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_log_entity ON audit_log(entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_academic_cv_items_study_id ON academic_cv_items(study_id);
+CREATE INDEX IF NOT EXISTS idx_academic_outputs_study_id ON academic_outputs(study_id);
 CREATE INDEX IF NOT EXISTS idx_ai_audit_study_id ON ai_audit(study_id);
 CREATE INDEX IF NOT EXISTS idx_ai_audit_user_id ON ai_audit(user_id);
 CREATE INDEX IF NOT EXISTS idx_api_tokens_study_id ON api_tokens(study_id);

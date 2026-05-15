@@ -1306,6 +1306,8 @@ function academicView() {
   const metrics = academic.metrics || {};
   const opportunities = academic.opportunities || [];
   const cvItems = academic.cv_items || [];
+  const outputs = academic.outputs || [];
+  const outputTypes = academic.output_types || [];
   const aiAudit = academic.ai_audit || [];
   const promptTemplates = academic.prompt_templates || [];
   const ai = academic.ai || { provider: "local", model: "local-rules", external_ai_enabled: false, phi_allowed: false, multimodal_enabled: false };
@@ -1313,6 +1315,7 @@ function academicView() {
     <section class="metrics-grid">
       ${metric("Captured Cases", metrics.case_count || 0, "Messy evidence organized")}
       ${metric("Opportunities", metrics.opportunity_count || 0, "Case report/series leads")}
+      ${metric("Academic Outputs", metrics.output_count || 0, "Ideas, abstracts, posters, audits")}
       ${metric("CV Items", metrics.cv_item_count || 0, "Academic outputs tracked")}
       ${metric("AI Reviews", metrics.ai_review_count || 0, "Audited academic AI reviews")}
     </section>
@@ -1392,6 +1395,47 @@ function academicView() {
                 </td>
               </tr>
             `).join("") || `<tr><td colspan="5">Add cases in Case Intake to generate publication opportunities.</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+    </section>
+    <section class="panel">
+      <h2>Academic Output Tracker</h2>
+      <form id="academic-output-form" class="form-grid">
+        <label>Output type
+          <select name="output_type">
+            ${outputTypes.map((value) => `<option value="${value}">${escapeHtml(value.replaceAll("_", " "))}</option>`).join("")}
+          </select>
+        </label>
+        <label>Title<input name="title" required placeholder="Retrospective influenza pneumonia case series" /></label>
+        <label>Status
+          <select name="status">
+            ${["idea", "planning", "drafting", "submitted", "accepted", "completed"].map((value) => `<option value="${value}">${escapeHtml(value)}</option>`).join("")}
+          </select>
+        </label>
+        <label>Linked case
+          <select name="linked_case_id">
+            <option value="">Not linked</option>
+            ${(state.caseIntake?.cases || []).map((item) => `<option value="${item.id}">${escapeHtml(item.case_uid)} - ${escapeHtml(item.title)}</option>`).join("")}
+          </select>
+        </label>
+        <label class="full">Dataset / export reference<input name="dataset_ref" placeholder="Dataset name, export date, registry subset, or analysis table" /></label>
+        <label class="full">Notes<textarea name="notes" placeholder="Missing data, ethics/consent, target conference, journal category, next action"></textarea></label>
+        <div class="full"><button class="secondary">Save Academic Output</button></div>
+      </form>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Output</th><th>Status</th><th>Linked Case</th><th>Dataset</th><th>Notes</th></tr></thead>
+          <tbody>
+            ${outputs.map((item) => `
+              <tr>
+                <td><strong>${escapeHtml(item.title)}</strong><br><span class="small">${escapeHtml((item.output_type || "").replaceAll("_", " "))}</span></td>
+                <td><span class="pill">${escapeHtml(item.status || "")}</span></td>
+                <td>${escapeHtml(item.linked_case_uid || "")}</td>
+                <td>${escapeHtml(item.dataset_ref || "")}</td>
+                <td>${escapeHtml(item.notes || "")}<br><span class="small">${escapeHtml(item.updated_by_name || "")} ${fmtTime(item.updated_at)}</span></td>
+              </tr>
+            `).join("") || `<tr><td colspan="5">No academic outputs yet.</td></tr>`}
           </tbody>
         </table>
       </div>
@@ -1855,6 +1899,7 @@ function bindRoute() {
   document.querySelector("#invitation-form")?.addEventListener("submit", submitInvitation);
   document.querySelectorAll("[data-invitation-action]").forEach((button) => button.addEventListener("click", () => updateInvitation(button.dataset.invitationId, button.dataset.invitationAction)));
   document.querySelector("#report-form")?.addEventListener("submit", submitReport);
+  document.querySelector("#academic-output-form")?.addEventListener("submit", submitAcademicOutput);
   document.querySelector("#academic-cv-form")?.addEventListener("submit", submitAcademicCvItem);
   document.querySelector("#ai-safety-form")?.addEventListener("submit", submitAiSafetyPreview);
   document.querySelector("#ai-workbench-form")?.addEventListener("submit", submitAiWorkbench);
@@ -2303,6 +2348,31 @@ async function submitAcademicCvItem(event) {
     });
     event.target.reset();
     state.error = "Academic CV item saved.";
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function submitAcademicOutput(event) {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(event.target));
+  try {
+    await api(`/api/studies/${state.studyId}/academic/outputs`, {
+      method: "POST",
+      body: JSON.stringify({
+        output_type: data.output_type,
+        title: data.title,
+        status: data.status,
+        linked_case_id: data.linked_case_id ? Number(data.linked_case_id) : null,
+        dataset_ref: data.dataset_ref || "",
+        notes: data.notes || "",
+      }),
+    });
+    event.target.reset();
+    state.error = "Academic output saved.";
     await loadStudy();
     render();
   } catch (error) {

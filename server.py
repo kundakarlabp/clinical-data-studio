@@ -76,6 +76,17 @@ API_TOKEN_SCOPES = {
     "ai:use",
 }
 DEFAULT_API_TOKEN_SCOPES = sorted(API_TOKEN_SCOPES)
+ACADEMIC_OUTPUT_TYPES = {
+    "publication_idea",
+    "abstract_draft",
+    "manuscript_draft",
+    "conference_submission",
+    "poster",
+    "audit_project",
+    "teaching_session",
+    "grant_proposal",
+    "cv_item",
+}
 SETTINGS.log_dir.mkdir(parents=True, exist_ok=True)
 LOG_FILE = SETTINGS.log_dir / "clinical-data-studio.log"
 logging.basicConfig(
@@ -842,6 +853,7 @@ STUDY_AUDIT_FILTER = """
     OR (audit_log.entity_type = 'survey_invitation' AND audit_log.entity_id IN (SELECT id FROM survey_invitations WHERE study_id = ?))
     OR (audit_log.entity_type = 'report' AND audit_log.entity_id IN (SELECT id FROM reports WHERE study_id = ?))
     OR (audit_log.entity_type = 'academic_cv_item' AND audit_log.entity_id IN (SELECT id FROM academic_cv_items WHERE study_id = ?))
+    OR (audit_log.entity_type = 'academic_output' AND audit_log.entity_id IN (SELECT id FROM academic_outputs WHERE study_id = ?))
     OR (audit_log.entity_type = 'case_intake' AND audit_log.entity_id IN (SELECT id FROM case_intakes WHERE study_id = ?))
     OR (audit_log.entity_type = 'case_ai_review' AND audit_log.entity_id IN (SELECT id FROM case_ai_reviews WHERE study_id = ?))
     OR (audit_log.entity_type = 'ai_audit' AND audit_log.entity_id IN (SELECT id FROM ai_audit WHERE study_id = ?))
@@ -1214,6 +1226,25 @@ def migrate() -> None:
                 updated_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS academic_outputs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+                output_type TEXT NOT NULL DEFAULT 'publication_idea',
+                title TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'idea',
+                linked_case_id INTEGER REFERENCES case_intakes(id) ON DELETE SET NULL,
+                participant_ids_json TEXT NOT NULL DEFAULT '[]',
+                evidence_file_ids_json TEXT NOT NULL DEFAULT '[]',
+                dataset_ref TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                active INTEGER NOT NULL DEFAULT 1,
+                created_by INTEGER REFERENCES users(id),
+                updated_by INTEGER REFERENCES users(id),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS api_tokens (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
@@ -1273,6 +1304,7 @@ def migrate() -> None:
         add_column(conn, "case_files", "original_filename", "TEXT NOT NULL DEFAULT ''")
         add_column(conn, "case_files", "stored_filename", "TEXT NOT NULL DEFAULT ''")
         add_column(conn, "case_files", "sha256", "TEXT NOT NULL DEFAULT ''")
+        add_column(conn, "academic_outputs", "active", "INTEGER NOT NULL DEFAULT 1")
         migrate_entries_unique_key(conn)
         seed_initial_data(conn)
         add_production_indexes(conn)
@@ -1318,6 +1350,7 @@ def add_production_indexes(conn) -> None:
         "CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON audit_log(created_at)",
         "CREATE INDEX IF NOT EXISTS idx_audit_log_entity ON audit_log(entity_type, entity_id)",
         "CREATE INDEX IF NOT EXISTS idx_academic_cv_items_study_id ON academic_cv_items(study_id)",
+        "CREATE INDEX IF NOT EXISTS idx_academic_outputs_study_id ON academic_outputs(study_id)",
         "CREATE INDEX IF NOT EXISTS idx_ai_audit_study_id ON ai_audit(study_id)",
         "CREATE INDEX IF NOT EXISTS idx_ai_audit_user_id ON ai_audit(user_id)",
         "CREATE INDEX IF NOT EXISTS idx_api_tokens_study_id ON api_tokens(study_id)",
@@ -2174,7 +2207,8 @@ def publication_opportunities(case_items: list[dict]) -> list[dict]:
     return sorted(opportunities, key=lambda item: (-item["case_count"], item["group"]))
 
 
-def academic_cv_markdown(study: dict, cv_items: list[dict], opportunities: list[dict]) -> str:
+def academic_cv_markdown(study: dict, cv_items: list[dict], opportunities: list[dict], outputs: list[dict] | None = None) -> str:
+    outputs = outputs or []
     lines = [
         f"# Academic Portfolio - {study['name']}",
         "",
@@ -2193,6 +2227,13 @@ def academic_cv_markdown(study: dict, cv_items: list[dict], opportunities: list[
             )
     else:
         lines.append("- No case-based publication opportunities have been generated yet.")
+    lines.extend(["", "## Academic Outputs", ""])
+    if outputs:
+        for item in outputs:
+            case_link = f" Linked case: {item.get('linked_case_uid')}." if item.get("linked_case_uid") else ""
+            lines.append(f"- **{item['title']}**. {item['output_type']} / {item['status']}.{case_link} {item.get('notes') or ''}".strip())
+    else:
+        lines.append("- Track publication ideas, abstracts, manuscripts, posters, audits, teaching, and grants here.")
     lines.extend(["", "## CV Items", ""])
     if cv_items:
         for item in cv_items:
@@ -5701,10 +5742,30 @@ class App(BaseHTTPRequestHandler):
             item["metadata"] = load_json(item.pop("metadata_json"), {})
         return data
 
+    def academic_output_rows(self, conn, study_id: int) -> list[dict]:
+        data = rows(
+            conn,
+            """
+            SELECT academic_outputs.*, case_intakes.case_uid AS linked_case_uid, case_intakes.title AS linked_case_title, users.display_name AS updated_by_name
+            FROM academic_outputs
+            LEFT JOIN case_intakes ON case_intakes.id = academic_outputs.linked_case_id
+            LEFT JOIN users ON users.id = academic_outputs.updated_by
+            WHERE academic_outputs.study_id = ? AND academic_outputs.active = 1
+            ORDER BY academic_outputs.updated_at DESC, academic_outputs.id DESC
+            """,
+            (study_id,),
+        )
+        for item in data:
+            item["participant_ids"] = load_json(item.pop("participant_ids_json"), [])
+            item["evidence_file_ids"] = load_json(item.pop("evidence_file_ids_json"), [])
+            item["metadata"] = load_json(item.pop("metadata_json"), {})
+        return data
+
     def academic_payload(self, conn, study_id: int, membership: dict | None = None, user: dict | None = None) -> dict:
         study = row(conn, "SELECT * FROM studies WHERE id = ?", (study_id,))
         cases = self.case_rows(conn, study_id, membership, user)
         cv_items = self.academic_cv_rows(conn, study_id)
+        outputs = self.academic_output_rows(conn, study_id)
         opportunities = publication_opportunities(cases)
         ai_review_count = row(conn, "SELECT COUNT(*) AS count FROM case_ai_reviews WHERE study_id = ?", (study_id,))["count"]
         report_count = row(conn, "SELECT COUNT(*) AS count FROM reports WHERE study_id = ?", (study_id,))["count"]
@@ -5714,11 +5775,14 @@ class App(BaseHTTPRequestHandler):
                 "case_count": len(cases),
                 "opportunity_count": len(opportunities),
                 "cv_item_count": len(cv_items),
+                "output_count": len(outputs),
                 "ai_review_count": ai_review_count,
                 "report_count": report_count,
             },
             "opportunities": opportunities,
             "cv_items": cv_items,
+            "outputs": outputs,
+            "output_types": sorted(ACADEMIC_OUTPUT_TYPES),
             "ai_audit": ai_audit,
             "prompt_templates": [
                 {"purpose": "case_summary", "label": "Case note to structured summary"},
@@ -5727,7 +5791,7 @@ class App(BaseHTTPRequestHandler):
                 {"purpose": "publication_idea", "label": "Case set publication ideas"},
                 {"purpose": "cv_item", "label": "Academic activity to CV item"},
             ],
-            "cv_markdown": academic_cv_markdown(study, cv_items, opportunities),
+            "cv_markdown": academic_cv_markdown(study, cv_items, opportunities, outputs),
             "ai": ai_status(),
             "guidance": [
                 "Use Case Intake for messy notes, photos, audio, PDFs, and scanned case details.",
@@ -5770,6 +5834,108 @@ class App(BaseHTTPRequestHandler):
             self.send_header("content-length", str(len(content)))
             self.end_headers()
             self.wfile.write(content)
+            return
+        if method == "POST" and len(parts) == 5 and parts[4] == "outputs":
+            payload = self.body()
+            timestamp = now()
+            title = str(payload.get("title", "")).strip()
+            if not title:
+                self.send_error_json("Academic output title is required", 400)
+                return
+            output_type = normalize_code(str(payload.get("output_type", "publication_idea"))) or "publication_idea"
+            if output_type not in ACADEMIC_OUTPUT_TYPES:
+                self.send_error_json("Unsupported academic output type", 400)
+                return
+            linked_case_id = int(payload.get("linked_case_id") or 0) or None
+            if linked_case_id and not row(conn, "SELECT id FROM case_intakes WHERE id = ? AND study_id = ?", (linked_case_id, study_id)):
+                self.send_error_json("Linked case not found", 404)
+                return
+            participant_ids = [int(value) for value in payload.get("participant_ids", []) if str(value).strip().isdigit()]
+            evidence_file_ids = [int(value) for value in payload.get("evidence_file_ids", []) if str(value).strip().isdigit()]
+            if participant_ids:
+                found = row(conn, f"SELECT COUNT(*) AS count FROM participants WHERE study_id = ? AND id IN ({','.join('?' for _ in participant_ids)})", tuple([study_id, *participant_ids]))["count"]
+                if found != len(set(participant_ids)):
+                    self.send_error_json("One or more linked participants were not found", 404)
+                    return
+            if evidence_file_ids:
+                found = row(conn, f"SELECT COUNT(*) AS count FROM case_files WHERE study_id = ? AND id IN ({','.join('?' for _ in evidence_file_ids)})", tuple([study_id, *evidence_file_ids]))["count"]
+                if found != len(set(evidence_file_ids)):
+                    self.send_error_json("One or more linked evidence files were not found", 404)
+                    return
+            cur = conn.execute(
+                """
+                INSERT INTO academic_outputs(
+                    study_id, output_type, title, status, linked_case_id, participant_ids_json,
+                    evidence_file_ids_json, dataset_ref, notes, metadata_json, active, created_by, updated_by, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                """,
+                (
+                    study_id,
+                    output_type,
+                    title,
+                    normalize_code(str(payload.get("status", "idea")))[:40] or "idea",
+                    linked_case_id,
+                    json.dumps(sorted(set(participant_ids))),
+                    json.dumps(sorted(set(evidence_file_ids))),
+                    str(payload.get("dataset_ref", "")).strip()[:240],
+                    str(payload.get("notes", "")).strip(),
+                    json.dumps(payload.get("metadata", {})),
+                    user["id"],
+                    user["id"],
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            after = row(conn, "SELECT * FROM academic_outputs WHERE id = ?", (cur.lastrowid,))
+            audit(conn, user["id"], "create", "academic_output", cur.lastrowid, None, after, study_id=study_id, **self.audit_context())
+            conn.commit()
+            output = self.academic_output_rows(conn, study_id)[0]
+            self.send_json({"output": output}, 201)
+            return
+        if method == "PATCH" and len(parts) == 6 and parts[4] == "outputs":
+            output_id = int(parts[5])
+            before = row(conn, "SELECT * FROM academic_outputs WHERE id = ? AND study_id = ?", (output_id, study_id))
+            if not before:
+                self.send_error_json("Academic output not found", 404)
+                return
+            payload = self.body()
+            output_type = normalize_code(str(payload.get("output_type", before["output_type"]))) or before["output_type"]
+            if output_type not in ACADEMIC_OUTPUT_TYPES:
+                self.send_error_json("Unsupported academic output type", 400)
+                return
+            linked_case_id = payload.get("linked_case_id", before.get("linked_case_id"))
+            linked_case_id = int(linked_case_id or 0) or None
+            if linked_case_id and not row(conn, "SELECT id FROM case_intakes WHERE id = ? AND study_id = ?", (linked_case_id, study_id)):
+                self.send_error_json("Linked case not found", 404)
+                return
+            timestamp = now()
+            conn.execute(
+                """
+                UPDATE academic_outputs
+                SET output_type = ?, title = ?, status = ?, linked_case_id = ?, dataset_ref = ?, notes = ?, metadata_json = ?, active = ?, updated_by = ?, updated_at = ?
+                WHERE id = ? AND study_id = ?
+                """,
+                (
+                    output_type,
+                    str(payload.get("title", before["title"])).strip() or before["title"],
+                    normalize_code(str(payload.get("status", before["status"])))[:40] or before["status"],
+                    linked_case_id,
+                    str(payload.get("dataset_ref", before["dataset_ref"])).strip()[:240],
+                    str(payload.get("notes", before["notes"])).strip(),
+                    json.dumps(payload.get("metadata", load_json(before["metadata_json"], {}))),
+                    1 if payload.get("active", bool(before["active"])) else 0,
+                    user["id"],
+                    timestamp,
+                    output_id,
+                    study_id,
+                ),
+            )
+            after = row(conn, "SELECT * FROM academic_outputs WHERE id = ?", (output_id,))
+            audit(conn, user["id"], "update", "academic_output", output_id, before, after, study_id=study_id, **self.audit_context())
+            conn.commit()
+            output = next((item for item in self.academic_output_rows(conn, study_id) if item["id"] == output_id), after)
+            self.send_json({"output": output})
             return
         if method == "POST" and len(parts) == 5 and parts[4] == "cv-items":
             payload = self.body()

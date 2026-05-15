@@ -4139,6 +4139,24 @@ class App(BaseHTTPRequestHandler):
             snapshot_json = json.dumps(snapshot, sort_keys=True)
             existing = row(conn, "SELECT * FROM entries WHERE participant_id = ? AND form_id = ? AND event_name = ? AND repeat_instance = ?", (participant_id, form_id, event_name, repeat_instance))
             if existing:
+                if_match_updated_at = payload.get("if_match_updated_at")
+                if_match_entry_hash = str(payload.get("if_match_entry_hash") or "").strip()
+                try:
+                    client_updated_at = int(if_match_updated_at or 0)
+                except (TypeError, ValueError):
+                    client_updated_at = -1
+                stale_timestamp = if_match_updated_at not in (None, "") and client_updated_at != int(existing.get("updated_at") or 0)
+                stale_hash = bool(if_match_entry_hash) and if_match_entry_hash != str(existing.get("entry_hash") or "")
+                if stale_timestamp or stale_hash:
+                    conflict_payload = {
+                        "entry_id": existing["id"],
+                        "updated_at": existing.get("updated_at"),
+                        "entry_hash": existing.get("entry_hash", ""),
+                        "data": load_json(existing.get("data_json"), {}),
+                    }
+                    audit(conn, user["id"], "sync_conflict", "entry", existing["id"], {"if_match_updated_at": if_match_updated_at, "if_match_entry_hash": if_match_entry_hash}, conflict_payload, study_id=study_id, **self.audit_context())
+                    self.send_json({"error": "Entry was changed on the server. Review conflict before syncing.", "server_entry": conflict_payload}, 409)
+                    return
                 if existing.get("locked_at"):
                     reason = str(payload.get("change_reason", "")).strip()
                     if not reason:

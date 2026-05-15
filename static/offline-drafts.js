@@ -37,10 +37,25 @@
   async function putDraft(draft) {
     const db = await openDb();
     try {
-      return await requestToPromise(txStore(db, "readwrite").put({ ...draft, updatedAt: Date.now(), synced: false }));
+      const timestamp = Date.now();
+      return await requestToPromise(txStore(db, "readwrite").put({
+        syncStatus: "draft",
+        syncError: "",
+        conflictServerPayload: null,
+        conflictDetectedAt: null,
+        ...draft,
+        localUpdatedAt: timestamp,
+        updatedAt: timestamp,
+        synced: false,
+      }));
     } finally {
       db.close();
     }
+  }
+
+  async function updateDraft(key, patch) {
+    const current = (await getDraft(key)) || { key };
+    return putDraft({ ...current, ...patch });
   }
 
   async function getDraft(key) {
@@ -75,5 +90,5 @@
     return [studyId, participantId, formId, eventId || "baseline", repeatInstance || 1].join(":");
   }
 
-  window.CDSOfflineDrafts = { putDraft, getDraft, deleteDraft, listDrafts, entryKey };
+  window.CDSOfflineDrafts = { putDraft, updateDraft, getDraft, deleteDraft, listDrafts, entryKey };
 })();

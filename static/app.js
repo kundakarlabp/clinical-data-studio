@@ -69,7 +69,10 @@ async function api(path, options = {}) {
   const response = await fetch(path, { ...options, headers, credentials: "same-origin" });
   if (!response.ok) {
     const payload = await response.json().catch(() => ({ error: response.statusText }));
-    throw new Error(payload.error || response.statusText);
+    const error = new Error(payload.error || response.statusText);
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
   }
   const type = response.headers.get("content-type") || "";
   if (type.includes("application/json")) return response.json();
@@ -569,7 +572,7 @@ function entryCard(participant, form, selectedEvent) {
   const locked = Boolean(existing.locked_at);
   const draftKey = window.CDSOfflineDrafts?.entryKey({ studyId: state.studyId, participantId: participant.id, formId: form.id, eventId: selectedEvent?.id || null, repeatInstance: existing.repeat_instance || 1 }) || "";
   return `
-    <form class="card stack entry-form" data-form-id="${form.id}" data-participant-id="${participant.id}" data-entry-id="${existing.id || ""}" data-entry-updated-at="${existing.updated_at || 0}" data-draft-key="${escapeHtml(draftKey)}">
+    <form class="card stack entry-form" data-form-id="${form.id}" data-participant-id="${participant.id}" data-entry-id="${existing.id || ""}" data-entry-updated-at="${existing.updated_at || 0}" data-entry-hash="${escapeHtml(existing.entry_hash || "")}" data-draft-key="${escapeHtml(draftKey)}">
       <div class="row">
         <div>
           <h3>${escapeHtml(form.name)}</h3>
@@ -1439,18 +1442,22 @@ async function renderDraftList() {
     const participant = state.participants.find((item) => item.id === draft.participantId);
     const form = state.forms.find((item) => item.id === draft.formId);
     const serverEntry = state.entries.find((entry) => entry.participant_id === draft.participantId && entry.form_id === draft.formId && Number(entry.repeat_instance || 1) === Number(draft.repeatInstance || 1));
-    const conflict = serverEntry?.updated_at && draft.baselineUpdatedAt && serverEntry.updated_at !== draft.baselineUpdatedAt;
+    const baseUpdatedAt = draft.baseServerUpdatedAt || draft.baselineUpdatedAt || 0;
+    const conflict = draft.syncStatus === "conflict" || (serverEntry?.updated_at && baseUpdatedAt && serverEntry.updated_at !== baseUpdatedAt);
+    const status = conflict ? "conflict" : (draft.syncStatus || "pending");
     return `
       <article class="card">
         <div class="row">
           <div>
             <h3>${escapeHtml(form?.name || `Form ${draft.formId}`)}</h3>
-            <p>${escapeHtml(participant?.study_uid || `Participant ${draft.participantId}`)} - saved ${new Date(draft.updatedAt).toLocaleString()}</p>
+            <p>${escapeHtml(participant?.study_uid || `Participant ${draft.participantId}`)} - saved ${new Date(draft.localUpdatedAt || draft.updatedAt).toLocaleString()}</p>
           </div>
-          <span class="pill ${conflict ? "bad" : "warn"}">${conflict ? "conflict" : "pending"}</span>
+          <span class="pill ${conflict ? "bad" : "warn"}">${escapeHtml(status)}</span>
         </div>
-        ${conflict ? `<div class="notice error">Server record changed after this draft started. Compare before syncing.</div>` : ""}
+        ${conflict ? `<div class="notice error">Server record changed after this draft started. Review before choosing whether to sync or discard.</div>` : ""}
+        ${draft.syncError ? `<div class="notice error">${escapeHtml(draft.syncError)}</div>` : ""}
         <pre class="draft-preview">${escapeHtml(JSON.stringify(draft.payload.data || {}, null, 2))}</pre>
+        ${draft.conflictServerPayload ? `<pre class="draft-preview">${escapeHtml(JSON.stringify(draft.conflictServerPayload.data || {}, null, 2))}</pre>` : ""}
         <div class="split-actions">
           <button type="button" data-sync-draft="${escapeHtml(draft.key)}">Sync Now</button>
           <button type="button" class="secondary" data-delete-draft="${escapeHtml(draft.key)}">Discard Draft</button>
@@ -2364,18 +2371,32 @@ async function syncLocalDraft(key) {
     const draft = await window.CDSOfflineDrafts.getDraft(key);
     if (!draft) return;
     const serverEntry = state.entries.find((entry) => entry.participant_id === draft.participantId && entry.form_id === draft.formId && Number(entry.repeat_instance || 1) === Number(draft.repeatInstance || 1));
-    if (serverEntry?.updated_at && draft.baselineUpdatedAt && serverEntry.updated_at !== draft.baselineUpdatedAt && !confirm("The server record changed after this draft started. Replace the server record with this local draft?")) {
+    const baseUpdatedAt = draft.baseServerUpdatedAt || draft.baselineUpdatedAt || 0;
+    if (serverEntry?.updated_at && baseUpdatedAt && serverEntry.updated_at !== baseUpdatedAt && !confirm("The server record changed after this draft started. Try syncing anyway and let the server verify the conflict?")) {
       return;
     }
+    const payload = {
+      ...draft.payload,
+      if_match_updated_at: baseUpdatedAt || null,
+      if_match_entry_hash: draft.baseEntryHash || "",
+    };
     await api(`/api/studies/${state.studyId}/entries`, {
       method: "POST",
-      body: JSON.stringify(draft.payload),
+      body: JSON.stringify(payload),
     });
     await window.CDSOfflineDrafts.deleteDraft(key);
     await loadStudy();
     state.error = "Local draft synced.";
     render();
   } catch (error) {
+    if (error.status === 409 && window.CDSOfflineDrafts) {
+      await window.CDSOfflineDrafts.updateDraft(key, {
+        syncStatus: "conflict",
+        syncError: error.message,
+        conflictServerPayload: error.payload?.server_entry || null,
+        conflictDetectedAt: Date.now(),
+      }).catch(() => null);
+    }
     state.error = error.message;
     render();
   }
@@ -2642,6 +2663,8 @@ async function collectEntryPayload(form) {
     repeat_instance: Number(payload.repeat_instance || 1),
     status: payload.status || "draft",
     change_reason: payload.change_reason || "",
+    if_match_updated_at: form.dataset.entryId ? Number(form.dataset.entryUpdatedAt || 0) : null,
+    if_match_entry_hash: form.dataset.entryId ? (form.dataset.entryHash || "") : "",
     data,
   };
 }
@@ -2661,7 +2684,14 @@ async function saveLocalDraft(form) {
     formId: Number(form.dataset.formId),
     eventId: payload.event_id,
     repeatInstance: payload.repeat_instance,
+    baseEntryId: form.dataset.entryId ? Number(form.dataset.entryId) : null,
+    baseServerUpdatedAt: Number(form.dataset.entryUpdatedAt || 0),
+    baseEntryHash: form.dataset.entryHash || "",
     baselineUpdatedAt: Number(form.dataset.entryUpdatedAt || 0),
+    syncStatus: "draft",
+    syncError: "",
+    conflictServerPayload: null,
+    conflictDetectedAt: null,
     payload,
   });
   markDraftStatus(form, "Draft saved");
@@ -2678,7 +2708,8 @@ async function restoreLocalDraft(form) {
   const draft = await window.CDSOfflineDrafts.getDraft(form.dataset.draftKey).catch(() => null);
   if (!draft) return;
   const serverUpdatedAt = Number(form.dataset.entryUpdatedAt || 0);
-  if (serverUpdatedAt && draft.baselineUpdatedAt && serverUpdatedAt !== draft.baselineUpdatedAt) {
+  const baseUpdatedAt = draft.baseServerUpdatedAt || draft.baselineUpdatedAt || 0;
+  if (serverUpdatedAt && baseUpdatedAt && serverUpdatedAt !== baseUpdatedAt) {
     form.insertAdjacentHTML("afterbegin", `<div class="notice error">Local draft exists, but the server record changed after the draft started. Open Local Drafts to compare before syncing.</div>`);
     markDraftStatus(form, "Conflict");
     return;

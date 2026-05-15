@@ -51,6 +51,11 @@ class FrontendStaticTests(unittest.TestCase):
         self.assertIn("serviceWorker", app_js)
         self.assertIn("beforeinstallprompt", app_js)
         self.assertIn("CDSOfflineDrafts", app_js)
+        self.assertIn("if_match_updated_at", app_js)
+        self.assertIn("if_match_entry_hash", app_js)
+        offline_js = (ROOT / "static" / "offline-drafts.js").read_text(encoding="utf-8")
+        for field in ("baseEntryId", "baseServerUpdatedAt", "baseEntryHash", "localUpdatedAt", "syncStatus", "conflictServerPayload", "conflictDetectedAt"):
+            self.assertIn(field, app_js + offline_js)
         self.assertIn("Local Drafts", app_js)
         self.assertIn("Mobile App Setup", app_js)
         self.assertIn("bottom-nav", app_js)

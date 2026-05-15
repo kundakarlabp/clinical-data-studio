@@ -440,6 +440,50 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertIn("text/csv", codebook_type)
         self.assertIn("1, Male | 2, Female", codebook_body.decode("utf-8-sig"))
 
+    def test_stale_offline_entry_save_returns_conflict_and_audit(self):
+        token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]
+        study_id = self.request_json("/api/studies", token=token)["studies"][0]["id"]
+        form_id = self.request_json(f"/api/studies/{study_id}/forms", token=token)["forms"][0]["id"]
+        participant = self.request_json(
+            f"/api/studies/{study_id}/participants",
+            "POST",
+            {"study_uid": "OFFLINE001", "initials": "OF", "status": "enrolled"},
+            token,
+        )["participant"]
+        created = self.request_json(
+            f"/api/studies/{study_id}/entries",
+            "POST",
+            {"participant_id": participant["id"], "form_id": form_id, "status": "draft", "data": {"age": "40", "sex": "Male", "consent_date": "2026-05-10", "diagnosis": "Initial"}},
+            token,
+        )["entry"]
+        self.request_json(
+            f"/api/studies/{study_id}/entries",
+            "POST",
+            {"participant_id": participant["id"], "form_id": form_id, "status": "draft", "data": {"age": "41", "sex": "Male", "consent_date": "2026-05-10", "diagnosis": "Server change"}},
+            token,
+        )
+        with self.assertRaises(HTTPError) as conflict:
+            self.request_json(
+                f"/api/studies/{study_id}/entries",
+                "POST",
+                {
+                    "participant_id": participant["id"],
+                    "form_id": form_id,
+                    "status": "draft",
+                    "if_match_updated_at": created["updated_at"],
+                    "if_match_entry_hash": created["entry_hash"],
+                    "data": {"age": "42", "sex": "Male", "consent_date": "2026-05-10", "diagnosis": "Offline stale"},
+                },
+                token,
+            )
+        self.assertEqual(conflict.exception.code, 409)
+        body = json.loads(conflict.exception.read().decode("utf-8"))
+        self.assertIn("server_entry", body)
+        self.assertEqual(body["server_entry"]["data"]["diagnosis"], "Server change")
+        conflict.exception.close()
+        audit_rows = self.request_json(f"/api/studies/{study_id}/audit", token=token)["audit"]
+        self.assertTrue(any(item["action"] == "sync_conflict" for item in audit_rows))
+
     def test_case_intake_groups_unstructured_cases_and_exports(self):
         token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]
         study_id = self.request_json("/api/studies", token=token)["studies"][0]["id"]

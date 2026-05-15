@@ -1,11 +1,61 @@
 # Backup And Restore
 
-Backups protect the study database. Keep the backup passphrase outside the server and outside GitHub.
+Backups protect the study database and uploaded evidence. Keep the backup passphrase outside the server and outside GitHub. If you lose the passphrase, encrypted backups cannot be opened.
+
+## Backup Types
+
+Lightsail snapshot:
+
+- AWS-level snapshot of the whole server disk.
+- Useful if the server is damaged or deleted.
+- Not a replacement for app-level backups because restore testing is less granular.
+
+PostgreSQL backup:
+
+- Database dump only.
+- Contains users, studies, CRFs, participants, entries, audit log, case metadata, and academic workbench data.
+- Does not contain uploaded photos, PDFs, audio, or other Case Intake evidence files.
+
+Full app backup:
+
+- Encrypted Clinical Data Studio archive.
+- Contains PostgreSQL dump plus uploaded evidence files.
+- Includes `manifest.json` and `SHA256SUMS.txt` for verification.
+- This is the preferred routine backup for non-coder admins.
 
 Clinical Data Studio stores large Case Intake evidence files in `uploads/`, not inside the database. A safe backup plan must protect both:
 
 - PostgreSQL database: participants, CRFs, entries, audit, case metadata, AI reviews.
 - Upload folder: case photos, PDFs, audio, and text evidence.
+
+## Recommended Browser Method
+
+Use **Admin -> Backups**:
+
+1. Click **Create Full Backup**.
+2. Click **Verify Latest Backup**.
+3. Confirm the page says the latest full backup is verified.
+4. Click **Download Full Backup** if you want an external encrypted copy.
+
+Do this instead of terminal commands for routine use.
+
+## Create A Full Backup From Terminal
+
+Use this only if you are comfortable with the server terminal:
+
+```bash
+cd clinical-data-studio
+bash scripts/backup_full.sh
+bash scripts/verify_backup.sh full_YYYYMMDD_HHMMSS.full.cdsenc
+```
+
+Dry-run restore check:
+
+```bash
+bash scripts/restore_full_dry_run.sh full_YYYYMMDD_HHMMSS.full.cdsenc
+```
+
+The dry run decrypts, lists, and verifies checksums. It does not overwrite the production database or uploads.
 
 ## Create A PostgreSQL Backup
 

@@ -3,12 +3,9 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-if [[ -f .env ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source .env
-  set +a
-fi
+# shellcheck disable=SC1091
+source scripts/env.sh
+load_cds_env .env
 
 mkdir -p backups
 timestamp="$(date +%Y%m%d_%H%M%S)"

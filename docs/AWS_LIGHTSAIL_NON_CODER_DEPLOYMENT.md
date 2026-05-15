@@ -136,7 +136,56 @@ docker compose exec app python server.py create-admin
 bash scripts/update.sh
 ```
 
-## 10. Android Use
+## 10. Routine Admin Schedule
+
+Daily after data entry:
+
+1. Open **Admin -> Backups**.
+2. Click **Create Full Backup**.
+3. Click **Verify Latest Backup**.
+4. Confirm the latest full backup says verified.
+5. Review **Audit Trail** for unexpected exports, failed logins, backup downloads, or AI calls.
+
+Weekly:
+
+1. Download one encrypted full backup to a safe external location.
+2. Keep the passphrase separately.
+3. Check that Lightsail automatic snapshots are still enabled.
+
+Monthly:
+
+1. Do a restore drill on a test server or temporary copy.
+2. Confirm login, participants, CRFs, entries, audit, and uploaded files.
+3. Record the result in the study validation checklist.
+
+View logs:
+
+```bash
+bash scripts/logs.sh
+```
+
+Restart:
+
+```bash
+docker compose restart app
+```
+
+Update:
+
+```bash
+bash scripts/update.sh
+```
+
+Create users:
+
+1. Log in as System Admin.
+2. Open **Access**.
+3. Create a named user.
+4. Assign that user to the project.
+5. Choose Data Entry, Reviewer, Analyst, Viewer, or Project Admin / PI.
+6. Assign a data access group if the user should see only one site/group.
+
+## 11. Android Use
 
 On Android Chrome:
 
@@ -147,15 +196,16 @@ On Android Chrome:
 5. Use **Data Entry** for CRFs and **Case Intake** for photos, PDFs, audio, and rough notes.
 6. Open **Local Drafts** before leaving the clinic if the phone was offline.
 
-## 11. What Not To Do
+## 12. What Not To Do
 
 - Do not upload live patient data to GitHub.
 - Do not email the `.env` file.
 - Do not share the admin account.
 - Do not delete the `postgres_data`, `cds_uploads`, or `cds_backups` Docker volumes.
 - Do not enable external AI for PHI unless your ethics and institutional policy explicitly allow it.
+- Do not rely on PostgreSQL-only backup if your study uses uploaded evidence files.
 
-## 12. Official References
+## 13. Official References
 
 - AWS Lightsail docs: https://docs.aws.amazon.com/lightsail/
 - Docker Engine install docs: https://docs.docker.com/engine/install/ubuntu/

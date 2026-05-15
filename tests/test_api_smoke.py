@@ -127,6 +127,17 @@ class ApiSmokeTests(unittest.TestCase):
         backup = self.request_json("/api/admin/backup", "POST", {"passphrase": "LongLocalPassphrase123"}, token)["backup"]
         self.assertTrue(backup["encrypted"])
         self.assertTrue(backup["name"].startswith("system_"))
+        full_backup = self.request_json("/api/admin/backup/full", "POST", {"passphrase": "LongLocalPassphrase123"}, token)["backup"]
+        self.assertEqual(full_backup["backup_type"], "full")
+        verified = self.request_json("/api/admin/backups/verify", "POST", {"filename": full_backup["name"], "passphrase": "LongLocalPassphrase123"}, token)["verification"]
+        self.assertTrue(verified["ok"], verified["errors"])
+        backups = self.request_json("/api/admin/backups", token=token)
+        self.assertTrue(backups["summary"]["latest_full_backup_verified"])
+        self.assertTrue(any(item["name"] == full_backup["name"] for item in backups["backups"]))
+        status, content_type, body = self.request_raw(f"/api/admin/backups/{full_backup['name']}", token=token)
+        self.assertEqual(status, 200)
+        self.assertIn("application/octet-stream", content_type)
+        self.assertGreater(len(body), 100)
 
     def test_short_archive_passphrase_is_rejected(self):
         token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]

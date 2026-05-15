@@ -21,7 +21,7 @@ import tempfile
 import time
 import ctypes
 import zipfile
-from io import StringIO
+from io import BytesIO, StringIO
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -333,6 +333,43 @@ def latest_backup_time() -> int | None:
     return int(max(item.stat().st_mtime for item in files))
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def sha256_bytes(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def backup_file_info(path: Path, backup_type: str | None = None) -> dict:
+    info = {
+        "name": path.name,
+        "size": path.stat().st_size,
+        "created_at": int(path.stat().st_mtime),
+        "encrypted": path.suffix == ".cdsenc",
+    }
+    if backup_type:
+        info["backup_type"] = backup_type
+    return info
+
+
+def latest_matching_backup(predicate) -> dict | None:
+    if not BACKUPS.exists():
+        return None
+    matches = [item for item in BACKUPS.iterdir() if item.is_file() and predicate(item)]
+    if not matches:
+        return None
+    target = max(matches, key=lambda item: item.stat().st_mtime)
+    if ".full." in target.name or target.name.startswith("full_"):
+        return latest_full_backup_info(target)
+    backup_type = "postgres" if target.name.startswith("postgres_") or target.name.endswith(".dump") else "database"
+    return backup_file_info(target, backup_type)
+
+
 def backup_name(prefix: str = "system") -> str:
     return f"{prefix}_{time.strftime('%Y%m%d_%H%M%S', time.localtime())}"
 
@@ -364,6 +401,177 @@ def create_database_backup(passphrase: str = "", study_id: int | None = None) ->
     else:
         target = plain_target
     return {"name": target.name, "size": target.stat().st_size, "created_at": int(target.stat().st_mtime), "encrypted": target.suffix == ".cdsenc", "backend": "sqlite"}
+
+
+def write_uploads_archive(target: Path) -> int:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    upload_count = 0
+    with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
+        if UPLOADS.exists():
+            for item in sorted(UPLOADS.rglob("*")):
+                if item.is_file():
+                    archive.write(item, item.relative_to(UPLOADS).as_posix())
+                    upload_count += 1
+        if upload_count == 0:
+            archive.writestr("EMPTY_UPLOADS.txt", "No upload files were present when this backup was created.\n")
+    return upload_count
+
+
+def write_database_dump(target: Path) -> str:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if DATABASE_BACKEND == "postgres":
+        subprocess.run(["pg_dump", "--format=custom", "--file", str(target), DATABASE_URL], check=True, capture_output=True, text=True, timeout=300)
+        return "postgres.dump"
+    with closing(db()) as conn:
+        write_sqlite_backup(conn, target)
+    return "sqlite.sqlite3"
+
+
+def create_full_backup(passphrase: str = "") -> dict:
+    passphrase = passphrase or SETTINGS.backup_passphrase
+    if not passphrase:
+        raise ValueError("Full backup passphrase is required")
+    BACKUPS.mkdir(parents=True, exist_ok=True)
+    UPLOADS.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    target = BACKUPS / f"full_{timestamp}.full.cdsenc"
+    with tempfile.TemporaryDirectory(dir=BACKUPS) as tmp_name:
+        tmp = Path(tmp_name)
+        db_name = "postgres.dump" if DATABASE_BACKEND == "postgres" else "sqlite.sqlite3"
+        db_path = tmp / db_name
+        db_name = write_database_dump(db_path)
+        uploads_path = tmp / "uploads.zip"
+        upload_count = write_uploads_archive(uploads_path)
+        manifest = {
+            "backup_type": "full",
+            "created_at": int(time.time()),
+            "created_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "app": "Clinical Data Studio",
+            "version": os.environ.get("CDS_VERSION", "0.1"),
+            "git_commit": git_commit(),
+            "database_backend": DATABASE_BACKEND,
+            "database_dump": db_name,
+            "uploads_archive": uploads_path.name,
+            "upload_file_count": upload_count,
+            "encryption": {
+                "format": "CDSENC1",
+                "kdf": "pbkdf2_hmac_sha256",
+                "passphrase_stored": False,
+            },
+        }
+        manifest_path = tmp / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+        checksum_targets = [db_path, uploads_path, manifest_path]
+        sums_path = tmp / "SHA256SUMS.txt"
+        sums_path.write_text("".join(f"{file_sha256(item)}  {item.name}\n" for item in checksum_targets), encoding="utf-8")
+        payload_path = tmp / "full_backup_payload.zip"
+        with zipfile.ZipFile(payload_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            for item in [db_path, uploads_path, manifest_path, sums_path]:
+                archive.write(item, item.name)
+        target.write_bytes(encrypted_archive_bytes(payload_path.read_bytes(), passphrase))
+    info = backup_file_info(target, "full")
+    info.update({"backend": DATABASE_BACKEND, "uploads_included": True, "verified": False})
+    return info
+
+
+def verification_sidecar_path(backup_path: Path) -> Path:
+    return backup_path.with_name(f"{backup_path.name}.verify.json")
+
+
+def full_backup_candidates() -> list[Path]:
+    if not BACKUPS.exists():
+        return []
+    return sorted(
+        [item for item in BACKUPS.iterdir() if item.is_file() and not item.name.endswith(".verify.json") and (item.name.startswith("full_") or ".full." in item.name)],
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def latest_full_backup_info(path: Path | None = None) -> dict | None:
+    target = path or (full_backup_candidates()[0] if full_backup_candidates() else None)
+    if not target:
+        return None
+    info = backup_file_info(target, "full")
+    info["uploads_included"] = True
+    sidecar = verification_sidecar_path(target)
+    if sidecar.exists():
+        try:
+            verification = json.loads(sidecar.read_text(encoding="utf-8"))
+            info["verification"] = verification
+            info["verified"] = bool(verification.get("ok"))
+            info["verified_at"] = verification.get("checked_at")
+        except Exception:
+            info["verified"] = False
+    else:
+        info["verified"] = False
+    return info
+
+
+def latest_postgres_backup_info() -> dict | None:
+    return latest_matching_backup(lambda item: item.name.startswith("postgres_") or item.name.endswith(".dump"))
+
+
+def verify_full_backup(backup_file: Path, passphrase: str = "", record: bool = False) -> dict:
+    passphrase = passphrase or SETTINGS.backup_passphrase
+    if not passphrase:
+        raise ValueError("Full backup passphrase is required for verification")
+    target = backup_file.resolve()
+    backup_root = BACKUPS.resolve()
+    if not str(target).startswith(str(backup_root)) or not target.exists() or not target.is_file():
+        raise ValueError("Full backup file not found inside configured backup directory")
+    archive_bytes = decrypted_archive_bytes(target.read_bytes(), passphrase) if target.suffix == ".cdsenc" else target.read_bytes()
+    result = {
+        "ok": False,
+        "name": target.name,
+        "checked_at": int(time.time()),
+        "contents": [],
+        "database_dump": "",
+        "uploads_archive": "",
+        "upload_file_count": 0,
+        "errors": [],
+    }
+    try:
+        with zipfile.ZipFile(BytesIO(archive_bytes), "r") as archive:
+            names = archive.namelist()
+            result["contents"] = names
+            required = {"manifest.json", "SHA256SUMS.txt", "uploads.zip"}
+            missing = sorted(required - set(names))
+            if missing:
+                result["errors"].append(f"Missing required file(s): {', '.join(missing)}")
+            manifest = json.loads(archive.read("manifest.json").decode("utf-8")) if "manifest.json" in names else {}
+            result["manifest"] = manifest
+            result["database_dump"] = str(manifest.get("database_dump") or "")
+            result["uploads_archive"] = str(manifest.get("uploads_archive") or "")
+            if result["database_dump"] not in names:
+                result["errors"].append("Database dump is missing")
+            if result["uploads_archive"] not in names:
+                result["errors"].append("Uploads archive is missing")
+            if manifest.get("backup_type") != "full":
+                result["errors"].append("Manifest backup_type is not full")
+            if "SHA256SUMS.txt" in names:
+                checksum_lines = archive.read("SHA256SUMS.txt").decode("utf-8").splitlines()
+                for line in checksum_lines:
+                    if not line.strip():
+                        continue
+                    expected, filename = line.split(None, 1)
+                    filename = filename.strip()
+                    if filename not in names:
+                        result["errors"].append(f"Checksum target missing: {filename}")
+                        continue
+                    actual = sha256_bytes(archive.read(filename))
+                    if actual != expected:
+                        result["errors"].append(f"Checksum mismatch: {filename}")
+            if result["uploads_archive"] in names:
+                with zipfile.ZipFile(BytesIO(archive.read(result["uploads_archive"])), "r") as uploads:
+                    result["upload_file_count"] = len([name for name in uploads.namelist() if not name.endswith("/") and name != "EMPTY_UPLOADS.txt"])
+        result["ok"] = not result["errors"]
+    except Exception as exc:
+        result["errors"].append(str(exc))
+        result["ok"] = False
+    if record:
+        verification_sidecar_path(target).write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+    return result
 
 
 def restore_database_backup(backup_file: Path, passphrase: str = "") -> dict:
@@ -398,6 +606,7 @@ def restore_database_backup(backup_file: Path, passphrase: str = "") -> dict:
 
 def health_payload() -> dict:
     db_status = database_status()
+    latest_full = latest_full_backup_info()
     return {
         "ok": db_status["ok"],
         "app": "Clinical Data Studio",
@@ -414,7 +623,18 @@ def health_payload() -> dict:
         "https_detected": SETTINGS.public_base_url.startswith("https://"),
         "data_protection": data_protection_status(),
         "ai": ai_status(),
-        "backup": {"directory": str(BACKUPS), "latest_backup_at": latest_backup_time()},
+        "backup": {
+            "directory": str(BACKUPS),
+            "latest_backup_at": latest_backup_time(),
+            "latest_postgres_backup": latest_postgres_backup_info(),
+            "latest_full_backup": latest_full,
+            "latest_full_backup_verified": bool(latest_full and latest_full.get("verified")),
+            "uploads": {
+                "directory": str(UPLOADS),
+                "exists": UPLOADS.exists(),
+                "file_count": sum(1 for item in UPLOADS.rglob("*") if item.is_file()) if UPLOADS.exists() else 0,
+            },
+        },
     }
 
 
@@ -423,7 +643,7 @@ def backup_files_for_study(study_id: int) -> list[dict]:
     files = []
     for item in sorted(BACKUPS.iterdir(), key=lambda path: path.stat().st_mtime, reverse=True):
         if item.is_file() and item.name.startswith(f"study_{study_id}_") and item.suffix in (".sqlite3", ".cdsenc", ".dump"):
-            files.append({"name": item.name, "size": item.stat().st_size, "created_at": int(item.stat().st_mtime), "encrypted": item.suffix == ".cdsenc"})
+            files.append(backup_file_info(item, "database"))
     return files
 
 
@@ -2562,9 +2782,10 @@ class App(BaseHTTPRequestHandler):
             BACKUPS.mkdir(parents=True, exist_ok=True)
             files = []
             for item in sorted(BACKUPS.iterdir(), key=lambda path: path.stat().st_mtime, reverse=True):
-                if item.is_file() and item.suffix in {".sqlite3", ".cdsenc", ".dump", ".gz"}:
-                    files.append({"name": item.name, "size": item.stat().st_size, "created_at": int(item.stat().st_mtime), "encrypted": item.suffix == ".cdsenc"})
-            self.send_json({"backups": files})
+                if item.is_file() and not item.name.endswith(".verify.json") and item.suffix in {".sqlite3", ".cdsenc", ".dump", ".gz"}:
+                    backup_type = "full" if item.name.startswith("full_") or ".full." in item.name else ("postgres" if item.name.startswith("postgres_") or item.name.endswith(".dump") else "database")
+                    files.append(latest_full_backup_info(item) if backup_type == "full" else backup_file_info(item, backup_type))
+            self.send_json({"backups": files, "summary": health_payload()["backup"]})
             return
         if path == "/api/admin/backup" and method == "POST":
             payload = self.body()
@@ -2572,6 +2793,40 @@ class App(BaseHTTPRequestHandler):
             backup = create_database_backup(str(payload.get("passphrase", "")) or SETTINGS.backup_passphrase)
             audit(conn, user["id"], "create_encrypted" if backup["encrypted"] else "create", "backup", None, None, backup, **self.audit_context())
             self.send_json({"backup": backup}, 201)
+            return
+        if path == "/api/admin/backup/full" and method == "POST":
+            payload = self.body()
+            conn.commit()
+            backup = create_full_backup(str(payload.get("passphrase", "")) or SETTINGS.backup_passphrase)
+            audit(conn, user["id"], "create_full", "backup", None, None, backup, **self.audit_context())
+            self.send_json({"backup": backup}, 201)
+            return
+        if path == "/api/admin/backups/verify" and method == "POST":
+            payload = self.body()
+            filename = Path(str(payload.get("filename", ""))).name
+            target = (BACKUPS / filename).resolve() if filename else (full_backup_candidates()[0] if full_backup_candidates() else None)
+            if not target or not str(target).startswith(str(BACKUPS.resolve())) or not target.exists():
+                self.send_error_json("Full backup not found", 404)
+                return
+            verification = verify_full_backup(target, str(payload.get("passphrase", "")) or SETTINGS.backup_passphrase, record=True)
+            audit(conn, user["id"], "verify", "backup", None, None, {"filename": target.name, "ok": verification["ok"]}, **self.audit_context())
+            self.send_json({"verification": verification})
+            return
+        if len(parts) == 4 and parts[:3] == ["api", "admin", "backups"] and method == "GET":
+            filename = Path(parts[3]).name
+            target = (BACKUPS / filename).resolve()
+            if not str(target).startswith(str(BACKUPS.resolve())) or not target.exists() or target.name.endswith(".verify.json"):
+                self.send_error_json("Backup not found", 404)
+                return
+            content = target.read_bytes()
+            audit(conn, user["id"], "download", "backup", None, None, {"filename": target.name, "size": target.stat().st_size}, **self.audit_context())
+            conn.commit()
+            self.send_response(200)
+            self.send_header("content-type", "application/octet-stream")
+            self.send_header("content-disposition", f"attachment; filename={target.name}")
+            self.send_header("content-length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
             return
         if len(parts) == 5 and parts[:3] == ["api", "admin", "users"] and parts[4] == "reset-password" and method == "POST":
             target_user_id = int(parts[3])
@@ -5197,6 +5452,19 @@ def handle_cli(argv: list[str]) -> bool:
         backup = create_database_backup(SETTINGS.backup_passphrase)
         print(json.dumps({"backup": backup}, indent=2))
         return True
+    if command == "backup-full":
+        backup = create_full_backup(SETTINGS.backup_passphrase)
+        print(json.dumps({"backup": backup}, indent=2))
+        return True
+    if command in {"verify-backup", "restore-full-dry-run"}:
+        if len(argv) < 3:
+            raise SystemExit(f"Usage: python server.py {command} <full_backup_file_or_name>")
+        backup_path = Path(argv[2])
+        if not backup_path.is_absolute():
+            backup_path = BACKUPS / backup_path.name
+        verification = verify_full_backup(backup_path, SETTINGS.backup_passphrase, record=command == "verify-backup")
+        print(json.dumps({"verification": verification, "dry_run": True}, indent=2))
+        raise SystemExit(0 if verification["ok"] else 1)
     if command == "restore":
         if len(argv) < 3:
             raise SystemExit("Usage: python server.py restore <backup_file>")

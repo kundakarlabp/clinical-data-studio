@@ -31,6 +31,7 @@ const state = {
   readiness: null,
   adminStatus: null,
   adminLogs: [],
+  adminBackups: { backups: [], summary: null },
   view: "dashboard",
   selectedParticipantId: 0,
   participantSearch: "",
@@ -116,7 +117,7 @@ async function loadStudy() {
   const manageUsers = can("manage_users");
   const viewAnalysis = can("view_analysis") || can("review_data");
   const readinessAllowed = can("manage_study") || can("review_data") || can("view_analysis");
-  const [forms, events, formEvents, surveyLinks, invitations, reports, academic, caseIntake, backups, participants, entries, queries, quality, analysis, assistantSummary, readiness, audit, groups, studyMembers, apiTokens, randomization, users, adminStatus, adminLogs] = await Promise.all([
+  const [forms, events, formEvents, surveyLinks, invitations, reports, academic, caseIntake, backups, participants, entries, queries, quality, analysis, assistantSummary, readiness, audit, groups, studyMembers, apiTokens, randomization, users, adminStatus, adminLogs, adminBackups] = await Promise.all([
     api(`/api/studies/${state.studyId}/forms`),
     api(`/api/studies/${state.studyId}/events`),
     api(`/api/studies/${state.studyId}/form-events`),
@@ -141,6 +142,7 @@ async function loadStudy() {
     isSuperAdmin() ? api("/api/users") : Promise.resolve({ users: [] }),
     isSuperAdmin() ? api("/api/admin/status") : Promise.resolve(null),
     isSuperAdmin() ? api("/api/admin/logs") : Promise.resolve({ lines: [] }),
+    isSuperAdmin() ? api("/api/admin/backups") : Promise.resolve({ backups: [], summary: null }),
   ]);
   state.forms = forms.forms;
   state.events = events.events;
@@ -169,6 +171,7 @@ async function loadStudy() {
   state.users = users.users;
   state.adminStatus = adminStatus;
   state.adminLogs = adminLogs.lines || [];
+  state.adminBackups = adminBackups;
 }
 
 function isSuperAdmin() {
@@ -1411,13 +1414,59 @@ async function renderDraftList() {
 }
 
 function backupsView() {
+  const backupSummary = state.adminBackups?.summary || state.adminStatus?.health?.backup || {};
+  const latestFull = backupSummary.latest_full_backup;
+  const latestPostgres = backupSummary.latest_postgres_backup;
+  const fullBackups = state.adminBackups?.backups?.filter((item) => item.backup_type === "full") || [];
   return `
+    ${isSuperAdmin() ? `
+    <section class="panel">
+      <div class="row">
+        <div>
+          <h2>Full App Backup</h2>
+          <p class="small">Full backup includes PostgreSQL database plus uploaded evidence files. Use this for real Lightsail study protection.</p>
+        </div>
+        <div class="split-actions">
+          <button id="full-backup-create">Create Full Backup</button>
+          <button class="secondary" id="full-backup-verify">Verify Latest Backup</button>
+          ${latestFull ? `<button class="secondary" id="full-backup-download">Download Full Backup</button>` : ""}
+        </div>
+      </div>
+      ${latestFull?.verified ? `<div class="notice ok">Latest full backup verified at ${fmtTime(latestFull.verified_at)}.</div>` : `<div class="notice warn">No verified full backup is recorded. Create and verify a full backup before relying on this deployment.</div>`}
+      <div class="grid three">
+        <div><span class="small">Latest PostgreSQL backup</span><strong>${latestPostgres ? `${escapeHtml(latestPostgres.name)} (${Math.round(latestPostgres.size / 1024)} KB)` : "Not found"}</strong></div>
+        <div><span class="small">Latest full backup</span><strong>${latestFull ? `${escapeHtml(latestFull.name)} (${Math.round(latestFull.size / 1024)} KB)` : "Not found"}</strong></div>
+        <div><span class="small">Uploads included</span><strong>${latestFull?.uploads_included ? "Yes" : "No verified full backup"}</strong></div>
+        <div><span class="small">Uploads folder</span><strong>${backupSummary.uploads?.exists ? `${backupSummary.uploads.file_count || 0} file(s)` : "Missing"}</strong></div>
+        <div><span class="small">Backup directory</span><strong>${escapeHtml(backupSummary.directory || "")}</strong></div>
+        <div><span class="small">Verification</span><strong>${latestFull?.verified ? "Passed" : "Needs verification"}</strong></div>
+      </div>
+      ${fullBackups.length ? `
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Full backup</th><th>Size</th><th>Created</th><th>Verified</th><th></th></tr></thead>
+            <tbody>
+              ${fullBackups.map((backup) => `
+                <tr>
+                  <td>${escapeHtml(backup.name)} <span class="pill ok">encrypted</span></td>
+                  <td>${Math.round(backup.size / 1024)} KB</td>
+                  <td>${fmtTime(backup.created_at)}</td>
+                  <td>${backup.verified ? `Yes (${fmtTime(backup.verified_at)})` : "No"}</td>
+                  <td><button class="secondary" data-download-admin-backup="${escapeHtml(backup.name)}">Download</button></td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+      ` : ""}
+    </section>
+    ` : ""}
     <section class="panel">
       <div class="row">
         <h2>Backups</h2>
         <button id="backup-create">Create Backup</button>
       </div>
-      <p>Backups are local SQLite snapshots stored under the app data folder. Keep copies on an encrypted external drive for real studies.</p>
+      <p>Project database backups protect structured data. Full app backups also include uploaded case evidence files.</p>
       <form id="encrypted-backup-form" class="form-grid">
         <label>Archive passphrase<input name="passphrase" type="password" minlength="12" placeholder="12+ characters" /></label>
         <div><button class="secondary">Create Encrypted Archive</button></div>
@@ -1721,6 +1770,12 @@ function bindRoute() {
     button.addEventListener("click", () => requestCaseAiReview(button.dataset.caseAi));
   });
   document.querySelector("#backup-create")?.addEventListener("click", createBackup);
+  document.querySelector("#full-backup-create")?.addEventListener("click", createFullBackup);
+  document.querySelector("#full-backup-verify")?.addEventListener("click", verifyLatestFullBackup);
+  document.querySelector("#full-backup-download")?.addEventListener("click", downloadLatestFullBackup);
+  document.querySelectorAll("[data-download-admin-backup]").forEach((button) => {
+    button.addEventListener("click", () => downloadApi(`/api/admin/backups/${encodeURIComponent(button.dataset.downloadAdminBackup)}`, button.dataset.downloadAdminBackup));
+  });
   document.querySelector("#encrypted-backup-form")?.addEventListener("submit", createEncryptedBackup);
   document.querySelectorAll("[data-restore-backup]").forEach((button) => button.addEventListener("click", () => restoreBackup(button.dataset.restoreBackup, button.dataset.encrypted === "true")));
   document.querySelector("#form-builder")?.addEventListener("submit", submitFormDefinition);
@@ -2251,6 +2306,36 @@ async function createBackup() {
     state.error = error.message;
     render();
   }
+}
+
+async function createFullBackup() {
+  try {
+    await api("/api/admin/backup/full", { method: "POST", body: "{}" });
+    await loadStudy();
+    state.error = "Full encrypted backup created. Verify it before relying on it.";
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function verifyLatestFullBackup() {
+  try {
+    const result = await api("/api/admin/backups/verify", { method: "POST", body: "{}" });
+    await loadStudy();
+    state.error = result.verification?.ok ? "Latest full backup verified." : `Full backup verification failed: ${(result.verification?.errors || []).join("; ")}`;
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+function downloadLatestFullBackup() {
+  const latest = state.adminBackups?.summary?.latest_full_backup || state.adminStatus?.health?.backup?.latest_full_backup;
+  if (!latest?.name) return;
+  downloadApi(`/api/admin/backups/${encodeURIComponent(latest.name)}`, latest.name);
 }
 
 async function createEncryptedBackup(event) {

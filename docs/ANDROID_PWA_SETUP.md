@@ -18,6 +18,21 @@ Clinical Data Studio should first be used on Android as an installable web app.
 - Use **Local Drafts** to review CRF drafts saved on that phone.
 - Sync drafts before clearing browser data or switching phones.
 
+## Offline Drafts And Conflicts
+
+When the phone loses connection, CRF edits are saved as local IndexedDB drafts on that phone. They are not in the central study database until synced.
+
+Before syncing, the app checks whether the server record changed after the draft started. If another user changed the record, the app marks the draft as a conflict instead of silently overwriting data.
+
+Use **Local Drafts** to review:
+
+- pending drafts
+- synced drafts
+- errors
+- conflicts
+
+For conflicts, compare the phone draft with the server version and decide whether to keep the server record, keep the local draft, or manually merge.
+
 ## Important Safety Notes
 
 - Do not share the admin account.
@@ -25,3 +40,4 @@ Clinical Data Studio should first be used on Android as an installable web app.
 - Offline drafts stay on that phone until synced.
 - The phone app shell does not store the main clinical database.
 - If the server is offline, clinical data cannot sync until the server is reachable again.
+- Do not uninstall Chrome or clear site data before syncing drafts.

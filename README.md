@@ -1,14 +1,14 @@
 # Clinical Data Studio
 
-A local-network electronic data capture app for small clinical research projects.
+A local-first and AWS Lightsail-ready electronic data capture app for small clinical research projects.
 
 ## What it does now
 
-- Runs on one laptop/desktop and serves phones/tablets on the same Wi-Fi.
-- Stores data in local SQLite.
-- Provides study setup, CRF schema editing, participant registry, data entry, review queries, audit trail, CSV export, and simple analysis.
+- Runs on one laptop/desktop for local development, or on AWS Lightsail with Docker Compose, PostgreSQL, and Nginx for multi-user remote access.
+- Stores local development data in SQLite and production data in PostgreSQL.
+- Provides study setup, CRF schema editing, participant registry, data entry, review queries, audit trail, CSV export, backups, and simple analysis.
 - Supports server-side edit checks, repeatable CRFs, lock/unlock review flow, data quality review, and codebook export.
-- Uses no paid cloud server and no subscription.
+- Uses no REDCap subscription. Lightsail hosting is optional but recommended for remote multi-user study access.
 
 ## Start
 
@@ -52,6 +52,7 @@ Implemented foundation:
 - Optional Windows EFS data-folder at-rest protection helper
 - Health endpoint and local LAN start helper
 - Installable Android/desktop PWA shell with offline fallback for app pages
+- Android-first offline CRF drafts with conflict detection before sync
 - Remote access guidance page for LAN, VPN overlay, HTTPS tunnel, and static/file-host limitations
 - Remote access helper script for LAN URL, Tailscale, and Cloudflare Tunnel checks
 - First-run administrator password setup
@@ -65,7 +66,10 @@ Implemented foundation:
 - File upload fields stored inside CRF data records
 - Smart Case Intake for unstructured retrospective case notes, photos, audio evidence, local extraction, grouping, and case-series CSV export
 - Optional OpenAI Academic AI review for multimodal case interpretation, adaptive CRF suggestions, and publication guidance
-- Academic Workbench for publication opportunities, CV item tracking, and Markdown/CSV academic portfolio export
+- AI safety gate, de-identification preview, AI audit table, and local prompt helpers for CRF drafts, missing-data checks, publication ideas, and CV item suggestions
+- Academic Workbench for publication opportunities, typed academic outputs, CV item tracking, and Markdown/CSV academic portfolio export
+- Encrypted full backup workflow for PostgreSQL plus uploaded evidence files
+- Cookie-based browser sessions with CSRF protection while keeping scoped REDCap-style API tokens
 - Windows scheduled-task start-at-login helper
 - Validation execution record template
 - Survey invitation and reminder tracking
@@ -119,6 +123,8 @@ For case-report and case-series AI review with images/audio, see [docs/OPENAI_AC
 Use **Case Intake** when case material arrives as notes, images, audio, scanned details, or rough typed summaries before a formal CRF is ready. The app stores original evidence, extracts draft demographics/diagnosis/treatment/outcome fields locally, groups similar cases, and exports a case-series CSV. See [docs/CASE_SERIES_WORKFLOW.md](docs/CASE_SERIES_WORKFLOW.md).
 
 Use **Academic CV** to convert grouped cases into publication opportunities, track abstracts/posters/manuscripts/presentations/audits, and export a CV-ready portfolio. See [docs/ACADEMIC_WORKBENCH.md](docs/ACADEMIC_WORKBENCH.md).
+
+For CRF field types, coded choices, branching logic, calculated fields, versioning, and data dictionary import/export, see [docs/CRF_BUILDER_GUIDE.md](docs/CRF_BUILDER_GUIDE.md).
 
 ## Android And Multi-Device Use
 

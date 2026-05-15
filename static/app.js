@@ -210,11 +210,11 @@ function currentMembership() {
 function can(permission) {
   const role = currentMembership()?.role || "";
   const permissions = {
-    admin: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis"],
-    super_admin: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis"],
-    owner: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis"],
-    project_admin: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis"],
-    pi: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis"],
+    admin: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis", "use_ai", "manage_backups"],
+    super_admin: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis", "use_ai", "manage_backups"],
+    owner: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis", "use_ai", "manage_backups"],
+    project_admin: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis", "use_ai", "manage_backups"],
+    pi: ["manage_users", "manage_study", "manage_forms", "enter_data", "review_data", "export_data", "view_analysis", "use_ai", "manage_backups"],
     data_entry: ["enter_data"],
     reviewer: ["review_data", "view_analysis"],
     analyst: ["export_data", "view_analysis"],
@@ -1306,6 +1306,9 @@ function academicView() {
   const metrics = academic.metrics || {};
   const opportunities = academic.opportunities || [];
   const cvItems = academic.cv_items || [];
+  const aiAudit = academic.ai_audit || [];
+  const promptTemplates = academic.prompt_templates || [];
+  const ai = academic.ai || { provider: "local", model: "local-rules", external_ai_enabled: false, phi_allowed: false, multimodal_enabled: false };
   return `
     <section class="metrics-grid">
       ${metric("Captured Cases", metrics.case_count || 0, "Messy evidence organized")}
@@ -1325,9 +1328,50 @@ function academicView() {
         </div>
       </div>
       <div class="grid two">
-        <div class="notice">AI mode: ${escapeHtml(academic.ai?.provider || "local")} / ${escapeHtml(academic.ai?.model || "local-rules")}. ${academic.ai?.external_ai_enabled ? "External OpenAI enabled." : "External AI off or local fallback active."}</div>
+        <div class="notice">AI mode: ${escapeHtml(ai.provider || "local")} / ${escapeHtml(ai.model || "local-rules")}. ${ai.external_ai_enabled ? (ai.phi_allowed ? "External enabled, PHI allowed by policy." : "External enabled, PHI blocked.") : "External AI off or local fallback active."} ${ai.multimodal_enabled ? "Multimodal enabled." : "Photo/audio AI is not automatic."}</div>
         <div class="notice">${escapeHtml((academic.guidance || []).join(" "))}</div>
       </div>
+    </section>
+    <section class="panel">
+      <h2>AI Safety and Prompts</h2>
+      <div class="grid two">
+        <form id="ai-safety-form" class="form-grid">
+          <label class="full">De-identification preview<textarea name="text" placeholder="Paste text here before considering external AI. Identifiers will be detected and removed in preview."></textarea></label>
+          <div class="full"><button class="secondary" ${can("use_ai") ? "" : "disabled"}>Preview PHI Safety</button></div>
+          <label class="full">Safety result<textarea id="ai-safety-result" readonly></textarea></label>
+        </form>
+        <form id="ai-workbench-form" class="form-grid">
+          <label>Template
+            <select name="purpose">
+              ${promptTemplates.map((item) => `<option value="${escapeHtml(item.purpose)}">${escapeHtml(item.label)}</option>`).join("")}
+            </select>
+          </label>
+          <label class="full">Text or activity note<textarea name="text" placeholder="Paste de-identified protocol text, case note, or academic activity. Dataset checks can run without text."></textarea></label>
+          <div class="full"><button class="secondary" ${can("use_ai") ? "" : "disabled"}>Run Local AI Helper</button></div>
+          <label class="full">AI helper result<textarea id="ai-workbench-result" readonly></textarea></label>
+        </form>
+      </div>
+      ${can("use_ai") ? "" : `<div class="notice warn">AI helpers are available only to System Admin and Project Admin / PI roles.</div>`}
+      <div class="notice">Novelty is never assumed here. Use generated search terms and ideas as planning aids, then verify with a manual literature search.</div>
+      ${aiAudit.length ? `
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Time</th><th>User</th><th>Purpose</th><th>Mode</th><th>PHI</th><th>Status</th></tr></thead>
+            <tbody>
+              ${aiAudit.slice(0, 20).map((item) => `
+                <tr>
+                  <td>${fmtTime(item.created_at)}</td>
+                  <td>${escapeHtml(item.display_name || item.username || "")}</td>
+                  <td>${escapeHtml(item.purpose || "")}${item.case_uid ? `<br><span class="small">${escapeHtml(item.case_uid)}</span>` : ""}</td>
+                  <td>${escapeHtml(item.mode || "local")}<br><span class="small">${escapeHtml(item.model || "")}</span></td>
+                  <td>${item.phi_detected ? '<span class="pill warn">detected</span>' : '<span class="pill ok">not detected</span>'}</td>
+                  <td>${escapeHtml(item.status || "")}${item.error ? `<br><span class="small">${escapeHtml(item.error)}</span>` : ""}</td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+      ` : `<p>No AI audit events for this study yet.</p>`}
     </section>
     <section class="panel">
       <h2>Publication Opportunities</h2>
@@ -1812,6 +1856,8 @@ function bindRoute() {
   document.querySelectorAll("[data-invitation-action]").forEach((button) => button.addEventListener("click", () => updateInvitation(button.dataset.invitationId, button.dataset.invitationAction)));
   document.querySelector("#report-form")?.addEventListener("submit", submitReport);
   document.querySelector("#academic-cv-form")?.addEventListener("submit", submitAcademicCvItem);
+  document.querySelector("#ai-safety-form")?.addEventListener("submit", submitAiSafetyPreview);
+  document.querySelector("#ai-workbench-form")?.addEventListener("submit", submitAiWorkbench);
   document.querySelector("#academic-export-md")?.addEventListener("click", () => downloadApi(`/api/studies/${state.studyId}/academic/export?format=md`, "academic_portfolio.md"));
   document.querySelector("#academic-export-csv")?.addEventListener("click", () => downloadApi(`/api/studies/${state.studyId}/academic/export?format=csv`, "academic_cv_tracker.csv"));
   document.querySelector("#refresh-drafts")?.addEventListener("click", renderDraftList);
@@ -2262,6 +2308,38 @@ async function submitAcademicCvItem(event) {
   } catch (error) {
     state.error = error.message;
     render();
+  }
+}
+
+async function submitAiSafetyPreview(event) {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(event.target));
+  const output = document.querySelector("#ai-safety-result");
+  try {
+    const result = await api(`/api/studies/${state.studyId}/ai/safety-preview`, {
+      method: "POST",
+      body: JSON.stringify({ text: data.text || "", replacement: "Study participant" }),
+    });
+    if (output) output.value = JSON.stringify(result.preview, null, 2);
+  } catch (error) {
+    if (output) output.value = error.message;
+    state.error = error.message;
+  }
+}
+
+async function submitAiWorkbench(event) {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(event.target));
+  const output = document.querySelector("#ai-workbench-result");
+  try {
+    const result = await api(`/api/studies/${state.studyId}/ai/workbench`, {
+      method: "POST",
+      body: JSON.stringify({ purpose: data.purpose, text: data.text || "" }),
+    });
+    if (output) output.value = JSON.stringify(result.result, null, 2);
+  } catch (error) {
+    if (output) output.value = error.message;
+    state.error = error.message;
   }
 }
 

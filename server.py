@@ -775,6 +775,52 @@ def audit(
     )
 
 
+def record_ai_audit(
+    conn: sqlite3.Connection,
+    user_id: int | None,
+    study_id: int | None = None,
+    case_id: int | None = None,
+    purpose: str = "",
+    input_type: str = "text",
+    mode: str = "local",
+    file_count: int = 0,
+    phi_detected: bool = False,
+    deidentified: bool = False,
+    status_value: str = "ok",
+    error: str = "",
+) -> int:
+    ai_state = ai_status()
+    provider = "openai" if mode == "openai" else "local"
+    model = ai_state.get("model", "local-rules") if mode == "openai" else "local-rules"
+    cur = conn.execute(
+        """
+        INSERT INTO ai_audit(
+            user_id, study_id, case_id, provider, model, mode, purpose, input_type,
+            phi_detected, phi_allowed, deidentified, file_count, status, error, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            study_id,
+            case_id,
+            provider,
+            model,
+            mode,
+            purpose[:80],
+            input_type[:40],
+            1 if phi_detected else 0,
+            1 if ai_state.get("phi_allowed") else 0,
+            1 if deidentified else 0,
+            int(file_count or 0),
+            status_value[:40],
+            str(error or "")[:1000],
+            now(),
+        ),
+    )
+    return int(cur.lastrowid)
+
+
 STUDY_AUDIT_FILTER = """
 (
     audit_log.study_id = ?
@@ -798,6 +844,7 @@ STUDY_AUDIT_FILTER = """
     OR (audit_log.entity_type = 'academic_cv_item' AND audit_log.entity_id IN (SELECT id FROM academic_cv_items WHERE study_id = ?))
     OR (audit_log.entity_type = 'case_intake' AND audit_log.entity_id IN (SELECT id FROM case_intakes WHERE study_id = ?))
     OR (audit_log.entity_type = 'case_ai_review' AND audit_log.entity_id IN (SELECT id FROM case_ai_reviews WHERE study_id = ?))
+    OR (audit_log.entity_type = 'ai_audit' AND audit_log.entity_id IN (SELECT id FROM ai_audit WHERE study_id = ?))
 )
 """
 
@@ -1129,6 +1176,25 @@ def migrate() -> None:
                 created_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS ai_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                study_id INTEGER REFERENCES studies(id) ON DELETE CASCADE,
+                case_id INTEGER REFERENCES case_intakes(id) ON DELETE SET NULL,
+                provider TEXT NOT NULL DEFAULT 'local',
+                model TEXT NOT NULL DEFAULT 'local-rules',
+                mode TEXT NOT NULL DEFAULT 'local',
+                purpose TEXT NOT NULL DEFAULT '',
+                input_type TEXT NOT NULL DEFAULT 'text',
+                phi_detected INTEGER NOT NULL DEFAULT 0,
+                phi_allowed INTEGER NOT NULL DEFAULT 0,
+                deidentified INTEGER NOT NULL DEFAULT 0,
+                file_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'ok',
+                error TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS academic_cv_items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
@@ -1252,6 +1318,8 @@ def add_production_indexes(conn) -> None:
         "CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON audit_log(created_at)",
         "CREATE INDEX IF NOT EXISTS idx_audit_log_entity ON audit_log(entity_type, entity_id)",
         "CREATE INDEX IF NOT EXISTS idx_academic_cv_items_study_id ON academic_cv_items(study_id)",
+        "CREATE INDEX IF NOT EXISTS idx_ai_audit_study_id ON ai_audit(study_id)",
+        "CREATE INDEX IF NOT EXISTS idx_ai_audit_user_id ON ai_audit(user_id)",
         "CREATE INDEX IF NOT EXISTS idx_api_tokens_study_id ON api_tokens(study_id)",
         "CREATE INDEX IF NOT EXISTS idx_api_tokens_token_hash ON api_tokens(token_hash)",
     ]
@@ -3120,6 +3188,12 @@ class App(BaseHTTPRequestHandler):
         conn.commit()
         self.send_json({"ok": True})
 
+    def user_can_use_ai_any_project(self, conn: sqlite3.Connection, user: dict) -> bool:
+        if is_super_admin(user):
+            return True
+        memberships = rows(conn, "SELECT role FROM study_memberships WHERE user_id = ? AND active = 1", (user["id"],))
+        return any(membership_has(item, "use_ai") for item in memberships)
+
     def assist_crf(self, conn: sqlite3.Connection, user: dict) -> None:
         payload = self.body()
         text = str(payload.get("text", "")).strip()
@@ -3129,9 +3203,25 @@ class App(BaseHTTPRequestHandler):
         status = ai_status()
         warnings = []
         mode = "local"
+        findings = detect_phi_findings(text)
+        ai_audit_id = None
         if status["external_ai_enabled"]:
-            assert_external_ai_safe(text)
+            if not self.user_can_use_ai_any_project(conn, user):
+                ai_audit_id = record_ai_audit(
+                    conn,
+                    user["id"],
+                    purpose="protocol_to_crf",
+                    input_type="text",
+                    mode="local",
+                    phi_detected=bool(findings),
+                    status_value="blocked",
+                    error="External AI permission required",
+                )
+                audit(conn, user["id"], "ai_request", "ai_audit", ai_audit_id, None, {"purpose": "protocol_to_crf", "status": "blocked"}, **self.audit_context())
+                self.send_error_json("AI permission required", 403)
+                return
             try:
+                assert_external_ai_safe(text)
                 schema = draft_crf_schema_with_openai(text)
                 mode = "openai"
             except Exception as exc:
@@ -3139,18 +3229,179 @@ class App(BaseHTTPRequestHandler):
                 warnings.append(f"External AI drafting failed; local fallback used: {exc}")
         else:
             schema, warnings = draft_crf_schema_locally(text)
-        audit(conn, user["id"], "assist_crf", "ai", None, None, {"mode": mode, "field_count": len(schema["fields"]), "warning_count": len(warnings)})
+        ai_audit_id = record_ai_audit(
+            conn,
+            user["id"],
+            purpose="protocol_to_crf",
+            input_type="text",
+            mode=mode,
+            phi_detected=bool(findings),
+            deidentified=False,
+            status_value="fallback" if warnings and mode == "local" and status["external_ai_enabled"] else "ok",
+            error="; ".join(warnings),
+        )
+        audit(
+            conn,
+            user["id"],
+            "ai_request",
+            "ai_audit",
+            ai_audit_id,
+            None,
+            {"purpose": "protocol_to_crf", "mode": mode, "field_count": len(schema["fields"]), "warning_count": len(warnings), "phi_detected": bool(findings)},
+            **self.audit_context(),
+        )
         self.send_json(
             {
                 "schema": schema,
                 "assistant": {
                     "mode": mode,
+                    "audit_id": ai_audit_id,
                     "field_count": len(schema["fields"]),
                     "warnings": warnings,
+                    "phi_findings": findings,
                     "safety_note": "Review every AI/local draft field before using it for real study data. Do not paste identifiers or PHI into external AI unless your study policy permits it.",
                 },
             }
         )
+
+    def ai_audit_rows(self, conn: sqlite3.Connection, study_id: int) -> list[dict]:
+        data = rows(
+            conn,
+            """
+            SELECT ai_audit.*, users.username, users.display_name, case_intakes.case_uid, case_intakes.title AS case_title
+            FROM ai_audit
+            LEFT JOIN users ON users.id = ai_audit.user_id
+            LEFT JOIN case_intakes ON case_intakes.id = ai_audit.case_id
+            WHERE ai_audit.study_id = ? OR ai_audit.study_id IS NULL
+            ORDER BY ai_audit.id DESC
+            LIMIT 250
+            """,
+            (study_id,),
+        )
+        for item in data:
+            item["phi_detected"] = bool(item.get("phi_detected"))
+            item["phi_allowed"] = bool(item.get("phi_allowed"))
+            item["deidentified"] = bool(item.get("deidentified"))
+        return data
+
+    def local_ai_workbench_result(self, conn, study_id: int, membership: dict, user: dict, purpose: str, text: str = "", case_id: int | None = None) -> dict:
+        purpose = purpose.strip().lower().replace("-", "_")
+        cases = self.case_rows(conn, study_id, membership, user)
+        if purpose == "case_summary":
+            if case_id:
+                case_row = self.case_for_member(conn, study_id, case_id, membership, user)
+                if not case_row:
+                    raise ValueError("Case not found")
+                case_item = self.case_payload(conn, case_row)
+                extracted = case_item.get("extracted", {})
+            else:
+                extracted = extract_case_intelligence(text, "Case note")
+            clinical = extracted.get("clinical", {})
+            return {
+                "purpose": purpose,
+                "summary": " ".join(part for part in [clinical.get("diagnosis", ""), clinical.get("presentation", ""), clinical.get("treatment", ""), clinical.get("outcome", "")] if part) or "Insufficient structured case detail for a reliable local summary.",
+                "structured": extracted,
+                "missing_items": extracted.get("missing_fields", []),
+                "safety_note": "Local summary is rule-based and should be checked against the source record.",
+            }
+        if purpose == "missing_fields":
+            issues = self.quality_issues(conn, study_id, membership)
+            missing = [issue for issue in issues if "missing" in str(issue.get("message", "")).lower() or issue.get("severity") == "warning"]
+            return {"purpose": purpose, "missing_count": len(missing), "items": missing[:100], "safety_note": "Use this as a preparation list before analysis or publication."}
+        if purpose == "inconsistency_detection":
+            issues = self.quality_issues(conn, study_id, membership)
+            errors = [issue for issue in issues if issue.get("severity") == "error"]
+            return {"purpose": purpose, "issue_count": len(errors), "items": errors[:100], "safety_note": "Rule-based checks do not replace clinical review."}
+        if purpose == "publication_idea":
+            return {
+                "purpose": purpose,
+                "opportunities": publication_opportunities(cases),
+                "safety_note": "These are publication angles only. Novelty requires a manual literature search.",
+            }
+        if purpose == "cv_item":
+            extracted = extract_case_intelligence(text, "Academic activity")
+            title = text.splitlines()[0].strip()[:140] if text.strip() else "Academic activity"
+            return {
+                "purpose": purpose,
+                "suggested_item": {
+                    "item_type": "publication" if "manuscript" in text.lower() or "paper" in text.lower() else "teaching" if "teach" in text.lower() else "abstract" if "abstract" in text.lower() else "activity",
+                    "title": title,
+                    "status": "planned",
+                    "notes": "Review and edit before saving to the CV tracker.",
+                },
+                "structured": extracted,
+                "safety_note": "AI/local suggestions are labels, not confirmed academic achievements.",
+            }
+        raise ValueError("Unsupported AI workbench purpose")
+
+    def ai_routes(self, conn, user, method, study_id, parts, membership) -> None:
+        if method == "GET" and len(parts) == 5 and parts[4] == "audit":
+            if not (membership_has(membership, "manage_study") or membership_has(membership, "review_data")):
+                self.send_error_json("AI audit permission required", 403)
+                return
+            self.send_json({"ai_audit": self.ai_audit_rows(conn, study_id), "ai": ai_status()})
+            return
+        if method == "POST" and len(parts) == 5 and parts[4] == "safety-preview":
+            if not membership_has(membership, "use_ai"):
+                self.send_error_json("AI permission required", 403)
+                return
+            payload = self.body()
+            text = str(payload.get("text", ""))
+            replacement = str(payload.get("replacement", "Study participant")) or "Study participant"
+            findings = detect_phi_findings(text)
+            cleaned = deidentify_for_ai(text, replacement)
+            ai_audit_id = record_ai_audit(
+                conn,
+                user["id"],
+                study_id=study_id,
+                purpose="deidentify_preview",
+                input_type="text",
+                mode="local",
+                phi_detected=bool(findings),
+                deidentified=True,
+                status_value="preview",
+            )
+            audit(conn, user["id"], "ai_request", "ai_audit", ai_audit_id, None, {"purpose": "deidentify_preview", "phi_detected": bool(findings)}, study_id=study_id, **self.audit_context())
+            self.send_json(
+                {
+                    "preview": {
+                        "findings": findings,
+                        "deidentified_text": cleaned,
+                        "remaining_findings": detect_phi_findings(cleaned),
+                        "external_ai_blocked": bool(findings and ai_status()["external_ai_enabled"] and not ai_status()["phi_allowed"]),
+                        "requires_admin_confirmation": bool(findings),
+                    },
+                    "ai": ai_status(),
+                    "audit_id": ai_audit_id,
+                }
+            )
+            return
+        if method == "POST" and len(parts) == 5 and parts[4] == "workbench":
+            if not membership_has(membership, "use_ai"):
+                self.send_error_json("AI permission required", 403)
+                return
+            payload = self.body()
+            purpose = str(payload.get("purpose", "")).strip().lower()
+            text = str(payload.get("text", ""))
+            case_id = int(payload.get("case_id") or 0) or None
+            findings = detect_phi_findings(text)
+            result = self.local_ai_workbench_result(conn, study_id, membership, user, purpose, text, case_id)
+            ai_audit_id = record_ai_audit(
+                conn,
+                user["id"],
+                study_id=study_id,
+                case_id=case_id,
+                purpose=purpose,
+                input_type="text",
+                mode="local",
+                phi_detected=bool(findings),
+                deidentified=False,
+                status_value="ok",
+            )
+            audit(conn, user["id"], "ai_request", "ai_audit", ai_audit_id, None, {"purpose": purpose, "mode": "local", "phi_detected": bool(findings)}, study_id=study_id, **self.audit_context())
+            self.send_json({"result": result, "ai": ai_status(), "audit_id": ai_audit_id})
+            return
+        self.send_error_json("Unsupported AI operation", 405)
 
     def create_study(self, conn: sqlite3.Connection, user: dict) -> None:
         if not is_super_admin(user):
@@ -3467,6 +3718,8 @@ class App(BaseHTTPRequestHandler):
                 self.send_error_json("Academic workbench permission required", 403)
                 return
             return self.academic_workbench(conn, user, method, study_id, parts, query, membership)
+        if resource == "ai":
+            return self.ai_routes(conn, user, method, study_id, parts, membership)
         if resource == "backups":
             if not membership_has(membership, "manage_study"):
                 self.send_error_json("Study management permission required", 403)
@@ -3515,7 +3768,7 @@ class App(BaseHTTPRequestHandler):
                 audit_params,
             )
             suspicious_actions = {"failed_login", "export", "download", "create_full", "create_encrypted", "ai_request", "api_request", "sync_conflict"}
-            suspicious = [item for item in audit_rows if item["action"] in suspicious_actions or item["entity_type"] in {"backup", "case_file", "case_ai_review"}]
+            suspicious = [item for item in audit_rows if item["action"] in suspicious_actions or item["entity_type"] in {"backup", "case_file", "case_ai_review", "ai_audit"}]
             return self.send_json({"audit": audit_rows, "suspicious": suspicious[:50]})
         if resource == "audit-export" and method == "GET":
             if not membership_has(membership, "review_data"):
@@ -4410,6 +4663,8 @@ class App(BaseHTTPRequestHandler):
             case_item = self.case_payload(conn, case_row)
             status = ai_status()
             mode = "local"
+            findings = detect_phi_findings(str(case_item.get("source_text", "")) + "\n" + question)
+            ai_error = ""
             try:
                 if status["external_ai_enabled"]:
                     response = openai_academic_case_review(conn, study_id, case_item, all_cases, question)
@@ -4417,6 +4672,7 @@ class App(BaseHTTPRequestHandler):
                 else:
                     response = local_academic_case_review(case_item, all_cases, question)
             except Exception as exc:
+                ai_error = str(exc)
                 response = local_academic_case_review(case_item, all_cases, question)
                 response["safety_notes"].append(f"External AI review failed; local fallback used: {exc}")
             file_count = len(case_item.get("files", []))
@@ -4429,7 +4685,42 @@ class App(BaseHTTPRequestHandler):
                 (case_id, study_id, question, mode, json.dumps(response), file_count, user["id"], timestamp),
             )
             review = row(conn, "SELECT id, user_prompt, mode, response_json, file_count, created_by, created_at FROM case_ai_reviews WHERE id = ?", (cur.lastrowid,))
-            audit(conn, user["id"], "academic_ai_review", "case_ai_review", cur.lastrowid, None, {"case_id": case_id, "mode": mode, "file_count": file_count})
+            ai_audit_id = record_ai_audit(
+                conn,
+                user["id"],
+                study_id=study_id,
+                case_id=case_id,
+                purpose="case_publication_review",
+                input_type="mixed" if file_count else "text",
+                mode=mode,
+                file_count=file_count,
+                phi_detected=bool(findings),
+                deidentified=mode == "openai" and not status["phi_allowed"],
+                status_value="fallback" if ai_error else "ok",
+                error=ai_error,
+            )
+            audit(
+                conn,
+                user["id"],
+                "academic_ai_review",
+                "case_ai_review",
+                cur.lastrowid,
+                None,
+                {"case_id": case_id, "mode": mode, "file_count": file_count, "ai_audit_id": ai_audit_id},
+                study_id=study_id,
+                **self.audit_context(),
+            )
+            audit(
+                conn,
+                user["id"],
+                "ai_request",
+                "ai_audit",
+                ai_audit_id,
+                None,
+                {"purpose": "case_publication_review", "case_id": case_id, "mode": mode, "file_count": file_count, "phi_detected": bool(findings)},
+                study_id=study_id,
+                **self.audit_context(),
+            )
             conn.commit()
             review["response"] = load_json(review.pop("response_json"), {})
             self.send_json({"review": review, "ai": status}, 201)
@@ -5417,6 +5708,7 @@ class App(BaseHTTPRequestHandler):
         opportunities = publication_opportunities(cases)
         ai_review_count = row(conn, "SELECT COUNT(*) AS count FROM case_ai_reviews WHERE study_id = ?", (study_id,))["count"]
         report_count = row(conn, "SELECT COUNT(*) AS count FROM reports WHERE study_id = ?", (study_id,))["count"]
+        ai_audit = self.ai_audit_rows(conn, study_id) if membership and (membership_has(membership, "manage_study") or membership_has(membership, "review_data")) else []
         return {
             "metrics": {
                 "case_count": len(cases),
@@ -5427,6 +5719,14 @@ class App(BaseHTTPRequestHandler):
             },
             "opportunities": opportunities,
             "cv_items": cv_items,
+            "ai_audit": ai_audit,
+            "prompt_templates": [
+                {"purpose": "case_summary", "label": "Case note to structured summary"},
+                {"purpose": "missing_fields", "label": "Dataset missing field check"},
+                {"purpose": "inconsistency_detection", "label": "Dataset inconsistency check"},
+                {"purpose": "publication_idea", "label": "Case set publication ideas"},
+                {"purpose": "cv_item", "label": "Academic activity to CV item"},
+            ],
             "cv_markdown": academic_cv_markdown(study, cv_items, opportunities),
             "ai": ai_status(),
             "guidance": [

@@ -553,6 +553,45 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertIn("text/markdown", md_type)
         self.assertIn(b"Influenza pneumonia case report", md_body)
 
+    def test_ai_safety_workbench_audit_and_permissions(self):
+        token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]
+        study_id = self.request_json("/api/studies", token=token)["studies"][0]["id"]
+        preview = self.request_json(
+            f"/api/studies/{study_id}/ai/safety-preview",
+            "POST",
+            {"text": "Patient name: John Doe\nPhone: 9999999999\nDiagnosis: influenza pneumonia"},
+            token,
+        )
+        self.assertIn("patient_name_label", preview["preview"]["findings"])
+        self.assertIn("[phone removed]", preview["preview"]["deidentified_text"])
+        workbench = self.request_json(
+            f"/api/studies/{study_id}/ai/workbench",
+            "POST",
+            {"purpose": "cv_item", "text": "Presented an influenza case report abstract at local conference"},
+            token,
+        )
+        self.assertEqual(workbench["result"]["purpose"], "cv_item")
+        self.assertIn("suggested_item", workbench["result"])
+        ai_audit = self.request_json(f"/api/studies/{study_id}/ai/audit", token=token)["ai_audit"]
+        purposes = {item["purpose"] for item in ai_audit}
+        self.assertTrue({"deidentify_preview", "cv_item"}.issubset(purposes))
+        audit_payload = self.request_json(f"/api/studies/{study_id}/audit?action=ai_request", token=token)
+        self.assertTrue(audit_payload["audit"])
+
+        data_user = self.request_json(
+            "/api/users",
+            "POST",
+            {"username": "ai.entry", "display_name": "AI Entry", "password": "Temporary12345", "role": "data_entry"},
+            token,
+        )["user"]
+        self.request_json(f"/api/studies/{study_id}/memberships", "POST", {"user_id": data_user["id"], "role": "data_entry", "active": True}, token)
+        data_token = self.request_json("/api/login", "POST", {"username": "ai.entry", "password": "Temporary12345"})["token"]
+        self.request_json("/api/password", "POST", {"current_password": "Temporary12345", "new_password": "DataEntryStrong123"}, data_token)
+        with self.assertRaises(HTTPError) as denied:
+            self.request_json(f"/api/studies/{study_id}/ai/workbench", "POST", {"purpose": "case_summary", "text": "deidentified note"}, data_token)
+        self.assertEqual(denied.exception.code, 403)
+        denied.exception.close()
+
     def test_sensitive_actions_are_audited_and_filterable(self):
         login = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})
         token = login["token"]

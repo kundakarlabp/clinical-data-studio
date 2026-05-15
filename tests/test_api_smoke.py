@@ -553,6 +553,43 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertIn("text/markdown", md_type)
         self.assertIn(b"Influenza pneumonia case report", md_body)
 
+    def test_sensitive_actions_are_audited_and_filterable(self):
+        login = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})
+        token = login["token"]
+        study_id = self.request_json("/api/studies", token=token)["studies"][0]["id"]
+        form = self.request_json(f"/api/studies/{study_id}/forms", token=token)["forms"][0]
+        schema = form["schema"]
+        schema["fields"].append({"code": "audit_note", "label": "Audit Note", "type": "text"})
+        self.request_json(f"/api/studies/{study_id}/forms/{form['id']}", "PATCH", {"name": form["name"], "code": form["code"], "schema": schema}, token)
+        data_user = self.request_json(
+            "/api/users",
+            "POST",
+            {"username": "audit.entry", "display_name": "Audit Entry", "password": "Temporary12345", "role": "data_entry"},
+            token,
+        )["user"]
+        self.request_json(f"/api/studies/{study_id}/memberships", "POST", {"user_id": data_user["id"], "role": "data_entry", "active": True}, token)
+        backup = self.request_json(f"/api/studies/{study_id}/backups", "POST", {"passphrase": "LongLocalPassphrase123"}, token)["backup"]
+        self.assertTrue(backup["encrypted"])
+        case = self.request_json(
+            f"/api/studies/{study_id}/case-intake",
+            "POST",
+            {"case_uid": "AUDIT-CASE-001", "title": "Audit case", "source_text": "Deidentified note.", "files": [{"name": "audit.txt", "type": "text/plain", "data": "YXVkaXQ="}]},
+            token,
+        )["case"]
+        self.request_raw(f"/api/studies/{study_id}/case-intake/{case['id']}/files/{case['files'][0]['id']}", token=token)
+        self.request_raw(f"/api/studies/{study_id}/export", token=token)
+        audit_payload = self.request_json(f"/api/studies/{study_id}/audit?action=export", token=token)
+        self.assertTrue(audit_payload["audit"])
+        all_audit = self.request_json(f"/api/studies/{study_id}/audit", token=token)
+        actions = {item["action"] for item in all_audit["audit"]}
+        self.assertTrue({"update", "create", "create_encrypted", "download", "export"}.issubset(actions))
+        self.assertTrue(all_audit["suspicious"])
+        _, audit_type, audit_body = self.request_raw(f"/api/studies/{study_id}/audit-export?action=download", token=token)
+        audit_text = audit_body.decode("utf-8-sig")
+        self.assertIn("text/csv", audit_type)
+        self.assertIn("ip_address", audit_text)
+        self.assertIn("download", audit_text)
+
     def test_public_survey_with_consent_and_file_upload(self):
         token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]
         study_id = self.request_json("/api/studies", token=token)["studies"][0]["id"]

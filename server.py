@@ -806,6 +806,28 @@ def study_audit_params(study_id: int) -> tuple[int, ...]:
     return (study_id,) * STUDY_AUDIT_FILTER.count("?")
 
 
+def audit_filters(study_id: int, query: dict[str, list[str]] | None = None) -> tuple[str, tuple]:
+    where = [STUDY_AUDIT_FILTER]
+    params: list = list(study_audit_params(study_id))
+    query = query or {}
+    if (query.get("user_id") or [""])[0]:
+        where.append("audit_log.user_id = ?")
+        params.append(int((query.get("user_id") or ["0"])[0]))
+    if (query.get("action") or [""])[0]:
+        where.append("audit_log.action = ?")
+        params.append((query.get("action") or [""])[0])
+    if (query.get("entity_type") or [""])[0]:
+        where.append("audit_log.entity_type = ?")
+        params.append((query.get("entity_type") or [""])[0])
+    if (query.get("date_from") or [""])[0]:
+        where.append("audit_log.created_at >= ?")
+        params.append(int((query.get("date_from") or ["0"])[0]))
+    if (query.get("date_to") or [""])[0]:
+        where.append("audit_log.created_at <= ?")
+        params.append(int((query.get("date_to") or ["0"])[0]))
+    return " AND ".join(f"({item})" for item in where), tuple(params)
+
+
 def migrate() -> None:
     with closing(db()) as conn, conn:
         if getattr(conn, "backend", "sqlite") == "postgres":
@@ -3479,25 +3501,28 @@ class App(BaseHTTPRequestHandler):
             if not membership_has(membership, "review_data"):
                 self.send_error_json("Review permission required", 403)
                 return
+            audit_where, audit_params = audit_filters(study_id, query)
             audit_rows = rows(
                 conn,
                 f"""
-                SELECT audit_log.*, users.display_name
+                SELECT audit_log.*, users.username, users.display_name
                 FROM audit_log
                 LEFT JOIN users ON users.id = audit_log.user_id
-                WHERE {STUDY_AUDIT_FILTER}
+                WHERE {audit_where}
                 ORDER BY audit_log.id DESC
                 LIMIT 250
                 """,
-                study_audit_params(study_id),
+                audit_params,
             )
-            return self.send_json({"audit": audit_rows})
+            suspicious_actions = {"failed_login", "export", "download", "create_full", "create_encrypted", "ai_request", "api_request", "sync_conflict"}
+            suspicious = [item for item in audit_rows if item["action"] in suspicious_actions or item["entity_type"] in {"backup", "case_file", "case_ai_review"}]
+            return self.send_json({"audit": audit_rows, "suspicious": suspicious[:50]})
         if resource == "audit-export" and method == "GET":
             if not membership_has(membership, "review_data"):
                 self.send_error_json("Review permission required", 403)
                 return
             audit(conn, user["id"], "export", "audit", study_id, None, {"format": "csv"}, study_id=study_id, **self.audit_context())
-            return self.export_audit_csv(conn, study_id)
+            return self.export_audit_csv(conn, study_id, query)
         self.send_error_json("Unknown study route", 404)
 
     def forms(self, conn, user, method, study_id, parts) -> None:
@@ -5300,21 +5325,24 @@ class App(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
 
-    def export_audit_csv(self, conn, study_id: int) -> None:
+    def export_audit_csv(self, conn, study_id: int, query: dict[str, list[str]] | None = None) -> None:
+        audit_where, audit_params = audit_filters(study_id, query)
         audit_rows = rows(
             conn,
             f"""
             SELECT audit_log.id, audit_log.created_at, users.username, users.display_name,
-                   audit_log.action, audit_log.entity_type, audit_log.entity_id, audit_log.before_json, audit_log.after_json
+                   audit_log.action, audit_log.entity_type, audit_log.entity_id,
+                   audit_log.study_id, audit_log.ip_address, audit_log.user_agent, audit_log.request_id,
+                   audit_log.before_json, audit_log.after_json
             FROM audit_log
             LEFT JOIN users ON users.id = audit_log.user_id
-            WHERE {STUDY_AUDIT_FILTER}
+            WHERE {audit_where}
             ORDER BY audit_log.id DESC
             LIMIT 5000
             """,
-            study_audit_params(study_id),
+            audit_params,
         )
-        fieldnames = ["id", "created_at", "username", "display_name", "action", "entity_type", "entity_id", "before_json", "after_json"]
+        fieldnames = ["id", "created_at", "username", "display_name", "action", "entity_type", "entity_id", "study_id", "ip_address", "user_agent", "request_id", "before_json", "after_json"]
         text_lines = []
         class Sink:
             def write(self, value):

@@ -31,6 +31,7 @@ from urllib.request import Request as UrlRequest, urlopen as urlopen_request
 from xml.etree import ElementTree
 
 from ai.safety import ai_status_payload, assert_external_ai_safe as assert_ai_text_safe, deidentify_for_ai as deidentify_text_for_ai, phi_findings as detect_phi_findings
+from authz import PROJECT_ADMIN_ROLES, ROLE_PERMISSIONS, SYSTEM_ADMIN_ROLES, can as authz_can, is_super_admin as authz_is_super_admin, membership_has as authz_membership_has, role_has as authz_role_has, safe_role as authz_safe_role
 from config import load_settings
 from storage import connect_database, migrate_postgres
 
@@ -62,61 +63,7 @@ CALC_OPERATORS = {
 }
 FILE_ATTRIBUTE_ENCRYPTED = 0x4000
 
-ROLE_PERMISSIONS = {
-    "super_admin": {
-        "system_admin",
-        "manage_users",
-        "manage_study",
-        "manage_forms",
-        "enter_data",
-        "review_data",
-        "export_data",
-        "view_analysis",
-    },
-    "admin": {
-        "system_admin",
-        "manage_users",
-        "manage_study",
-        "manage_forms",
-        "enter_data",
-        "review_data",
-        "export_data",
-        "view_analysis",
-    },
-    "owner": {
-        "manage_users",
-        "manage_study",
-        "manage_forms",
-        "enter_data",
-        "review_data",
-        "export_data",
-        "view_analysis",
-    },
-    "project_admin": {
-        "manage_users",
-        "manage_study",
-        "manage_forms",
-        "enter_data",
-        "review_data",
-        "export_data",
-        "view_analysis",
-    },
-    "pi": {
-        "manage_users",
-        "manage_study",
-        "manage_forms",
-        "enter_data",
-        "review_data",
-        "export_data",
-        "view_analysis",
-    },
-    "data_entry": {"enter_data"},
-    "reviewer": {"review_data", "view_analysis"},
-    "analyst": {"export_data", "view_analysis"},
-    "viewer": {"view_analysis"},
-    "read_only": {"view_analysis"},
-}
-SUPERUSER_ROLES = {"admin", "super_admin"}
+SUPERUSER_ROLES = SYSTEM_ADMIN_ROLES
 PROJECT_ADMIN_ROLES = {"owner", "project_admin", "pi"}
 PASSWORD_MIN_LENGTH = 10
 PRODUCTION_ADMIN_PASSWORD_MIN_LENGTH = 12
@@ -296,11 +243,11 @@ def ai_status() -> dict:
 
 
 def is_super_admin(user: dict | None) -> bool:
-    return bool(user and user.get("role") in SUPERUSER_ROLES)
+    return authz_is_super_admin(user)
 
 
 def safe_role(role: str) -> str:
-    return (role or "").strip().lower()
+    return authz_safe_role(role)
 
 
 def parse_token_scopes(value: str | None) -> set[str]:
@@ -2409,11 +2356,11 @@ def user_membership(conn: sqlite3.Connection, user: dict, study_id: int) -> dict
 
 
 def role_has(role: str, permission: str) -> bool:
-    return permission in ROLE_PERMISSIONS.get(role, set())
+    return authz_role_has(role, permission)
 
 
 def membership_has(membership: dict | None, permission: str) -> bool:
-    return bool(membership and role_has(membership["role"], permission))
+    return authz_membership_has(membership, permission)
 
 
 class App(BaseHTTPRequestHandler):
@@ -4653,6 +4600,8 @@ class App(BaseHTTPRequestHandler):
                 """,
                 (study_id,),
             )
+            for membership in memberships:
+                membership["effective_permissions"] = sorted(ROLE_PERMISSIONS.get(safe_role(membership.get("role", "")), set()))
             self.send_json({"memberships": memberships})
             return
         if method == "POST":

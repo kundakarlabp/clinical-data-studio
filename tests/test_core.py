@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import config
+import authz
 import server
 
 
@@ -58,6 +59,15 @@ class CoreEdcTests(unittest.TestCase):
         self.assertEqual(issues, [])
         self.assertNotIn("pregnant", cleaned_hidden)
         self.assertEqual(server.choice_label(schema["fields"][1], "2"), "Female")
+
+    def test_authz_denies_unknown_roles_and_actions(self):
+        user = {"id": 10, "role": "data_entry"}
+        membership = {"role": "data_entry", "data_group_id": 1}
+        self.assertTrue(authz.can(user, "entries.create", membership, {"data_group_id": 1}))
+        self.assertFalse(authz.can(user, "export.read", membership))
+        self.assertFalse(authz.can({"id": 11, "role": "unknown"}, "entries.create", {"role": "unknown"}))
+        self.assertFalse(authz.can(user, "unknown.action", membership))
+        self.assertFalse(authz.can(user, "entries.create", membership, {"data_group_id": 2}))
 
     def test_local_crf_assistant_detects_types_and_choices(self):
         schema, warnings = server.draft_crf_schema_locally("Age\nVisit date\nSex (Female, Male, Unknown)\nAny adverse event?")

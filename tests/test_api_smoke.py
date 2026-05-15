@@ -687,11 +687,28 @@ class ApiSmokeTests(unittest.TestCase):
             {"username": "analyst.user", "display_name": "Analyst User", "password": "Temporary12345", "role": "analyst"},
             admin_token,
         )["user"]
+        viewer_user = self.request_json(
+            "/api/users",
+            "POST",
+            {"username": "viewer.user", "display_name": "Viewer User", "password": "Temporary12345", "role": "viewer"},
+            admin_token,
+        )["user"]
+        unassigned_user = self.request_json(
+            "/api/users",
+            "POST",
+            {"username": "unassigned.user", "display_name": "Unassigned User", "password": "Temporary12345", "role": "data_entry"},
+            admin_token,
+        )["user"]
         group_a = self.request_json(f"/api/studies/{study_id}/groups", "POST", {"name": "Site A", "code": "site_a"}, admin_token)["group"]
         group_b = self.request_json(f"/api/studies/{study_id}/groups", "POST", {"name": "Site B", "code": "site_b"}, admin_token)["group"]
         self.request_json(f"/api/studies/{study_id}/memberships", "POST", {"user_id": data_user["id"], "role": "data_entry", "data_group_id": group_a["id"], "active": True}, admin_token)
         self.request_json(f"/api/studies/{study_id}/memberships", "POST", {"user_id": other_data_user["id"], "role": "data_entry", "data_group_id": group_b["id"], "active": True}, admin_token)
         self.request_json(f"/api/studies/{study_id}/memberships", "POST", {"user_id": analyst_user["id"], "role": "analyst", "active": True}, admin_token)
+        self.request_json(f"/api/studies/{study_id}/memberships", "POST", {"user_id": viewer_user["id"], "role": "viewer", "active": True}, admin_token)
+        memberships = self.request_json(f"/api/studies/{study_id}/memberships", token=admin_token)["memberships"]
+        viewer_membership = next(item for item in memberships if item["user_id"] == viewer_user["id"])
+        self.assertIn("view_analysis", viewer_membership["effective_permissions"])
+        self.assertNotIn("enter_data", viewer_membership["effective_permissions"])
 
         entry_token = self.request_json("/api/login", "POST", {"username": "entry.user", "password": "Temporary12345"})["token"]
         self.request_json("/api/password", "POST", {"current_password": "Temporary12345", "new_password": "EntryUserStrong123"}, entry_token)
@@ -750,6 +767,21 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("text/csv", content_type)
         self.assertIn(b"EXP00001", body)
+
+        viewer_token = self.request_json("/api/login", "POST", {"username": "viewer.user", "password": "Temporary12345"})["token"]
+        self.request_json("/api/password", "POST", {"current_password": "Temporary12345", "new_password": "ViewerStrong123"}, viewer_token)
+        with self.assertRaises(HTTPError) as viewer_edit_denied:
+            self.request_json(f"/api/studies/{study_id}/participants", "POST", {"study_uid": "VIEW001"}, viewer_token)
+        self.assertEqual(viewer_edit_denied.exception.code, 403)
+        viewer_edit_denied.exception.close()
+
+        unassigned_token = self.request_json("/api/login", "POST", {"username": "unassigned.user", "password": "Temporary12345"})["token"]
+        self.request_json("/api/password", "POST", {"current_password": "Temporary12345", "new_password": "UnassignedStrong123"}, unassigned_token)
+        self.assertEqual(self.request_json("/api/studies", token=unassigned_token)["studies"], [])
+        with self.assertRaises(HTTPError) as unassigned_denied:
+            self.request_json(f"/api/studies/{study_id}/participants", token=unassigned_token)
+        self.assertEqual(unassigned_denied.exception.code, 403)
+        unassigned_denied.exception.close()
 
         scoped_token = self.request_json(
             f"/api/studies/{study_id}/api-tokens",

@@ -1630,13 +1630,14 @@ function accessView() {
       </form>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>User</th><th>Role</th><th>Group</th><th>Active</th></tr></thead>
+          <thead><tr><th>User</th><th>Role</th><th>Group</th><th>Effective Permissions</th><th>Active</th></tr></thead>
           <tbody>
             ${state.studyMembers.map((item) => `
               <tr>
                 <td>${escapeHtml(item.username)}<br><span class="small">${escapeHtml(item.display_name)}</span></td>
                 <td><span class="pill">${escapeHtml(roleLabel(item.role))}</span></td>
                 <td>${escapeHtml(item.data_group_name || "All groups")}</td>
+                <td><span class="small">${escapeHtml((item.effective_permissions || []).join(", "))}</span></td>
                 <td>${item.active ? "Yes" : "No"}</td>
               </tr>
             `).join("")}

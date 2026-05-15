@@ -1,9 +1,11 @@
+import csv
 import json
 import tempfile
 import threading
 import unittest
 from contextlib import closing
 from http.server import ThreadingHTTPServer
+from io import StringIO
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urlencode
@@ -391,6 +393,52 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertIn("versioned_crf__new_field", csv_text)
         self.assertIn("kept value", csv_text)
         self.assertIn("older_form_version", csv_text)
+
+    def test_data_dictionary_coded_choices_round_trip_and_label_export(self):
+        token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]
+        study_id = self.request_json("/api/studies", token=token)["studies"][0]["id"]
+        dictionary_buffer = StringIO()
+        headers = [
+            "instrument_name", "instrument_label", "field_order", "field_name", "field_label", "field_type",
+            "required", "choices", "validation_min", "validation_max", "validation_type", "regex",
+            "units", "field_note", "branching_logic", "calculation", "phi", "identifier", "repeatable",
+        ]
+        writer = csv.DictWriter(dictionary_buffer, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(
+            [
+                {"instrument_name": "coded_demo", "instrument_label": "Coded Demo", "field_order": 1, "field_name": "age", "field_label": "Age", "field_type": "integer", "required": "yes", "validation_min": 0, "validation_max": 120, "units": "years", "field_note": "Age at entry", "repeatable": "no"},
+                {"instrument_name": "coded_demo", "instrument_label": "Coded Demo", "field_order": 2, "field_name": "sex", "field_label": "Sex", "field_type": "radio", "required": "yes", "choices": "1, Male | 2, Female | 3, Other", "phi": "yes", "identifier": "yes", "repeatable": "no"},
+                {"instrument_name": "coded_demo", "instrument_label": "Coded Demo", "field_order": 3, "field_name": "pregnant", "field_label": "Pregnant", "field_type": "yesno", "required": "no", "branching_logic": "age >= 18 AND sex == 2", "repeatable": "no"},
+            ]
+        )
+        dictionary = dictionary_buffer.getvalue()
+        imported = self.request_json(f"/api/studies/{study_id}/dictionary", "POST", {"csv": dictionary}, token)["imported"]
+        form_id = imported[0]["form_id"]
+        form = next(item for item in self.request_json(f"/api/studies/{study_id}/forms", token=token)["forms"] if item["id"] == form_id)
+        sex_field = next(field for field in form["schema"]["fields"] if field["code"] == "sex")
+        self.assertEqual(sex_field["choices"][1], {"value": "2", "label": "Female"})
+        participant = self.request_json(
+            f"/api/studies/{study_id}/participants",
+            "POST",
+            {"study_uid": "CHOICE001", "initials": "CH", "status": "enrolled"},
+            token,
+        )["participant"]
+        self.request_json(
+            f"/api/studies/{study_id}/entries",
+            "POST",
+            {"participant_id": participant["id"], "form_id": form_id, "status": "complete", "data": {"age": "24", "sex": "2", "pregnant": "1"}},
+            token,
+        )
+        _, raw_type, raw_body = self.request_raw(f"/api/studies/{study_id}/export", token=token)
+        self.assertIn("text/csv", raw_type)
+        self.assertIn("coded_demo__sex", raw_body.decode("utf-8-sig"))
+        _, label_type, label_body = self.request_raw(f"/api/studies/{study_id}/export?choice_format=labels", token=token)
+        self.assertIn("text/csv", label_type)
+        self.assertIn("Female", label_body.decode("utf-8-sig"))
+        _, codebook_type, codebook_body = self.request_raw(f"/api/studies/{study_id}/codebook", token=token)
+        self.assertIn("text/csv", codebook_type)
+        self.assertIn("1, Male | 2, Female", codebook_body.decode("utf-8-sig"))
 
     def test_case_intake_groups_unstructured_cases_and_exports(self):
         token = self.request_json("/api/login", "POST", {"username": "admin", "password": "admin123"})["token"]

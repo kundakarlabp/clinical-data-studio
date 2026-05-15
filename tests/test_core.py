@@ -36,6 +36,29 @@ class CoreEdcTests(unittest.TestCase):
         self.assertEqual(issues, [])
         self.assertEqual(cleaned["double_weight"], 100)
 
+    def test_redcap_style_choices_metadata_and_branching(self):
+        schema = server.normalize_schema(
+            {
+                "fields": [
+                    {"code": "age", "label": "Age", "type": "integer", "min": 0, "max": 120, "units": "years"},
+                    {"code": "sex", "label": "Sex", "type": "radio", "choices": "1, Male | 2, Female | 3, Other"},
+                    {"code": "pregnant", "label": "Pregnant", "type": "yesno", "branching_logic": "age >= 18 AND sex == 2"},
+                    {"code": "note", "label": "Note", "type": "descriptive", "help_text": "Shown only as text"},
+                ]
+            }
+        )
+        self.assertEqual(schema["fields"][1]["choices"][1], {"value": "2", "label": "Female"})
+        self.assertEqual(schema["fields"][2]["options"], ["1", "0"])
+        cleaned, issues = server.validate_entry_data(schema, {"age": "21", "sex": "2", "pregnant": "1"})
+        self.assertEqual(issues, [])
+        self.assertEqual(cleaned["age"], 21)
+        self.assertEqual(cleaned["sex"], "2")
+        self.assertEqual(cleaned["pregnant"], "1")
+        cleaned_hidden, issues = server.validate_entry_data(schema, {"age": "12", "sex": "2", "pregnant": "1"})
+        self.assertEqual(issues, [])
+        self.assertNotIn("pregnant", cleaned_hidden)
+        self.assertEqual(server.choice_label(schema["fields"][1], "2"), "Female")
+
     def test_local_crf_assistant_detects_types_and_choices(self):
         schema, warnings = server.draft_crf_schema_locally("Age\nVisit date\nSex (Female, Male, Unknown)\nAny adverse event?")
         self.assertEqual(warnings, [])

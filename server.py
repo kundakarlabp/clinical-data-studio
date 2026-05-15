@@ -1378,6 +1378,92 @@ def normalize_code(value: str, fallback: str = "") -> str:
     return normalized or fallback
 
 
+def normalize_choices(value) -> list[dict]:
+    if not value:
+        return []
+    if isinstance(value, list):
+        choices = []
+        for item in value:
+            if isinstance(item, dict):
+                coded_value = str(item.get("value", item.get("code", ""))).strip()
+                label = str(item.get("label", coded_value)).strip()
+            else:
+                text = str(item).strip()
+                if "," in text:
+                    coded_value, label = [part.strip() for part in text.split(",", 1)]
+                else:
+                    coded_value, label = text, text
+            if coded_value:
+                choices.append({"value": coded_value, "label": label or coded_value})
+        return choices
+    text = str(value)
+    parts = [part.strip() for part in re.split(r"\s*[|;]\s*", text) if part.strip()]
+    if len(parts) <= 1 and "," in text:
+        raw_parts = [part.strip() for part in text.split(",") if part.strip()]
+        if len(raw_parts) > 2 or not raw_parts[0].isdigit():
+            parts = raw_parts
+    choices = []
+    for part in parts:
+        if "," in part:
+            coded_value, label = [piece.strip() for piece in part.split(",", 1)]
+        else:
+            coded_value, label = part, part
+        if coded_value:
+            choices.append({"value": coded_value, "label": label or coded_value})
+    return choices
+
+
+def choice_label(field: dict, value) -> str:
+    choices = field.get("choices") or [{"value": option, "label": option} for option in field.get("options", [])]
+    lookup = {str(item.get("value", "")): str(item.get("label", item.get("value", ""))) for item in choices}
+    return lookup.get(str(value), str(value))
+
+
+def evaluate_branching_logic(expression: str, data: dict) -> bool:
+    expression = str(expression or "").strip()
+    if not expression:
+        return True
+
+    def compare(clause: str) -> bool:
+        clause = clause.strip()
+        in_match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)\s+IN\s+\[(.*)\]", clause, flags=re.IGNORECASE)
+        if in_match:
+            field, raw_values = in_match.groups()
+            allowed = [item.strip().strip("'\"") for item in raw_values.split(",") if item.strip()]
+            return str(data.get(field, "")) in allowed
+        match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)\s*(==|=|!=|>=|<=|>|<)\s*(.+)", clause)
+        if not match:
+            return False
+        field, operator, raw_expected = match.groups()
+        actual = data.get(field, "")
+        expected = raw_expected.strip().strip("'\"")
+        if operator in {"=", "=="}:
+            return str(actual) == expected
+        if operator == "!=":
+            return str(actual) != expected
+        try:
+            actual_number = float(actual)
+            expected_number = float(expected)
+        except (TypeError, ValueError):
+            return False
+        if operator == ">=":
+            return actual_number >= expected_number
+        if operator == "<=":
+            return actual_number <= expected_number
+        if operator == ">":
+            return actual_number > expected_number
+        if operator == "<":
+            return actual_number < expected_number
+        return False
+
+    or_groups = re.split(r"\s+OR\s+", expression, flags=re.IGNORECASE)
+    for group in or_groups:
+        clauses = re.split(r"\s+AND\s+", group, flags=re.IGNORECASE)
+        if all(compare(clause) for clause in clauses if clause.strip()):
+            return True
+    return False
+
+
 def normalize_schema(schema: dict) -> dict:
     fields = []
     seen = set()
@@ -1388,7 +1474,10 @@ def normalize_schema(schema: dict) -> dict:
             raise ValueError(f"Duplicate field code: {code}")
         seen.add(code)
         field_type = str(source.get("type", "text")).strip() or "text"
-        if field_type not in {"text", "textarea", "number", "date", "select", "checkbox", "calc", "file"}:
+        aliases = {"dropdown": "select", "calculated": "calc", "calculated field": "calc", "yes/no": "yesno", "section header": "section"}
+        field_type = aliases.get(field_type.lower(), field_type.lower())
+        allowed = {"text", "textarea", "number", "integer", "decimal", "date", "datetime", "select", "radio", "checkbox", "yesno", "calc", "file", "section", "descriptive"}
+        if field_type not in allowed:
             raise ValueError(f"Unsupported field type: {field_type}")
         field = {
             "code": code,
@@ -1396,14 +1485,23 @@ def normalize_schema(schema: dict) -> dict:
             "type": field_type,
             "required": bool(source.get("required", False)),
         }
+        for key in ("help_text", "field_note", "units", "validation_type", "regex", "branching_logic"):
+            if source.get(key) not in (None, ""):
+                field[key] = str(source[key]).strip()
+        if source.get("phi"):
+            field["phi"] = bool(source.get("phi"))
+        if source.get("identifier"):
+            field["identifier"] = bool(source.get("identifier"))
         for key in ("min", "max"):
             if source.get(key) not in (None, ""):
                 field[key] = float(source[key])
-        if field_type in {"select", "checkbox"}:
-            options = source.get("options") or []
-            if isinstance(options, str):
-                options = [item.strip() for item in options.split(",")]
-            field["options"] = [str(item).strip() for item in options if str(item).strip()]
+        if field_type == "yesno":
+            field["choices"] = [{"value": "1", "label": "Yes"}, {"value": "0", "label": "No"}]
+            field["options"] = ["1", "0"]
+        if field_type in {"select", "radio", "checkbox"}:
+            choices = normalize_choices(source.get("choices") or source.get("options") or [])
+            field["choices"] = choices
+            field["options"] = [item["value"] for item in choices]
         if source.get("show_if"):
             show_if = source["show_if"]
             field["show_if"] = {"field": normalize_code(str(show_if.get("field", ""))), "equals": str(show_if.get("equals", ""))}
@@ -1425,7 +1523,12 @@ def validate_entry_data(schema: dict, data: dict) -> tuple[dict, list[dict]]:
         if field.get("show_if"):
             condition = field["show_if"]
             visible = str(data.get(condition["field"], "")) == str(condition["equals"])
+        if visible and field.get("branching_logic"):
+            visible = evaluate_branching_logic(field["branching_logic"], data)
         if not visible:
+            continue
+        if field["type"] in {"section", "descriptive"}:
+            cleaned[code] = ""
             continue
         if isinstance(value, str):
             value = value.strip()
@@ -1436,20 +1539,22 @@ def validate_entry_data(schema: dict, data: dict) -> tuple[dict, list[dict]]:
             continue
         if field["type"] == "calc":
             continue
-        if field["type"] == "number":
+        if field["type"] in {"number", "decimal", "integer"}:
             try:
                 number = float(value)
             except (TypeError, ValueError):
                 issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} must be numeric"})
                 cleaned[code] = value
                 continue
+            if field["type"] == "integer" and not number.is_integer():
+                issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} must be an integer"})
             if "min" in field and number < field["min"]:
                 issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} is below minimum {field['min']}"})
             if "max" in field and number > field["max"]:
                 issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} is above maximum {field['max']}"})
-            cleaned[code] = number
+            cleaned[code] = int(number) if field["type"] == "integer" and number.is_integer() else number
             continue
-        if field["type"] == "select":
+        if field["type"] in {"select", "radio", "yesno"}:
             if field.get("options") and str(value) not in field["options"]:
                 issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} must be one of the coded options"})
             cleaned[code] = str(value)
@@ -1479,6 +1584,8 @@ def validate_entry_data(schema: dict, data: dict) -> tuple[dict, list[dict]]:
                 issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} exceeds 5 MB"})
             cleaned[code] = {"name": filename, "type": content_type, "size": len(raw), "data": data_b64}
             continue
+        if field.get("regex") and not re.fullmatch(str(field["regex"]), str(value)):
+            issues.append({"field_code": code, "severity": "error", "message": f"{field['label']} does not match the required format"})
         cleaned[code] = str(value)
     for field in schema.get("fields", []):
         if field["type"] != "calc":
@@ -3774,19 +3881,33 @@ class App(BaseHTTPRequestHandler):
                 },
             )
             field_type = str(raw.get("field_type", "text")).strip() or "text"
-            choices = [item.strip() for item in str(raw.get("choices", "")).replace("|", ",").split(",") if item.strip()]
             field = {
                 "code": raw.get("field_name", ""),
                 "label": raw.get("field_label", ""),
                 "type": field_type,
                 "required": str(raw.get("required", "")).strip().lower() in {"yes", "true", "1"},
             }
+            choices = normalize_choices(raw.get("choices", ""))
             if choices:
-                field["options"] = choices
+                field["choices"] = choices
             if raw.get("validation_min") not in (None, ""):
                 field["min"] = raw.get("validation_min")
             if raw.get("validation_max") not in (None, ""):
                 field["max"] = raw.get("validation_max")
+            for csv_key, field_key in (
+                ("units", "units"),
+                ("field_note", "field_note"),
+                ("help_text", "help_text"),
+                ("validation_type", "validation_type"),
+                ("regex", "regex"),
+                ("branching_logic", "branching_logic"),
+            ):
+                if raw.get(csv_key) not in (None, ""):
+                    field[field_key] = raw.get(csv_key)
+            if str(raw.get("phi", "")).strip().lower() in {"yes", "true", "1"}:
+                field["phi"] = True
+            if str(raw.get("identifier", "")).strip().lower() in {"yes", "true", "1"}:
+                field["identifier"] = True
             if raw.get("calculation"):
                 field["calculation"] = raw.get("calculation")
                 field["type"] = "calc"
@@ -5114,11 +5235,15 @@ class App(BaseHTTPRequestHandler):
         if query:
             value = (query.get("deidentified") or query.get("deidentified_export") or [""])[0].strip().lower()
             deidentified = deidentified or value in {"1", "true", "yes", "on"}
+        choice_format = ((query or {}).get("choice_format") or ["raw"])[0].strip().lower()
+        if choice_format not in {"raw", "labels", "both"}:
+            choice_format = "raw"
         filename = "clinical_data_deidentified_export.csv" if deidentified else "clinical_data_export.csv"
-        return self.export_entries_csv(conn, study_id, membership, {"deidentified": deidentified}, filename)
+        return self.export_entries_csv(conn, study_id, membership, {"deidentified": deidentified, "choice_format": choice_format}, filename)
 
     def record_payload(self, conn, study_id: int, membership, filters: dict) -> list[dict]:
         deidentified = bool(filters.get("deidentified")) or membership.get("role") == "analyst"
+        choice_format = str(filters.get("choice_format") or "raw")
         where = ["entries.study_id = ?"]
         params: list = [study_id]
         if filters.get("participant_status"):
@@ -5176,6 +5301,15 @@ class App(BaseHTTPRequestHandler):
                     continue
                 code = f"{form_code}__{field_code}"
                 value = data.get(field_code, "")
+                if field.get("choices") and choice_format in {"labels", "both"}:
+                    if isinstance(value, list):
+                        labels = [choice_label(field, item) for item in value]
+                    else:
+                        labels = choice_label(field, value) if value not in (None, "") else ""
+                    if choice_format == "labels":
+                        value = "; ".join(labels) if isinstance(labels, list) else labels
+                    else:
+                        record[f"{code}__label"] = "; ".join(labels) if isinstance(labels, list) else labels
                 record[code] = deidentify_for_ai(str(value), record["study_uid"]) if deidentified and isinstance(value, str) else value
             payload.append(record)
         return payload
@@ -5535,14 +5669,20 @@ class App(BaseHTTPRequestHandler):
         events_by_form: dict[int, list[str]] = {}
         for item in form_event_rows:
             events_by_form.setdefault(item["form_id"], []).append(item["event_code"])
-        output = [["instrument_name", "instrument_label", "events", "field_order", "field_name", "field_label", "field_type", "required", "choices", "validation_min", "validation_max", "branching_logic", "calculation", "repeatable"]]
+        output = [[
+            "instrument_name", "instrument_label", "events", "field_order", "field_name", "field_label",
+            "field_type", "required", "choices", "validation_min", "validation_max", "validation_type",
+            "regex", "units", "field_note", "branching_logic", "calculation", "phi", "identifier", "repeatable",
+        ]]
         for form in forms:
             schema = load_json(form["schema_json"], {"fields": []})
             for order, field in enumerate(schema.get("fields", []), start=1):
-                choices = " | ".join(field.get("options", []))
+                choices = " | ".join(f"{choice['value']}, {choice['label']}" for choice in normalize_choices(field.get("choices") or field.get("options") or []))
                 branching = ""
                 if field.get("show_if"):
                     branching = f"[{field['show_if']['field']}] = '{field['show_if']['equals']}'"
+                if field.get("branching_logic"):
+                    branching = field["branching_logic"]
                 output.append(
                     [
                         form["code"],
@@ -5556,8 +5696,14 @@ class App(BaseHTTPRequestHandler):
                         choices,
                         field.get("min", ""),
                         field.get("max", ""),
+                        field.get("validation_type", ""),
+                        field.get("regex", ""),
+                        field.get("units", ""),
+                        field.get("field_note") or field.get("help_text", ""),
                         branching,
                         field.get("calculation", ""),
+                        "yes" if field.get("phi") else "no",
+                        "yes" if field.get("identifier") else "no",
                         "yes" if schema.get("repeatable") else "no",
                     ]
                 )

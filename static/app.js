@@ -613,36 +613,54 @@ function entryCard(participant, form, selectedEvent) {
   `;
 }
 
+function fieldChoices(field) {
+  if (field.choices?.length) return field.choices;
+  return (field.options || []).map((option) => ({ value: option, label: option }));
+}
+
 function fieldInput(field, data) {
   const value = data[field.code] ?? "";
   const required = field.required ? "required" : "";
-  const visibility = field.show_if ? `data-show-field="${escapeHtml(field.show_if.field)}" data-show-value="${escapeHtml(field.show_if.equals)}"` : "";
+  const visibility = [
+    field.show_if ? `data-show-field="${escapeHtml(field.show_if.field)}" data-show-value="${escapeHtml(field.show_if.equals)}"` : "",
+    field.branching_logic ? `data-branching-logic="${escapeHtml(field.branching_logic)}"` : "",
+  ].filter(Boolean).join(" ");
+  const note = field.help_text || field.field_note || field.units ? `<span class="small">${escapeHtml([field.help_text || field.field_note || "", field.units ? `Units: ${field.units}` : ""].filter(Boolean).join(" "))}</span>` : "";
+  if (field.type === "section" || field.type === "descriptive") {
+    return `<div class="notice" ${visibility}><strong>${escapeHtml(field.label)}</strong>${note}</div>`;
+  }
   if (field.type === "textarea") {
-    return `<label ${visibility}>${escapeHtml(field.label)}<textarea name="${escapeHtml(field.code)}" ${required}>${escapeHtml(value)}</textarea></label>`;
+    return `<label ${visibility}>${escapeHtml(field.label)}<textarea name="${escapeHtml(field.code)}" ${required}>${escapeHtml(value)}</textarea>${note}</label>`;
   }
   if (field.type === "select") {
-    return `<label ${visibility}>${escapeHtml(field.label)}<select name="${escapeHtml(field.code)}" ${required}><option value=""></option>${(field.options || []).map((option) => `<option ${option === value ? "selected" : ""}>${escapeHtml(option)}</option>`).join("")}</select></label>`;
+    return `<label ${visibility}>${escapeHtml(field.label)}<select name="${escapeHtml(field.code)}" ${required}><option value=""></option>${fieldChoices(field).map((option) => `<option value="${escapeHtml(option.value)}" ${option.value === value ? "selected" : ""}>${escapeHtml(option.label)}</option>`).join("")}</select>${note}</label>`;
+  }
+  if (field.type === "radio" || field.type === "yesno") {
+    return `<fieldset ${visibility}><legend>${escapeHtml(field.label)}</legend>${fieldChoices(field).map((option) => `<label class="check"><input type="radio" name="${escapeHtml(field.code)}" value="${escapeHtml(option.value)}" ${option.value === value ? "checked" : ""} ${required} />${escapeHtml(option.label)}</label>`).join("")}${note}</fieldset>`;
   }
   if (field.type === "checkbox") {
     const selected = Array.isArray(value) ? value : [];
-    return `<fieldset ${visibility}><legend>${escapeHtml(field.label)}</legend>${(field.options || []).map((option) => `<label class="check"><input type="checkbox" name="${escapeHtml(field.code)}" value="${escapeHtml(option)}" ${selected.includes(option) ? "checked" : ""} />${escapeHtml(option)}</label>`).join("")}</fieldset>`;
+    return `<fieldset ${visibility}><legend>${escapeHtml(field.label)}</legend>${fieldChoices(field).map((option) => `<label class="check"><input type="checkbox" name="${escapeHtml(field.code)}" value="${escapeHtml(option.value)}" ${selected.includes(option.value) ? "checked" : ""} />${escapeHtml(option.label)}</label>`).join("")}${note}</fieldset>`;
   }
   if (field.type === "calc") {
-    return `<label ${visibility}>${escapeHtml(field.label)}<input name="${escapeHtml(field.code)}" value="${escapeHtml(value)}" readonly placeholder="${escapeHtml(field.calculation || "Calculated on save")}" /></label>`;
+    return `<label ${visibility}>${escapeHtml(field.label)}<input name="${escapeHtml(field.code)}" value="${escapeHtml(value)}" readonly placeholder="${escapeHtml(field.calculation || "Calculated on save")}" />${note}</label>`;
   }
   if (field.type === "file") {
     const fileName = value?.name ? `<span class="small">Current file: ${escapeHtml(value.name)} (${Math.round((value.size || 0) / 1024)} KB)</span>` : "";
-    return `<label ${visibility}>${escapeHtml(field.label)}<input name="${escapeHtml(field.code)}" type="file" ${required} />${fileName}</label>`;
+    return `<label ${visibility}>${escapeHtml(field.label)}<input name="${escapeHtml(field.code)}" type="file" ${required} />${fileName}${note}</label>`;
   }
   const attrs = [`name="${escapeHtml(field.code)}"`, `value="${escapeHtml(value)}"`, required];
-  if (field.type === "number") {
-    attrs.push('type="number"', field.min !== undefined ? `min="${field.min}"` : "", field.max !== undefined ? `max="${field.max}"` : "", "step='any'");
+  if (["number", "integer", "decimal"].includes(field.type)) {
+    attrs.push('type="number"', field.min !== undefined ? `min="${field.min}"` : "", field.max !== undefined ? `max="${field.max}"` : "", field.type === "integer" ? "step='1'" : "step='any'");
   } else if (field.type === "date") {
     attrs.push('type="date"');
+  } else if (field.type === "datetime") {
+    attrs.push('type="datetime-local"');
   } else {
     attrs.push('type="text"');
   }
-  return `<label ${visibility}>${escapeHtml(field.label)}<input ${attrs.join(" ")} /></label>`;
+  if (field.regex) attrs.push(`pattern="${escapeHtml(field.regex)}"`);
+  return `<label ${visibility}>${escapeHtml(field.label)}<input ${attrs.filter(Boolean).join(" ")} />${note}</label>`;
 }
 
 function formsView() {
@@ -895,17 +913,24 @@ function fieldEditorRow(field = null) {
       <label>Code<input name="field_code" required placeholder="systolic_bp" value="${escapeHtml(field?.code || "")}" /></label>
       <label>Type
         <select name="field_type">
-          ${["text", "number", "date", "select", "checkbox", "textarea", "calc", "file"].map((type) => `<option value="${type}" ${field?.type === type ? "selected" : ""}>${type}</option>`).join("")}
+          ${["text", "textarea", "integer", "decimal", "number", "date", "datetime", "select", "radio", "checkbox", "yesno", "calc", "file", "section", "descriptive"].map((type) => `<option value="${type}" ${field?.type === type ? "selected" : ""}>${type}</option>`).join("")}
         </select>
       </label>
       <label>Required<select name="field_required"><option value="false" ${field?.required ? "" : "selected"}>No</option><option value="true" ${field?.required ? "selected" : ""}>Yes</option></select></label>
       <button type="button" class="secondary icon" data-remove-field title="Remove">X</button>
-      <label class="full">Options for select or checkbox fields<input name="field_options" placeholder="No, Yes" value="${escapeHtml((field?.options || []).join(", "))}" /></label>
+      <label class="full">Coded choices<input name="field_options" placeholder="1, Male | 2, Female | 3, Other" value="${escapeHtml((field?.choices || []).map((choice) => `${choice.value}, ${choice.label}`).join(" | ") || (field?.options || []).join(", "))}" /></label>
       <label>Min<input name="field_min" type="number" step="any" value="${escapeHtml(field?.min ?? "")}" /></label>
       <label>Max<input name="field_max" type="number" step="any" value="${escapeHtml(field?.max ?? "")}" /></label>
+      <label>Units<input name="field_units" placeholder="kg, mmHg, days" value="${escapeHtml(field?.units || "")}" /></label>
+      <label>Validation<input name="field_validation_type" placeholder="email, phone, custom" value="${escapeHtml(field?.validation_type || "")}" /></label>
+      <label class="full">Help text<input name="field_help_text" placeholder="Short instruction shown during data entry" value="${escapeHtml(field?.help_text || field?.field_note || "")}" /></label>
+      <label class="full">Regex<input name="field_regex" placeholder="^[A-Z0-9-]+$" value="${escapeHtml(field?.regex || "")}" /></label>
       <label class="full">Calculation<input name="field_calculation" placeholder="age + 10" value="${escapeHtml(field?.calculation || "")}" /></label>
       <label>Show if field<input name="field_show_if_field" placeholder="adverse_event" value="${escapeHtml(field?.show_if?.field || "")}" /></label>
-      <label>Equals<input name="field_show_if_equals" placeholder="Yes" value="${escapeHtml(field?.show_if?.equals || "")}" /></label>
+      <label>Equals<input name="field_show_if_equals" placeholder="1" value="${escapeHtml(field?.show_if?.equals || "")}" /></label>
+      <label class="full">Branching logic<input name="field_branching_logic" placeholder='age >= 18 AND pregnant == 1' value="${escapeHtml(field?.branching_logic || "")}" /></label>
+      <label class="check"><input type="checkbox" name="field_phi" value="true" ${field?.phi ? "checked" : ""} />PHI-sensitive</label>
+      <label class="check"><input type="checkbox" name="field_identifier" value="true" ${field?.identifier ? "checked" : ""} />Identifier</label>
     </div>
   `;
 }
@@ -1865,11 +1890,51 @@ function bindRoute() {
 }
 
 function applyBranching(form) {
-  form.querySelectorAll("[data-show-field]").forEach((label) => {
-    const source = form.elements[label.dataset.showField];
-    const visible = source && source.value === label.dataset.showValue;
+  form.querySelectorAll("[data-show-field], [data-branching-logic]").forEach((label) => {
+    let visible = true;
+    if (label.dataset.showField) {
+      const source = form.elements[label.dataset.showField];
+      visible = Boolean(source) && source.value === label.dataset.showValue;
+    }
+    if (visible && label.dataset.branchingLogic) {
+      visible = evaluateBranchingExpression(label.dataset.branchingLogic, form);
+    }
     label.classList.toggle("hidden", !visible);
   });
+}
+
+function fieldValueForBranching(form, field) {
+  const item = form.elements[field];
+  if (!item) return "";
+  if (item instanceof RadioNodeList) return item.value;
+  return item.value;
+}
+
+function evaluateBranchingExpression(expression, form) {
+  const compare = (clause) => {
+    const inMatch = clause.trim().match(/^([A-Za-z_][A-Za-z0-9_]*)\s+IN\s+\[(.*)\]$/i);
+    if (inMatch) {
+      const [, field, values] = inMatch;
+      const allowed = values.split(",").map((item) => item.trim().replace(/^['"]|['"]$/g, ""));
+      return allowed.includes(String(fieldValueForBranching(form, field)));
+    }
+    const match = clause.trim().match(/^([A-Za-z_][A-Za-z0-9_]*)\s*(==|=|!=|>=|<=|>|<)\s*(.+)$/);
+    if (!match) return false;
+    const [, field, operator, rawExpected] = match;
+    const actual = fieldValueForBranching(form, field);
+    const expected = rawExpected.trim().replace(/^['"]|['"]$/g, "");
+    if (operator === "=" || operator === "==") return String(actual) === expected;
+    if (operator === "!=") return String(actual) !== expected;
+    const left = Number(actual);
+    const right = Number(expected);
+    if (Number.isNaN(left) || Number.isNaN(right)) return false;
+    if (operator === ">=") return left >= right;
+    if (operator === "<=") return left <= right;
+    if (operator === ">") return left > right;
+    if (operator === "<") return left < right;
+    return false;
+  };
+  return expression.split(/\s+OR\s+/i).some((group) => group.split(/\s+AND\s+/i).every(compare));
 }
 
 async function submitParticipant(event) {
@@ -2389,16 +2454,31 @@ async function submitFormDefinition(event) {
       required: get("field_required") === "true",
     };
     const options = get("field_options");
-    if ((field.type === "select" || field.type === "checkbox") && options) field.options = options.split(",").map((item) => item.trim()).filter(Boolean);
+    if (["select", "radio", "checkbox"].includes(field.type) && options) field.choices = options.split("|").map((item) => {
+      const [value, ...labelParts] = item.split(",");
+      return { value: value.trim(), label: (labelParts.join(",").trim() || value.trim()) };
+    }).filter((item) => item.value);
     const min = get("field_min");
     const max = get("field_max");
     if (min !== "") field.min = Number(min);
     if (max !== "") field.max = Number(max);
+    const units = get("field_units");
+    if (units) field.units = units;
+    const validationType = get("field_validation_type");
+    if (validationType) field.validation_type = validationType;
+    const helpText = get("field_help_text");
+    if (helpText) field.help_text = helpText;
+    const regex = get("field_regex");
+    if (regex) field.regex = regex;
     const calculation = get("field_calculation");
     if (calculation) field.calculation = calculation;
     const showIfField = get("field_show_if_field");
     const showIfEquals = get("field_show_if_equals");
     if (showIfField && showIfEquals) field.show_if = { field: showIfField, equals: showIfEquals };
+    const branchingLogic = get("field_branching_logic");
+    if (branchingLogic) field.branching_logic = branchingLogic;
+    field.phi = Boolean(editor.querySelector(`[name="field_phi"]`)?.checked);
+    field.identifier = Boolean(editor.querySelector(`[name="field_identifier"]`)?.checked);
     return field;
   });
   try {

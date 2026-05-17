@@ -4429,7 +4429,7 @@ class App(BaseHTTPRequestHandler):
                 self.send_error_json("Invitation not found", 404)
                 return
             payload = self.body()
-            action = str(payload.get("action", "")).strip()
+            action = str(payload.get("action", "")).strip().lower()
             timestamp = now()
             if action == "mark_sent":
                 conn.execute(
@@ -4821,7 +4821,13 @@ class App(BaseHTTPRequestHandler):
                     audit(conn, user["id"], "sync_conflict", "entry", existing["id"], {"if_match_updated_at": if_match_updated_at, "if_match_entry_hash": if_match_entry_hash}, conflict_payload, study_id=study_id, **self.audit_context())
                     self.send_json({"error": "Entry was changed on the server. Review conflict before syncing.", "server_entry": conflict_payload}, 409)
                     return
+                if existing.get("status") == "frozen":
+                    self.send_error_json("Entry is frozen for analysis. Unfreeze with a reason before editing.", 423)
+                    return
                 if existing.get("locked_at"):
+                    if not (membership_has(membership, "review_data") or membership_has(membership, "manage_study")):
+                        self.send_error_json("Entry is locked and cannot be edited by data entry users.", 423)
+                        return
                     reason = str(payload.get("change_reason", "")).strip()
                     if not reason:
                         self.send_error_json("Change reason is required before editing a locked CRF", 423)
@@ -4857,21 +4863,36 @@ class App(BaseHTTPRequestHandler):
                 return
             payload = self.body()
             action = str(payload.get("action", "")).strip()
-            if action == "lock":
-                reason = str(payload.get("reason", "")).strip() or "Reviewed and locked"
-                conn.execute("UPDATE entries SET locked_at = ?, locked_by = ?, lock_reason = ?, status = 'complete', updated_by = ?, updated_at = ? WHERE id = ?", (now(), user["id"], reason, user["id"], now(), entry_id))
+            if action in {"lock", "freeze"}:
+                if not (membership_has(membership, "review_data") or membership_has(membership, "manage_study")):
+                    self.send_error_json("Review permission required", 403)
+                    return
+                reason = str(payload.get("reason", "")).strip()
+                if not reason:
+                    self.send_error_json("Reason is required", 400)
+                    return
+                next_status = "frozen" if action == "freeze" else "complete"
+                conn.execute("UPDATE entries SET locked_at = ?, locked_by = ?, lock_reason = ?, status = ?, updated_by = ?, updated_at = ? WHERE id = ?", (now(), user["id"], reason, next_status, user["id"], now(), entry_id))
                 after = row(conn, "SELECT * FROM entries WHERE id = ?", (entry_id,))
-                audit(conn, user["id"], "lock", "entry", entry_id, before, after)
+                audit(conn, user["id"], action, "entry", entry_id, before, after, study_id=study_id, **self.audit_context())
+                conn.commit()
                 self.send_json({"entry": after})
                 return
-            if action == "unlock":
+            if action in {"unlock", "unfreeze"}:
+                if not (membership_has(membership, "review_data") or membership_has(membership, "manage_study")):
+                    self.send_error_json("Review permission required", 403)
+                    return
                 reason = str(payload.get("reason", "")).strip()
                 if not reason:
                     self.send_error_json("Unlock reason is required", 400)
                     return
-                conn.execute("UPDATE entries SET locked_at = NULL, locked_by = NULL, lock_reason = '', updated_by = ?, updated_at = ? WHERE id = ?", (user["id"], now(), entry_id))
+                next_status = "reviewed" if action == "unfreeze" else before.get("status", "complete")
+                if next_status == "frozen":
+                    next_status = "reviewed"
+                conn.execute("UPDATE entries SET locked_at = NULL, locked_by = NULL, lock_reason = '', status = ?, updated_by = ?, updated_at = ? WHERE id = ?", (next_status, user["id"], now(), entry_id))
                 after = row(conn, "SELECT * FROM entries WHERE id = ?", (entry_id,))
-                audit(conn, user["id"], "unlock", "entry", entry_id, before, {"entry": after, "reason": reason})
+                audit(conn, user["id"], action, "entry", entry_id, before, {"entry": after, "reason": reason}, study_id=study_id, **self.audit_context())
+                conn.commit()
                 self.send_json({"entry": after})
                 return
             if action in {"verify_field", "freeze_field"}:
@@ -4888,7 +4909,8 @@ class App(BaseHTTPRequestHandler):
                     """,
                     (entry_id, field_code, state, reason, user["id"], now()),
                 )
-                audit(conn, user["id"], action, "entry", entry_id, before, {"field_code": field_code, "state": state, "reason": reason})
+                audit(conn, user["id"], action, "entry", entry_id, before, {"field_code": field_code, "state": state, "reason": reason}, study_id=study_id, **self.audit_context())
+                conn.commit()
                 self.send_json({"field_state": {"entry_id": entry_id, "field_code": field_code, "state": state}})
                 return
             self.send_error_json("Unsupported entry action", 405)

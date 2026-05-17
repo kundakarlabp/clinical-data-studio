@@ -1001,7 +1001,7 @@ class ApiSmokeTests(unittest.TestCase):
         )["participant"]
         self.assertEqual(created["study_uid"], "RBAC001")
         form_id = self.request_json(f"/api/studies/{study_id}/forms", token=entry_token)["forms"][0]["id"]
-        self.request_json(
+        entry = self.request_json(
             f"/api/studies/{study_id}/entries",
             "POST",
             {
@@ -1011,7 +1011,43 @@ class ApiSmokeTests(unittest.TestCase):
                 "data": {"age": "44", "sex": "Male", "consent_date": "2026-05-07", "diagnosis": "RBAC test"},
             },
             entry_token,
-        )
+        )["entry"]
+        with self.assertRaises(HTTPError) as data_lock_denied:
+            self.request_json(f"/api/studies/{study_id}/entries/{entry['id']}", "PATCH", {"action": "lock", "reason": "review"}, entry_token)
+        self.assertEqual(data_lock_denied.exception.code, 403)
+        data_lock_denied.exception.close()
+        self.request_json(f"/api/studies/{study_id}/entries/{entry['id']}", "PATCH", {"action": "lock", "reason": "reviewed"}, admin_token)
+        with self.assertRaises(HTTPError) as locked_edit_denied:
+            self.request_json(
+                f"/api/studies/{study_id}/entries",
+                "POST",
+                {
+                    "participant_id": created["id"],
+                    "form_id": form_id,
+                    "status": "complete",
+                    "data": {"age": "45", "sex": "Male", "consent_date": "2026-05-07", "diagnosis": "locked edit"},
+                },
+                entry_token,
+            )
+        self.assertEqual(locked_edit_denied.exception.code, 423)
+        locked_edit_denied.exception.close()
+        self.request_json(f"/api/studies/{study_id}/entries/{entry['id']}", "PATCH", {"action": "unlock", "reason": "data correction allowed"}, admin_token)
+        self.request_json(f"/api/studies/{study_id}/entries/{entry['id']}", "PATCH", {"action": "freeze", "reason": "analysis dataset frozen"}, admin_token)
+        with self.assertRaises(HTTPError) as frozen_edit_denied:
+            self.request_json(
+                f"/api/studies/{study_id}/entries",
+                "POST",
+                {
+                    "participant_id": created["id"],
+                    "form_id": form_id,
+                    "status": "complete",
+                    "data": {"age": "46", "sex": "Male", "consent_date": "2026-05-07", "diagnosis": "frozen edit"},
+                },
+                entry_token,
+            )
+        self.assertEqual(frozen_edit_denied.exception.code, 423)
+        frozen_edit_denied.exception.close()
+        self.request_json(f"/api/studies/{study_id}/entries/{entry['id']}", "PATCH", {"action": "unfreeze", "reason": "analysis reopened"}, admin_token)
         with self.assertRaises(HTTPError) as export_denied:
             self.request_raw(f"/api/studies/{study_id}/export", token=entry_token)
         self.assertEqual(export_denied.exception.code, 403)

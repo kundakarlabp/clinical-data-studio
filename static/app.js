@@ -571,6 +571,7 @@ function entryCard(participant, form, selectedEvent) {
   const existing = state.entries.find((entry) => entry.participant_id === participant.id && entry.form_id === form.id && (entry.event_id === selectedEvent?.id || (!entry.event_id && entry.event_name === (selectedEvent?.code || "Baseline")))) || { data: {}, status: "draft", event_name: selectedEvent?.code || "Baseline", event_id: selectedEvent?.id || null, repeat_instance: 1 };
   const schema = existing.schema_snapshot?.fields?.length ? { fields: existing.schema_snapshot.fields, repeatable: existing.schema_snapshot.repeatable } : form.schema;
   const locked = Boolean(existing.locked_at);
+  const frozen = existing.status === "frozen";
   const draftKey = window.CDSOfflineDrafts?.entryKey({ studyId: state.studyId, participantId: participant.id, formId: form.id, eventId: selectedEvent?.id || null, repeatInstance: existing.repeat_instance || 1 }) || "";
   return `
     <form class="card stack entry-form" data-form-id="${form.id}" data-participant-id="${participant.id}" data-entry-id="${existing.id || ""}" data-entry-updated-at="${existing.updated_at || 0}" data-entry-hash="${escapeHtml(existing.entry_hash || "")}" data-draft-key="${escapeHtml(draftKey)}">
@@ -581,6 +582,7 @@ function entryCard(participant, form, selectedEvent) {
           <span class="pill">CRF v${escapeHtml(existing.form_version || form.version || 1)}</span>
           ${existing.form_version && form.version && existing.form_version < form.version ? `<span class="pill warn">older schema</span>` : ""}
           ${locked ? `<span class="pill ok">locked</span>` : ""}
+          ${frozen ? `<span class="pill warn">frozen</span>` : ""}
           <span class="pill draft-status" data-draft-status>Synced</span>
         </div>
         <label>Event<input name="event_name" value="${escapeHtml(selectedEvent?.name || existing.event_name || "Baseline")}" readonly /></label>
@@ -592,6 +594,8 @@ function entryCard(participant, form, selectedEvent) {
         <select name="status">
           <option value="draft" ${existing.status === "draft" ? "selected" : ""}>draft</option>
           <option value="complete" ${existing.status === "complete" ? "selected" : ""}>complete</option>
+          <option value="reviewed" ${existing.status === "reviewed" ? "selected" : ""}>reviewed</option>
+          <option value="frozen" ${existing.status === "frozen" ? "selected" : ""}>frozen</option>
         </select>
       </label>
       ${locked ? `<label>Change reason required for locked CRF<input name="change_reason" placeholder="Reason for updating locked data" /></label>` : ""}
@@ -611,7 +615,7 @@ function entryCard(participant, form, selectedEvent) {
         <button type="button" class="secondary" data-query-form="${form.id}" data-query-participant="${participant.id}">Open Query</button>
         ${existing.id && !locked ? `<button type="button" class="secondary" data-lock-entry="${existing.id}">Lock</button>` : ""}
         ${existing.id && locked ? `<button type="button" class="warning" data-unlock-entry="${existing.id}">Unlock</button>` : ""}
-        ${existing.id && can("review_data") ? `<button type="button" class="secondary" data-entry-history="${existing.id}">History</button><button type="button" class="secondary" data-verify-field="${existing.id}">Verify Field</button><button type="button" class="secondary" data-freeze-field="${existing.id}">Freeze Field</button>` : ""}
+        ${existing.id && can("review_data") ? `<button type="button" class="secondary" data-entry-history="${existing.id}">History</button><button type="button" class="secondary" data-verify-field="${existing.id}">Verify Field</button><button type="button" class="secondary" data-freeze-field="${existing.id}">Freeze Field</button>${frozen ? `<button type="button" class="secondary" data-unfreeze-entry="${existing.id}">Unfreeze</button>` : `<button type="button" class="warning" data-freeze-entry="${existing.id}">Freeze Entry</button>`}` : ""}
       </div>
     </form>
   `;
@@ -2033,6 +2037,8 @@ function bindRoute() {
   document.querySelectorAll("[data-respond-query]").forEach((button) => button.addEventListener("click", () => respondQuery(button.dataset.respondQuery)));
   document.querySelectorAll("[data-lock-entry]").forEach((button) => button.addEventListener("click", () => lockEntry(button.dataset.lockEntry)));
   document.querySelectorAll("[data-unlock-entry]").forEach((button) => button.addEventListener("click", () => unlockEntry(button.dataset.unlockEntry)));
+  document.querySelectorAll("[data-freeze-entry]").forEach((button) => button.addEventListener("click", () => freezeEntry(button.dataset.freezeEntry)));
+  document.querySelectorAll("[data-unfreeze-entry]").forEach((button) => button.addEventListener("click", () => unfreezeEntry(button.dataset.unfreezeEntry)));
   document.querySelectorAll("[data-entry-history]").forEach((button) => button.addEventListener("click", () => showEntryHistory(button.dataset.entryHistory)));
   document.querySelectorAll("[data-verify-field]").forEach((button) => button.addEventListener("click", () => setFieldState(button, "verify_field")));
   document.querySelectorAll("[data-freeze-field]").forEach((button) => button.addEventListener("click", () => setFieldState(button, "freeze_field")));
@@ -2993,7 +2999,8 @@ function applyEntryDraft(form, payload) {
 }
 
 async function lockEntry(id) {
-  const reason = prompt("Lock reason") || "Reviewed and locked";
+  const reason = prompt("Lock reason");
+  if (!reason) return;
   try {
     await api(`/api/studies/${state.studyId}/entries/${id}`, { method: "PATCH", body: JSON.stringify({ action: "lock", reason }) });
     await loadStudy();
@@ -3009,6 +3016,32 @@ async function unlockEntry(id) {
   if (!reason) return;
   try {
     await api(`/api/studies/${state.studyId}/entries/${id}`, { method: "PATCH", body: JSON.stringify({ action: "unlock", reason }) });
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function freezeEntry(id) {
+  const reason = prompt("Freeze reason for analysis lock");
+  if (!reason) return;
+  try {
+    await api(`/api/studies/${state.studyId}/entries/${id}`, { method: "PATCH", body: JSON.stringify({ action: "freeze", reason }) });
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function unfreezeEntry(id) {
+  const reason = prompt("Unfreeze reason");
+  if (!reason) return;
+  try {
+    await api(`/api/studies/${state.studyId}/entries/${id}`, { method: "PATCH", body: JSON.stringify({ action: "unfreeze", reason }) });
     await loadStudy();
     render();
   } catch (error) {

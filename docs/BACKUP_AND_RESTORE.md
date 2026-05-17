@@ -121,3 +121,15 @@ Do a restore drill before real study use:
 6. Restore database and uploads on a test server or test container.
 7. Confirm login, participant, CRF, audit log, and file download.
 8. Record the result in the safety checklist.
+
+## Browser Backup Routine
+
+For routine non-coder use, open **Admin -> Backups**:
+
+- create a PostgreSQL backup before updates;
+- create a **Full Backup** weekly, because it includes both database and uploaded evidence files;
+- run **Verify Latest Backup** after creating the full backup;
+- run **Dry Run Restore Check** before major updates;
+- download one encrypted full backup weekly to a safe off-server location.
+
+Lightsail snapshots are useful, but they do not replace an encrypted full app backup that includes uploads. Keep the backup passphrase separately. If the passphrase is lost, the encrypted backup cannot be restored.

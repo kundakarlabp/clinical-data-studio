@@ -75,3 +75,17 @@ Photo, PDF, and audio interpretation by external AI must stay behind admin enabl
 ## Publication And Novelty
 
 AI may suggest publication angles, missing data, titles, and abstract structure. It must not be treated as proof of novelty. Novelty requires a manual literature search and supervisor or co-author review.
+
+## Project AI Policy
+
+Each study now has its own AI policy in **Academic Workbench -> Project AI Policy**.
+
+Default safe settings:
+
+- local AI helpers allowed;
+- external AI blocked;
+- PHI blocked;
+- photo/PDF/audio external AI blocked;
+- allowed purposes limited to approved clinical-research helpers.
+
+External AI is used only if both the server configuration and the project AI policy allow it. Data Entry users cannot run external AI by default. Every AI request is recorded in the AI audit trail.

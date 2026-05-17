@@ -289,6 +289,7 @@ function render() {
           ${state.user?.must_change_password ? `<div class="notice error">Default password is still active. Change it in Study Setup before real use.</div>` : ""}
           ${state.online ? "" : `<div class="notice error">This device is offline. You can open installed pages, but clinical data saves require connection to the study computer.</div>`}
           ${state.error ? `<div class="notice error">${escapeHtml(state.error)}</div>` : ""}
+          ${state.notice ? `<div class="notice ok">${escapeHtml(state.notice)}</div>` : ""}
           ${route()}
         </div>
         ${mobileBottomNav()}
@@ -570,6 +571,7 @@ function entryCard(participant, form, selectedEvent) {
   const existing = state.entries.find((entry) => entry.participant_id === participant.id && entry.form_id === form.id && (entry.event_id === selectedEvent?.id || (!entry.event_id && entry.event_name === (selectedEvent?.code || "Baseline")))) || { data: {}, status: "draft", event_name: selectedEvent?.code || "Baseline", event_id: selectedEvent?.id || null, repeat_instance: 1 };
   const schema = existing.schema_snapshot?.fields?.length ? { fields: existing.schema_snapshot.fields, repeatable: existing.schema_snapshot.repeatable } : form.schema;
   const locked = Boolean(existing.locked_at);
+  const frozen = existing.status === "frozen";
   const draftKey = window.CDSOfflineDrafts?.entryKey({ studyId: state.studyId, participantId: participant.id, formId: form.id, eventId: selectedEvent?.id || null, repeatInstance: existing.repeat_instance || 1 }) || "";
   return `
     <form class="card stack entry-form" data-form-id="${form.id}" data-participant-id="${participant.id}" data-entry-id="${existing.id || ""}" data-entry-updated-at="${existing.updated_at || 0}" data-entry-hash="${escapeHtml(existing.entry_hash || "")}" data-draft-key="${escapeHtml(draftKey)}">
@@ -580,6 +582,7 @@ function entryCard(participant, form, selectedEvent) {
           <span class="pill">CRF v${escapeHtml(existing.form_version || form.version || 1)}</span>
           ${existing.form_version && form.version && existing.form_version < form.version ? `<span class="pill warn">older schema</span>` : ""}
           ${locked ? `<span class="pill ok">locked</span>` : ""}
+          ${frozen ? `<span class="pill warn">frozen</span>` : ""}
           <span class="pill draft-status" data-draft-status>Synced</span>
         </div>
         <label>Event<input name="event_name" value="${escapeHtml(selectedEvent?.name || existing.event_name || "Baseline")}" readonly /></label>
@@ -591,6 +594,8 @@ function entryCard(participant, form, selectedEvent) {
         <select name="status">
           <option value="draft" ${existing.status === "draft" ? "selected" : ""}>draft</option>
           <option value="complete" ${existing.status === "complete" ? "selected" : ""}>complete</option>
+          <option value="reviewed" ${existing.status === "reviewed" ? "selected" : ""}>reviewed</option>
+          <option value="frozen" ${existing.status === "frozen" ? "selected" : ""}>frozen</option>
         </select>
       </label>
       ${locked ? `<label>Change reason required for locked CRF<input name="change_reason" placeholder="Reason for updating locked data" /></label>` : ""}
@@ -610,7 +615,7 @@ function entryCard(participant, form, selectedEvent) {
         <button type="button" class="secondary" data-query-form="${form.id}" data-query-participant="${participant.id}">Open Query</button>
         ${existing.id && !locked ? `<button type="button" class="secondary" data-lock-entry="${existing.id}">Lock</button>` : ""}
         ${existing.id && locked ? `<button type="button" class="warning" data-unlock-entry="${existing.id}">Unlock</button>` : ""}
-        ${existing.id && can("review_data") ? `<button type="button" class="secondary" data-entry-history="${existing.id}">History</button><button type="button" class="secondary" data-verify-field="${existing.id}">Verify Field</button><button type="button" class="secondary" data-freeze-field="${existing.id}">Freeze Field</button>` : ""}
+        ${existing.id && can("review_data") ? `<button type="button" class="secondary" data-entry-history="${existing.id}">History</button><button type="button" class="secondary" data-verify-field="${existing.id}">Verify Field</button><button type="button" class="secondary" data-freeze-field="${existing.id}">Freeze Field</button>${frozen ? `<button type="button" class="secondary" data-unfreeze-entry="${existing.id}">Unfreeze</button>` : `<button type="button" class="warning" data-freeze-entry="${existing.id}">Freeze Entry</button>`}` : ""}
       </div>
     </form>
   `;
@@ -681,6 +686,11 @@ function formsView() {
               <option value="true" ${editing?.schema?.repeatable ? "selected" : ""}>Yes</option>
             </select>
           </label>
+          <label>Lifecycle
+            <select name="lifecycle_state">
+              ${["draft", "published", "retired", "locked"].map((stateName) => `<option value="${stateName}" ${(editing?.lifecycle_state || "published") === stateName ? "selected" : ""}>${stateName}</option>`).join("")}
+            </select>
+          </label>
           <fieldset class="full">
             <legend>Assign to events</legend>
             ${state.events.map((event) => `<label class="check"><input type="checkbox" name="event_ids" value="${event.id}" ${event.code === "baseline" ? "checked" : ""} />${escapeHtml(event.name)}</label>`).join("")}
@@ -702,13 +712,17 @@ function formsView() {
         ${state.forms.map((form) => `
           <article class="card">
             <h3>${escapeHtml(form.name)}</h3>
-            <p>${escapeHtml(form.code)} - v${form.version} - ${form.schema.fields.length} fields${form.schema.repeatable ? " - repeatable" : ""}</p>
+            <p>${escapeHtml(form.code)} - v${form.version} - ${(form.lifecycle_state || "published")} - ${form.schema.fields.length} fields${form.schema.repeatable ? " - repeatable" : ""}</p>
             <div class="stack">
               ${form.schema.fields.map((field) => `<span class="pill">${escapeHtml(field.label)} (${escapeHtml(field.type)})</span>`).join("")}
             </div>
             <div class="split-actions">
               <button class="secondary" data-edit-form="${form.id}">Edit</button>
               <button class="secondary" data-form-versions="${form.id}">Versions</button>
+              <button class="secondary" data-form-action="validate" data-form-id="${form.id}">Validate</button>
+              ${(form.lifecycle_state || "published") !== "published" ? `<button class="secondary" data-form-action="publish" data-form-id="${form.id}">Publish</button>` : ""}
+              ${(form.lifecycle_state || "published") !== "retired" ? `<button class="secondary" data-form-action="retire" data-form-id="${form.id}">Retire</button>` : ""}
+              ${(form.lifecycle_state || "published") !== "locked" ? `<button class="warning" data-form-action="lock" data-form-id="${form.id}">Lock</button>` : `<button class="secondary" data-form-action="unlock" data-form-id="${form.id}">Unlock</button>`}
             </div>
           </article>
         `).join("")}
@@ -1311,6 +1325,7 @@ function academicView() {
   const aiAudit = academic.ai_audit || [];
   const promptTemplates = academic.prompt_templates || [];
   const ai = academic.ai || { provider: "local", model: "local-rules", external_ai_enabled: false, phi_allowed: false, multimodal_enabled: false };
+  const aiPolicy = academic.ai_policy || { enabled: true, local_ai_allowed: true, external_ai_allowed: false, phi_allowed: false, multimodal_allowed: false, allowed_purposes: [] };
   return `
     <section class="metrics-grid">
       ${metric("Captured Cases", metrics.case_count || 0, "Messy evidence organized")}
@@ -1332,9 +1347,25 @@ function academicView() {
       </div>
       <div class="grid two">
         <div class="notice">AI mode: ${escapeHtml(ai.provider || "local")} / ${escapeHtml(ai.model || "local-rules")}. ${ai.external_ai_enabled ? (ai.phi_allowed ? "External enabled, PHI allowed by policy." : "External enabled, PHI blocked.") : "External AI off or local fallback active."} ${ai.multimodal_enabled ? "Multimodal enabled." : "Photo/audio AI is not automatic."}</div>
+        <div class="notice">Project AI policy: ${aiPolicy.enabled ? "enabled" : "disabled"}; local ${aiPolicy.local_ai_allowed ? "allowed" : "blocked"}; external ${aiPolicy.external_ai_allowed ? "allowed" : "blocked"}; PHI ${aiPolicy.phi_allowed ? "allowed" : "blocked"}.</div>
         <div class="notice">${escapeHtml((academic.guidance || []).join(" "))}</div>
       </div>
     </section>
+    ${can("manage_study") ? `
+      <section class="panel">
+        <h2>Project AI Policy</h2>
+        <form id="ai-policy-form" class="form-grid">
+          <label class="check"><input type="checkbox" name="enabled" ${aiPolicy.enabled ? "checked" : ""} />AI helpers enabled</label>
+          <label class="check"><input type="checkbox" name="local_ai_allowed" ${aiPolicy.local_ai_allowed ? "checked" : ""} />Local AI allowed</label>
+          <label class="check"><input type="checkbox" name="external_ai_allowed" ${aiPolicy.external_ai_allowed ? "checked" : ""} />External AI allowed</label>
+          <label class="check"><input type="checkbox" name="phi_allowed" ${aiPolicy.phi_allowed ? "checked" : ""} />External PHI allowed</label>
+          <label class="check"><input type="checkbox" name="multimodal_allowed" ${aiPolicy.multimodal_allowed ? "checked" : ""} />External photo/PDF/audio AI allowed</label>
+          <label class="full">Allowed purposes<input name="allowed_purposes" value="${escapeHtml((aiPolicy.allowed_purposes || []).join(", "))}" /></label>
+          <div class="full"><button class="secondary">Save AI Policy</button></div>
+        </form>
+        <div class="notice warn">External AI and PHI remain blocked unless both server settings and this project policy allow them.</div>
+      </section>
+    ` : ""}
     <section class="panel">
       <h2>AI Safety and Prompts</h2>
       <div class="grid two">
@@ -1561,6 +1592,7 @@ function backupsView() {
   const backupSummary = state.adminBackups?.summary || state.adminStatus?.health?.backup || {};
   const latestFull = backupSummary.latest_full_backup;
   const latestPostgres = backupSummary.latest_postgres_backup;
+  const latestVerifiedFull = backupSummary.latest_verified_full_backup;
   const fullBackups = state.adminBackups?.backups?.filter((item) => item.backup_type === "full") || [];
   return `
     ${isSuperAdmin() ? `
@@ -1573,14 +1605,19 @@ function backupsView() {
         <div class="split-actions">
           <button id="full-backup-create">Create Full Backup</button>
           <button class="secondary" id="full-backup-verify">Verify Latest Backup</button>
+          <button class="secondary" id="full-backup-dry-run">Dry Run Restore Check</button>
           ${latestFull ? `<button class="secondary" id="full-backup-download">Download Full Backup</button>` : ""}
         </div>
       </div>
       ${latestFull?.verified ? `<div class="notice ok">Latest full backup verified at ${fmtTime(latestFull.verified_at)}.</div>` : `<div class="notice warn">No verified full backup is recorded. Create and verify a full backup before relying on this deployment.</div>`}
+      <div class="notice">Download one encrypted full backup weekly or configure external storage. Lightsail snapshots alone are not enough.</div>
       <div class="grid three">
         <div><span class="small">Latest PostgreSQL backup</span><strong>${latestPostgres ? `${escapeHtml(latestPostgres.name)} (${Math.round(latestPostgres.size / 1024)} KB)` : "Not found"}</strong></div>
         <div><span class="small">Latest full backup</span><strong>${latestFull ? `${escapeHtml(latestFull.name)} (${Math.round(latestFull.size / 1024)} KB)` : "Not found"}</strong></div>
-        <div><span class="small">Uploads included</span><strong>${latestFull?.uploads_included ? "Yes" : "No verified full backup"}</strong></div>
+        <div><span class="small">Latest verified full</span><strong>${latestVerifiedFull ? `${escapeHtml(latestVerifiedFull.name)} (${fmtTime(latestVerifiedFull.verified_at)})` : "Not found"}</strong></div>
+        <div><span class="small">Uploads included</span><strong>${latestFull?.includes_uploads ? "Yes" : "No verified full backup"}</strong></div>
+        <div><span class="small">Manifest included</span><strong>${latestFull?.includes_manifest ? "Yes" : "Needs verification"}</strong></div>
+        <div><span class="small">Checksum verified</span><strong>${latestFull?.checksum_verified ? "Yes" : "Needs verification"}</strong></div>
         <div><span class="small">Uploads folder</span><strong>${backupSummary.uploads?.exists ? `${backupSummary.uploads.file_count || 0} file(s)` : "Missing"}</strong></div>
         <div><span class="small">Backup directory</span><strong>${escapeHtml(backupSummary.directory || "")}</strong></div>
         <div><span class="small">Verification</span><strong>${latestFull?.verified ? "Passed" : "Needs verification"}</strong></div>
@@ -1588,14 +1625,16 @@ function backupsView() {
       ${fullBackups.length ? `
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Full backup</th><th>Size</th><th>Created</th><th>Verified</th><th></th></tr></thead>
+            <thead><tr><th>Full backup</th><th>Type</th><th>Size</th><th>Created</th><th>Verified</th><th>Contents</th><th></th></tr></thead>
             <tbody>
               ${fullBackups.map((backup) => `
                 <tr>
                   <td>${escapeHtml(backup.name)} <span class="pill ok">encrypted</span></td>
+                  <td>${escapeHtml(backup.backup_contents || "full database + uploads")}</td>
                   <td>${Math.round(backup.size / 1024)} KB</td>
                   <td>${fmtTime(backup.created_at)}</td>
-                  <td>${backup.verified ? `Yes (${fmtTime(backup.verified_at)})` : "No"}</td>
+                  <td>${backup.verified ? `Yes (${fmtTime(backup.verified_at)})` : "No"}<br><span class="small">${escapeHtml(backup.verification_status || "not_verified")}</span></td>
+                  <td class="small">uploads=${backup.includes_uploads ? "yes" : "no"} manifest=${backup.includes_manifest ? "yes" : "no"} checksum=${backup.checksum_verified ? "yes" : "no"}</td>
                   <td><button class="secondary" data-download-admin-backup="${escapeHtml(backup.name)}">Download</button></td>
                 </tr>
               `).join("")}
@@ -1608,9 +1647,9 @@ function backupsView() {
     <section class="panel">
       <div class="row">
         <h2>Backups</h2>
-        <button id="backup-create">Create Backup</button>
+        <button id="backup-create">Create PostgreSQL Backup</button>
       </div>
-      <p>Project database backups protect structured data. Full app backups also include uploaded case evidence files.</p>
+      <p>Project database backups protect structured data only. Full app backups also include uploaded case evidence files.</p>
       <form id="encrypted-backup-form" class="form-grid">
         <label>Archive passphrase<input name="passphrase" type="password" minlength="12" placeholder="12+ characters" /></label>
         <div><button class="secondary">Create Encrypted Archive</button></div>
@@ -1780,18 +1819,36 @@ function accessView() {
 
 function settingsView() {
   const health = state.adminStatus?.health;
+  const warnings = health?.public_base_url_warnings || [];
+  const counts = health?.counts || {};
   return `
     ${isSuperAdmin() ? `
     <section class="panel">
       <h2>System Status</h2>
+      ${warnings.map((warning) => `<div class="notice warn">${escapeHtml(warning)}</div>`).join("")}
       <div class="grid three">
         <div><span class="small">App</span><strong>${health?.ok ? "Running" : "Needs review"}</strong></div>
+        <div><span class="small">Version</span><strong>${escapeHtml(health?.version || "0.1")}</strong></div>
+        <div><span class="small">Git commit</span><strong>${escapeHtml(health?.commit || "unknown")}</strong></div>
         <div><span class="small">Mode</span><strong>${escapeHtml(health?.environment || "development")}</strong></div>
         <div><span class="small">Database</span><strong>${escapeHtml(health?.database_backend || "")}</strong></div>
+        <div><span class="small">PostgreSQL / DB status</span><strong>${health?.database?.ok ? "Connected" : "Error"}</strong></div>
+        <div><span class="small">Migration</span><strong>${escapeHtml(health?.migration_status || "")}</strong></div>
         <div><span class="small">HTTPS</span><strong>${health?.https_detected ? "Detected" : "Not detected"}</strong></div>
+        <div><span class="small">Public URL</span><strong>${escapeHtml(health?.public_base_url || "Not set")}</strong></div>
         <div><span class="small">AI</span><strong>${health?.ai?.external_ai_enabled ? "External enabled" : "Local/off"}</strong></div>
-        <div><span class="small">Latest backup</span><strong>${fmtTime(health?.backup?.latest_backup_at)}</strong></div>
+        <div><span class="small">PHI allowed</span><strong>${health?.ai?.phi_allowed ? "Yes" : "No"}</strong></div>
+        <div><span class="small">Latest full backup</span><strong>${health?.backup?.latest_full_backup?.name ? escapeHtml(health.backup.latest_full_backup.name) : "Not found"}</strong></div>
+        <div><span class="small">Latest verified full</span><strong>${health?.backup?.latest_verified_full_backup?.name ? escapeHtml(health.backup.latest_verified_full_backup.name) : "Not found"}</strong></div>
+        <div><span class="small">Uploads</span><strong>${health?.backup?.uploads?.exists ? `${health.backup.uploads.file_count || 0} file(s)` : "Missing"}</strong></div>
+        <div><span class="small">Backup directory</span><strong>${health?.backup?.directory_exists ? "Available" : "Missing"}</strong></div>
+        <div><span class="small">Disk free</span><strong>${health?.disk?.free ? `${Math.round(health.disk.free / 1024 / 1024)} MB` : ""}</strong></div>
+        <div><span class="small">Users</span><strong>${counts.users ?? ""}</strong></div>
+        <div><span class="small">Studies</span><strong>${counts.studies ?? ""}</strong></div>
+        <div><span class="small">Failed logins 7d</span><strong>${counts.recent_failed_logins ?? ""}</strong></div>
+        <div><span class="small">Exports 7d</span><strong>${counts.recent_exports ?? ""}</strong></div>
       </div>
+      <div class="notice">${escapeHtml(health?.backup?.off_server_reminder || "Download one encrypted full backup weekly.")}</div>
       <div class="split-actions">
         <button class="secondary" id="admin-backup">Create System Backup</button>
         <button class="secondary" id="refresh-admin">Refresh Status</button>
@@ -1903,6 +1960,7 @@ function bindRoute() {
   document.querySelector("#academic-cv-form")?.addEventListener("submit", submitAcademicCvItem);
   document.querySelector("#ai-safety-form")?.addEventListener("submit", submitAiSafetyPreview);
   document.querySelector("#ai-workbench-form")?.addEventListener("submit", submitAiWorkbench);
+  document.querySelector("#ai-policy-form")?.addEventListener("submit", submitAiPolicy);
   document.querySelector("#academic-export-md")?.addEventListener("click", () => downloadApi(`/api/studies/${state.studyId}/academic/export?format=md`, "academic_portfolio.md"));
   document.querySelector("#academic-export-csv")?.addEventListener("click", () => downloadApi(`/api/studies/${state.studyId}/academic/export?format=csv`, "academic_cv_tracker.csv"));
   document.querySelector("#refresh-drafts")?.addEventListener("click", renderDraftList);
@@ -1920,6 +1978,7 @@ function bindRoute() {
   document.querySelector("#backup-create")?.addEventListener("click", createBackup);
   document.querySelector("#full-backup-create")?.addEventListener("click", createFullBackup);
   document.querySelector("#full-backup-verify")?.addEventListener("click", verifyLatestFullBackup);
+  document.querySelector("#full-backup-dry-run")?.addEventListener("click", dryRunLatestFullBackup);
   document.querySelector("#full-backup-download")?.addEventListener("click", downloadLatestFullBackup);
   document.querySelectorAll("[data-download-admin-backup]").forEach((button) => {
     button.addEventListener("click", () => downloadApi(`/api/admin/backups/${encodeURIComponent(button.dataset.downloadAdminBackup)}`, button.dataset.downloadAdminBackup));
@@ -1978,6 +2037,8 @@ function bindRoute() {
   document.querySelectorAll("[data-respond-query]").forEach((button) => button.addEventListener("click", () => respondQuery(button.dataset.respondQuery)));
   document.querySelectorAll("[data-lock-entry]").forEach((button) => button.addEventListener("click", () => lockEntry(button.dataset.lockEntry)));
   document.querySelectorAll("[data-unlock-entry]").forEach((button) => button.addEventListener("click", () => unlockEntry(button.dataset.unlockEntry)));
+  document.querySelectorAll("[data-freeze-entry]").forEach((button) => button.addEventListener("click", () => freezeEntry(button.dataset.freezeEntry)));
+  document.querySelectorAll("[data-unfreeze-entry]").forEach((button) => button.addEventListener("click", () => unfreezeEntry(button.dataset.unfreezeEntry)));
   document.querySelectorAll("[data-entry-history]").forEach((button) => button.addEventListener("click", () => showEntryHistory(button.dataset.entryHistory)));
   document.querySelectorAll("[data-verify-field]").forEach((button) => button.addEventListener("click", () => setFieldState(button, "verify_field")));
   document.querySelectorAll("[data-freeze-field]").forEach((button) => button.addEventListener("click", () => setFieldState(button, "freeze_field")));
@@ -1986,6 +2047,7 @@ function bindRoute() {
     render();
   }));
   document.querySelectorAll("[data-form-versions]").forEach((button) => button.addEventListener("click", () => showFormVersions(button.dataset.formVersions)));
+  document.querySelectorAll("[data-form-action]").forEach((button) => button.addEventListener("click", () => setFormLifecycle(button.dataset.formId, button.dataset.formAction)));
 }
 
 function applyBranching(form) {
@@ -2413,6 +2475,34 @@ async function submitAiWorkbench(event) {
   }
 }
 
+async function submitAiPolicy(event) {
+  event.preventDefault();
+  const formData = new FormData(event.target);
+  const allowedPurposes = String(formData.get("allowed_purposes") || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  try {
+    await api(`/api/studies/${state.studyId}/ai/policy`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        enabled: formData.has("enabled"),
+        local_ai_allowed: formData.has("local_ai_allowed"),
+        external_ai_allowed: formData.has("external_ai_allowed"),
+        phi_allowed: formData.has("phi_allowed"),
+        multimodal_allowed: formData.has("multimodal_allowed"),
+        allowed_purposes: allowedPurposes,
+      }),
+    });
+    state.notice = "AI policy updated.";
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
 async function submitCaseIntake(event) {
   event.preventDefault();
   const form = event.target;
@@ -2591,6 +2681,18 @@ async function verifyLatestFullBackup() {
   }
 }
 
+async function dryRunLatestFullBackup() {
+  try {
+    const result = await api("/api/admin/backups/dry-run", { method: "POST", body: "{}" });
+    await loadStudy();
+    state.error = result.verification?.ok ? "Dry run restore check passed. No production data was overwritten." : `Dry run restore check failed: ${(result.verification?.errors || []).join("; ")}`;
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
 function downloadLatestFullBackup() {
   const latest = state.adminBackups?.summary?.latest_full_backup || state.adminStatus?.health?.backup?.latest_full_backup;
   if (!latest?.name) return;
@@ -2656,9 +2758,28 @@ async function submitFormDefinition(event) {
     const path = state.editingFormId ? `/api/studies/${state.studyId}/forms/${state.editingFormId}` : `/api/studies/${state.studyId}/forms`;
     await api(path, {
       method: state.editingFormId ? "PATCH" : "POST",
-      body: JSON.stringify({ name: formData.get("name"), code: formData.get("code"), event_ids: eventIds, schema: { fields, repeatable: formData.get("repeatable") === "true" } }),
+      body: JSON.stringify({ name: formData.get("name"), code: formData.get("code"), lifecycle_state: formData.get("lifecycle_state"), event_ids: eventIds, schema: { fields, repeatable: formData.get("repeatable") === "true" } }),
     });
     state.editingFormId = 0;
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function setFormLifecycle(formId, action) {
+  const labels = { publish: "publish this CRF for data entry", retire: "retire this CRF", lock: "lock this CRF", unlock: "unlock this CRF", validate: "validate this CRF" };
+  if (action !== "validate" && !confirm(`Do you want to ${labels[action] || action}?`)) return;
+  try {
+    const result = await api(`/api/studies/${state.studyId}/forms/${formId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ action }),
+    });
+    if (action === "validate") {
+      state.notice = result.valid ? "CRF validation passed." : `CRF validation needs review: ${(result.errors || []).join("; ")}`;
+    }
     await loadStudy();
     render();
   } catch (error) {
@@ -2878,7 +2999,8 @@ function applyEntryDraft(form, payload) {
 }
 
 async function lockEntry(id) {
-  const reason = prompt("Lock reason") || "Reviewed and locked";
+  const reason = prompt("Lock reason");
+  if (!reason) return;
   try {
     await api(`/api/studies/${state.studyId}/entries/${id}`, { method: "PATCH", body: JSON.stringify({ action: "lock", reason }) });
     await loadStudy();
@@ -2894,6 +3016,32 @@ async function unlockEntry(id) {
   if (!reason) return;
   try {
     await api(`/api/studies/${state.studyId}/entries/${id}`, { method: "PATCH", body: JSON.stringify({ action: "unlock", reason }) });
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function freezeEntry(id) {
+  const reason = prompt("Freeze reason for analysis lock");
+  if (!reason) return;
+  try {
+    await api(`/api/studies/${state.studyId}/entries/${id}`, { method: "PATCH", body: JSON.stringify({ action: "freeze", reason }) });
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function unfreezeEntry(id) {
+  const reason = prompt("Unfreeze reason");
+  if (!reason) return;
+  try {
+    await api(`/api/studies/${state.studyId}/entries/${id}`, { method: "PATCH", body: JSON.stringify({ action: "unfreeze", reason }) });
     await loadStudy();
     render();
   } catch (error) {

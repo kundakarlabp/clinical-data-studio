@@ -159,3 +159,16 @@ Run `.\remote_access.ps1` after starting the app to print the LAN address and de
 For a free remote-access decision guide and Oracle Always Free VM notes, see [docs/FREE_REMOTE_ACCESS.md](docs/FREE_REMOTE_ACCESS.md).
 
 Do not use GitHub Pages or Google Drive as the live clinical database host. GitHub Pages is for static site files, not this Python backend and SQLite database. Google Drive can store encrypted backup archives, but live SQLite databases are not safe to edit through file-sync storage from multiple users. Do not place PHI, identifiers, live exports, database files, or backup passphrases in a public or shared GitHub repository.
+
+## Pilot Production Hardening
+
+Recent pilot-production controls include:
+
+- Admin health checks with full backup verification and public URL warnings.
+- Cookie-based browser sessions with CSRF protection.
+- CRF draft/publish/retire/lock lifecycle controls.
+- De-identified exports that remove PHI/identifier fields and protect CSV/Excel formula injection.
+- Entry lock/freeze review workflow with required reasons.
+- Project-level AI policy with external AI and PHI blocked by default.
+
+This is suitable for supervised pilot use after local ethics/governance approval, named user accounts, HTTPS, verified backups, and a documented restore drill.

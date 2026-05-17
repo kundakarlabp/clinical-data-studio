@@ -248,6 +248,12 @@ class CoreEdcTests(unittest.TestCase):
                 self.assertIn("SHA256SUMS.txt", verification["contents"])
                 self.assertIn("uploads.zip", verification["contents"])
                 self.assertTrue(verification["database_dump"])
+                self.assertTrue(verification["database_dump_nonempty"])
+                self.assertTrue(verification["includes_manifest"])
+                self.assertTrue(verification["includes_uploads"])
+                self.assertTrue(verification["checksum_verified"])
+                self.assertFalse(verification["manifest"]["encryption"]["passphrase_stored"])
+                self.assertNotIn("LongLocalPassphrase123", json.dumps(verification["manifest"]))
                 self.assertEqual(verification["upload_file_count"], 1)
                 self.assertTrue(server.latest_full_backup_info()["verified"])
                 health = server.health_payload()
@@ -278,6 +284,43 @@ class CoreEdcTests(unittest.TestCase):
                 self.assertTrue(any("Uploads archive" in item or "uploads.zip" in item for item in verification["errors"]))
             finally:
                 server.BACKUPS = original_backups
+
+    def test_full_backup_verification_fails_on_checksum_mismatch(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            original_backups = server.BACKUPS
+            try:
+                server.BACKUPS = Path(tmp)
+                server.BACKUPS.mkdir(parents=True, exist_ok=True)
+                uploads = BytesIO()
+                with zipfile.ZipFile(uploads, "w", zipfile.ZIP_DEFLATED) as upload_zip:
+                    upload_zip.writestr("EMPTY_UPLOADS.txt", "empty")
+                upload_bytes = uploads.getvalue()
+                payload = BytesIO()
+                with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive:
+                    archive.writestr("postgres.dump", b"dump")
+                    archive.writestr("uploads.zip", upload_bytes)
+                    archive.writestr("manifest.json", json.dumps({"backup_type": "full", "database_dump": "postgres.dump", "uploads_archive": "uploads.zip"}))
+                    archive.writestr("SHA256SUMS.txt", f"{'0' * 64}  postgres.dump\n{server.sha256_bytes(upload_bytes)}  uploads.zip\n")
+                broken = server.BACKUPS / "full_checksum.full.cdsenc"
+                broken.write_bytes(server.encrypted_archive_bytes(payload.getvalue(), "LongLocalPassphrase123"))
+                verification = server.verify_full_backup(broken, "LongLocalPassphrase123")
+                self.assertFalse(verification["ok"])
+                self.assertFalse(verification["checksum_verified"])
+                self.assertTrue(any("Checksum mismatch" in item for item in verification["errors"]))
+            finally:
+                server.BACKUPS = original_backups
+
+    def test_public_base_url_warnings_detect_placeholder_and_mismatch(self):
+        original_settings = server.SETTINGS
+        try:
+            server.SETTINGS = replace(original_settings, env="production", public_base_url="https://your-domain.example", require_https=True)
+            warnings = server.public_base_url_warnings("real.example", "https")
+            self.assertTrue(any("placeholder" in warning for warning in warnings))
+            self.assertTrue(any("does not match" in warning for warning in warnings))
+            server.SETTINGS = replace(original_settings, env="production", public_base_url="http://real.example", require_https=True)
+            self.assertTrue(any("http://" in warning for warning in server.public_base_url_warnings("real.example", "https")))
+        finally:
+            server.SETTINGS = original_settings
 
     def test_env_example_quotes_display_name_with_spaces(self):
         env_text = (server.ROOT / ".env.example").read_text(encoding="utf-8")

@@ -253,6 +253,61 @@ def ai_status() -> dict:
     return ai_status_payload(SETTINGS, os.environ, DEFAULT_OPENAI_MODEL, DEFAULT_TRANSCRIBE_MODEL)
 
 
+AI_ALLOWED_PURPOSES = {"protocol_to_crf", "case_summary", "missing_fields", "inconsistency_detection", "publication_idea", "cv_item", "case_publication_review"}
+
+
+def default_ai_policy() -> dict:
+    return {
+        "enabled": True,
+        "local_ai_allowed": True,
+        "external_ai_allowed": False,
+        "phi_allowed": False,
+        "multimodal_allowed": False,
+        "allowed_purposes": sorted(AI_ALLOWED_PURPOSES),
+        "monthly_budget_limit": "",
+    }
+
+
+def normalize_ai_policy(value) -> dict:
+    raw = value if isinstance(value, dict) else load_json(value, {})
+    policy = default_ai_policy()
+    if isinstance(raw, dict):
+        policy.update({key: raw[key] for key in policy.keys() if key in raw})
+    policy["enabled"] = bool(policy.get("enabled"))
+    policy["local_ai_allowed"] = bool(policy.get("local_ai_allowed"))
+    policy["external_ai_allowed"] = bool(policy.get("external_ai_allowed"))
+    policy["phi_allowed"] = bool(policy.get("phi_allowed"))
+    policy["multimodal_allowed"] = bool(policy.get("multimodal_allowed"))
+    requested = policy.get("allowed_purposes") or []
+    if isinstance(requested, str):
+        requested = [item.strip() for item in requested.split(",")]
+    policy["allowed_purposes"] = sorted({item for item in requested if item in AI_ALLOWED_PURPOSES}) or sorted(AI_ALLOWED_PURPOSES)
+    return policy
+
+
+def study_ai_policy(conn: sqlite3.Connection, study_id: int) -> dict:
+    study = row(conn, "SELECT ai_policy_json FROM studies WHERE id = ?", (study_id,))
+    return normalize_ai_policy(study.get("ai_policy_json") if study else {})
+
+
+def ai_policy_allows(policy: dict, purpose: str, external: bool = False, input_type: str = "text", phi_detected: bool = False) -> tuple[bool, str]:
+    purpose = purpose.strip().lower().replace("-", "_")
+    if not policy.get("enabled"):
+        return False, "AI is disabled for this project."
+    if purpose not in set(policy.get("allowed_purposes") or []):
+        return False, "This AI purpose is not allowed for this project."
+    if external:
+        if not policy.get("external_ai_allowed"):
+            return False, "External AI is disabled for this project."
+        if phi_detected and not policy.get("phi_allowed"):
+            return False, "Project policy blocks sending likely PHI to external AI."
+        if input_type in {"image", "pdf", "audio", "mixed"} and not policy.get("multimodal_allowed"):
+            return False, "Project policy blocks external file/photo/audio AI."
+    elif not policy.get("local_ai_allowed"):
+        return False, "Local AI helpers are disabled for this project."
+    return True, ""
+
+
 def is_super_admin(user: dict | None) -> bool:
     return authz_is_super_admin(user)
 
@@ -276,6 +331,42 @@ def phi_findings(text: str) -> list[str]:
 
 def deidentify_for_ai(text: str, replacement: str = "Study participant") -> str:
     return deidentify_text_for_ai(text, replacement)
+
+
+CSV_FORMULA_PREFIXES = ("=", "+", "-", "@")
+
+
+def csv_safe_cell(value):
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        value = json.dumps(value, ensure_ascii=False)
+    if isinstance(value, str) and value.lstrip()[:1] in CSV_FORMULA_PREFIXES:
+        return "'" + value
+    return value
+
+
+def csv_safe_row(row):
+    if isinstance(row, dict):
+        return {key: csv_safe_cell(value) for key, value in row.items()}
+    return [csv_safe_cell(value) for value in row]
+
+
+def field_truthy(field: dict, key: str) -> bool:
+    value = field.get(key)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def omit_field_from_deidentified_export(field: dict) -> bool:
+    field_type = str(field.get("type") or "").strip().lower()
+    return (
+        field_truthy(field, "identifier")
+        or field_truthy(field, "phi")
+        or field_truthy(field, "phi_sensitive")
+        or field_type in {"file", "file_upload", "attachment"}
+    )
 
 
 def assert_external_ai_safe(text: str) -> None:
@@ -329,6 +420,10 @@ def backup_file_info(path: Path, backup_type: str | None = None) -> dict:
         "size": path.stat().st_size,
         "created_at": int(path.stat().st_mtime),
         "encrypted": path.suffix == ".cdsenc",
+        "verification_status": "not_verified",
+        "includes_uploads": False,
+        "includes_manifest": False,
+        "checksum_verified": False,
     }
     if backup_type:
         info["backup_type"] = backup_type
@@ -353,15 +448,17 @@ def backup_name(prefix: str = "system") -> str:
 
 
 def create_database_backup(passphrase: str = "", study_id: int | None = None) -> dict:
-    BACKUPS.mkdir(parents=True, exist_ok=True)
+    backup_dir = BACKUPS
+    backup_dir.mkdir(parents=True, exist_ok=True)
     prefix = f"study_{study_id}" if study_id else "system"
     stem = backup_name(prefix)
     if DATABASE_BACKEND == "postgres":
-        dump_target = BACKUPS / f"{stem}.dump"
+        dump_target = backup_dir / f"{stem}.dump"
         command = ["pg_dump", "--format=custom", "--file", str(dump_target), DATABASE_URL]
         subprocess.run(command, check=True, capture_output=True, text=True, timeout=300)
         if passphrase:
-            encrypted = BACKUPS / f"{stem}.cdsenc"
+            encrypted = backup_dir / f"{stem}.cdsenc"
+            encrypted.parent.mkdir(parents=True, exist_ok=True)
             encrypted.write_bytes(encrypted_archive_bytes(dump_target.read_bytes(), passphrase))
             dump_target.unlink(missing_ok=True)
             target = encrypted
@@ -369,10 +466,11 @@ def create_database_backup(passphrase: str = "", study_id: int | None = None) ->
             target = dump_target
         return {"name": target.name, "size": target.stat().st_size, "created_at": int(target.stat().st_mtime), "encrypted": target.suffix == ".cdsenc", "backend": "postgres"}
     with closing(db()) as conn:
-        plain_target = BACKUPS / f"{stem}.sqlite3"
+        plain_target = backup_dir / f"{stem}.sqlite3"
         write_sqlite_backup(conn, plain_target)
     if passphrase:
-        encrypted = BACKUPS / f"{stem}.cdsenc"
+        encrypted = backup_dir / f"{stem}.cdsenc"
+        encrypted.parent.mkdir(parents=True, exist_ok=True)
         encrypted.write_bytes(encrypted_archive_bytes(plain_target.read_bytes(), passphrase))
         plain_target.unlink(missing_ok=True)
         target = encrypted
@@ -471,7 +569,9 @@ def latest_full_backup_info(path: Path | None = None) -> dict | None:
     if not target:
         return None
     info = backup_file_info(target, "full")
+    info["includes_uploads"] = True
     info["uploads_included"] = True
+    info["backup_contents"] = "full database + uploads"
     sidecar = verification_sidecar_path(target)
     if sidecar.exists():
         try:
@@ -479,8 +579,14 @@ def latest_full_backup_info(path: Path | None = None) -> dict | None:
             info["verification"] = verification
             info["verified"] = bool(verification.get("ok"))
             info["verified_at"] = verification.get("checked_at")
+            info["verification_status"] = "passed" if info["verified"] else "failed"
+            info["includes_uploads"] = bool(verification.get("includes_uploads"))
+            info["uploads_included"] = info["includes_uploads"]
+            info["includes_manifest"] = bool(verification.get("includes_manifest"))
+            info["checksum_verified"] = bool(verification.get("checksum_verified"))
         except Exception:
             info["verified"] = False
+            info["verification_status"] = "failed"
     else:
         info["verified"] = False
     return info
@@ -507,27 +613,46 @@ def verify_full_backup(backup_file: Path, passphrase: str = "", record: bool = F
         "database_dump": "",
         "uploads_archive": "",
         "upload_file_count": 0,
+        "includes_uploads": False,
+        "includes_manifest": False,
+        "checksum_verified": False,
+        "database_dump_nonempty": False,
+        "archive_readable": False,
+        "uploads_archive_readable": False,
         "errors": [],
     }
     try:
         with zipfile.ZipFile(BytesIO(archive_bytes), "r") as archive:
+            bad_file = archive.testzip()
+            if bad_file:
+                result["errors"].append(f"Archive contains unreadable member: {bad_file}")
+            else:
+                result["archive_readable"] = True
             names = archive.namelist()
             result["contents"] = names
             required = {"manifest.json", "SHA256SUMS.txt", "uploads.zip"}
             missing = sorted(required - set(names))
             if missing:
                 result["errors"].append(f"Missing required file(s): {', '.join(missing)}")
+            result["includes_manifest"] = "manifest.json" in names
             manifest = json.loads(archive.read("manifest.json").decode("utf-8")) if "manifest.json" in names else {}
             result["manifest"] = manifest
             result["database_dump"] = str(manifest.get("database_dump") or "")
             result["uploads_archive"] = str(manifest.get("uploads_archive") or "")
             if result["database_dump"] not in names:
                 result["errors"].append("Database dump is missing")
+            elif len(archive.read(result["database_dump"])) == 0:
+                result["errors"].append("Database dump is empty")
+            else:
+                result["database_dump_nonempty"] = True
             if result["uploads_archive"] not in names:
                 result["errors"].append("Uploads archive is missing")
+            else:
+                result["includes_uploads"] = True
             if manifest.get("backup_type") != "full":
                 result["errors"].append("Manifest backup_type is not full")
             if "SHA256SUMS.txt" in names:
+                checksum_ok = True
                 checksum_lines = archive.read("SHA256SUMS.txt").decode("utf-8").splitlines()
                 for line in checksum_lines:
                     if not line.strip():
@@ -536,12 +661,20 @@ def verify_full_backup(backup_file: Path, passphrase: str = "", record: bool = F
                     filename = filename.strip()
                     if filename not in names:
                         result["errors"].append(f"Checksum target missing: {filename}")
+                        checksum_ok = False
                         continue
                     actual = sha256_bytes(archive.read(filename))
                     if actual != expected:
                         result["errors"].append(f"Checksum mismatch: {filename}")
+                        checksum_ok = False
+                result["checksum_verified"] = checksum_ok and bool(checksum_lines)
             if result["uploads_archive"] in names:
                 with zipfile.ZipFile(BytesIO(archive.read(result["uploads_archive"])), "r") as uploads:
+                    bad_upload = uploads.testzip()
+                    if bad_upload:
+                        result["errors"].append(f"Uploads archive contains unreadable member: {bad_upload}")
+                    else:
+                        result["uploads_archive_readable"] = True
                     result["upload_file_count"] = len([name for name in uploads.namelist() if not name.endswith("/") and name != "EMPTY_UPLOADS.txt"])
         result["ok"] = not result["errors"]
     except Exception as exc:
@@ -550,6 +683,42 @@ def verify_full_backup(backup_file: Path, passphrase: str = "", record: bool = F
     if record:
         verification_sidecar_path(target).write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
     return result
+
+
+def latest_verified_full_backup_info() -> dict | None:
+    verified = [info for info in (latest_full_backup_info(item) for item in full_backup_candidates()) if info and info.get("verified")]
+    return verified[0] if verified else None
+
+
+def public_base_url_warnings(request_host: str = "", request_scheme: str = "") -> list[str]:
+    warnings: list[str] = []
+    public_url = (SETTINGS.public_base_url or "").strip()
+    if SETTINGS.production and not public_url:
+        warnings.append("CDS_PUBLIC_BASE_URL is missing in production.")
+    if public_url and "your-domain.example" in public_url:
+        warnings.append("CDS_PUBLIC_BASE_URL still contains the placeholder your-domain.example.")
+    if SETTINGS.require_https and public_url.startswith("http://"):
+        warnings.append("CDS_REQUIRE_HTTPS=true but CDS_PUBLIC_BASE_URL starts with http://.")
+    if public_url and request_host:
+        parsed = urlparse(public_url)
+        if parsed.netloc and parsed.netloc.lower() != request_host.lower() and os.environ.get("CDS_ALLOW_PUBLIC_URL_HOST_MISMATCH", "").lower() not in {"1", "true", "yes", "on"}:
+            warnings.append(f"CDS_PUBLIC_BASE_URL host {parsed.netloc} does not match detected request host {request_host}.")
+        if request_scheme and parsed.scheme and SETTINGS.require_https and parsed.scheme != "https":
+            warnings.append("CDS_PUBLIC_BASE_URL should use https when HTTPS is required.")
+    return warnings
+
+
+def system_counts() -> dict:
+    try:
+        with closing(db()) as conn:
+            return {
+                "users": row(conn, "SELECT COUNT(*) AS count FROM users")["count"],
+                "studies": row(conn, "SELECT COUNT(*) AS count FROM studies")["count"],
+                "recent_failed_logins": row(conn, "SELECT COUNT(*) AS count FROM audit_log WHERE action = 'failed_login' AND created_at >= ?", (now() - 7 * 86400,))["count"],
+                "recent_exports": row(conn, "SELECT COUNT(*) AS count FROM audit_log WHERE action = 'export' AND created_at >= ?", (now() - 7 * 86400,))["count"],
+            }
+    except Exception as exc:
+        return {"error": str(exc)}
 
 
 def restore_database_backup(backup_file: Path, passphrase: str = "") -> dict:
@@ -582,9 +751,19 @@ def restore_database_backup(backup_file: Path, passphrase: str = "") -> dict:
     return {"restored": target.name, "backend": DATABASE_BACKEND}
 
 
-def health_payload() -> dict:
+def health_payload(request_host: str = "", request_scheme: str = "") -> dict:
     db_status = database_status()
     latest_full = latest_full_backup_info()
+    latest_verified_full = latest_verified_full_backup_info()
+    disk = shutil.disk_usage(ROOT)
+    full_backup_age_days = None
+    if latest_verified_full and latest_verified_full.get("verified_at"):
+        full_backup_age_days = round((now() - int(latest_verified_full["verified_at"])) / 86400, 1)
+    warnings = public_base_url_warnings(request_host, request_scheme)
+    if not latest_verified_full:
+        warnings.append("No verified full backup exists. Create and verify a full backup before updates or real data entry.")
+    elif full_backup_age_days is not None and full_backup_age_days > 7:
+        warnings.append("Latest verified full backup is older than 7 days.")
     return {
         "ok": db_status["ok"],
         "app": "Clinical Data Studio",
@@ -595,18 +774,27 @@ def health_payload() -> dict:
         "database_backend": DATABASE_BACKEND,
         "migration_status": "ok" if db_status["ok"] else "error",
         "public_base_url": SETTINGS.public_base_url,
+        "public_base_url_warnings": warnings,
         "host": HOST,
         "port": PORT,
         "require_https": SETTINGS.require_https,
-        "https_detected": SETTINGS.public_base_url.startswith("https://"),
+        "https_detected": (request_scheme == "https") or SETTINGS.public_base_url.startswith("https://"),
+        "request_host": request_host,
         "data_protection": data_protection_status(),
         "ai": ai_status(),
+        "disk": {"total": disk.total, "used": disk.used, "free": disk.free},
+        "counts": system_counts(),
         "backup": {
             "directory": str(BACKUPS),
+            "directory_exists": BACKUPS.exists(),
             "latest_backup_at": latest_backup_time(),
             "latest_postgres_backup": latest_postgres_backup_info(),
             "latest_full_backup": latest_full,
+            "latest_verified_full_backup": latest_verified_full,
             "latest_full_backup_verified": bool(latest_full and latest_full.get("verified")),
+            "latest_verified_full_backup_age_days": full_backup_age_days,
+            "retention_policy": {"daily": 7, "weekly": 4, "monthly": 3},
+            "off_server_reminder": "Download one encrypted full backup weekly or configure external storage. Lightsail snapshots alone are not enough.",
             "uploads": {
                 "directory": str(UPLOADS),
                 "exists": UPLOADS.exists(),
@@ -897,6 +1085,8 @@ def migrate() -> None:
             add_column(conn, "audit_log", "user_agent", "TEXT NOT NULL DEFAULT ''")
             add_column(conn, "audit_log", "request_id", "TEXT NOT NULL DEFAULT ''")
             add_column(conn, "forms", "active", "INTEGER NOT NULL DEFAULT 1")
+            add_column(conn, "forms", "lifecycle_state", "TEXT NOT NULL DEFAULT 'published'")
+            add_column(conn, "studies", "ai_policy_json", "TEXT NOT NULL DEFAULT '{}'")
             add_column(conn, "survey_links", "expires_at", "BIGINT")
             add_column(conn, "survey_links", "one_time", "INTEGER NOT NULL DEFAULT 0")
             add_column(conn, "academic_cv_items", "active", "INTEGER NOT NULL DEFAULT 1")
@@ -955,6 +1145,7 @@ def migrate() -> None:
                 protocol_id TEXT NOT NULL DEFAULT '',
                 description TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'draft',
+                ai_policy_json TEXT NOT NULL DEFAULT '{}',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -967,6 +1158,7 @@ def migrate() -> None:
                 schema_json TEXT NOT NULL,
                 version INTEGER NOT NULL DEFAULT 1,
                 active INTEGER NOT NULL DEFAULT 1,
+                lifecycle_state TEXT NOT NULL DEFAULT 'published',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 UNIQUE(study_id, code)
@@ -1298,6 +1490,8 @@ def migrate() -> None:
         add_column(conn, "audit_log", "user_agent", "TEXT NOT NULL DEFAULT ''")
         add_column(conn, "audit_log", "request_id", "TEXT NOT NULL DEFAULT ''")
         add_column(conn, "forms", "active", "INTEGER NOT NULL DEFAULT 1")
+        add_column(conn, "forms", "lifecycle_state", "TEXT NOT NULL DEFAULT 'published'")
+        add_column(conn, "studies", "ai_policy_json", "TEXT NOT NULL DEFAULT '{}'")
         add_column(conn, "survey_links", "expires_at", "INTEGER")
         add_column(conn, "survey_links", "one_time", "INTEGER NOT NULL DEFAULT 0")
         add_column(conn, "academic_cv_items", "active", "INTEGER NOT NULL DEFAULT 1")
@@ -1583,6 +1777,56 @@ def normalize_schema(schema: dict) -> dict:
     return {"fields": fields, "repeatable": bool(schema.get("repeatable", False))}
 
 
+FORM_LIFECYCLE_STATES = {"draft", "published", "retired", "locked"}
+FORM_ENTRY_ALLOWED_STATES = {"published"}
+
+
+def form_lifecycle_state(form: dict | None) -> str:
+    state = str((form or {}).get("lifecycle_state") or "published").strip().lower()
+    return state if state in FORM_LIFECYCLE_STATES else "published"
+
+
+def validate_crf_for_publish(schema: dict) -> list[str]:
+    errors: list[str] = []
+    fields = schema.get("fields", [])
+    codes = [str(field.get("code", "")).strip() for field in fields]
+    known_codes = set(codes)
+    if not fields:
+        errors.append("CRF must contain at least one field.")
+    for index, field in enumerate(fields, start=1):
+        code = str(field.get("code", "")).strip()
+        label = str(field.get("label", "")).strip()
+        field_type = str(field.get("type", "")).strip().lower()
+        if not re.fullmatch(r"[a-z][a-z0-9_]*", code):
+            errors.append(f"Field {index} has an invalid variable name: {code or '(blank)'}.")
+        if not label:
+            errors.append(f"Field {code or index} is missing a label.")
+        if field_type not in {"text", "textarea", "number", "integer", "decimal", "date", "datetime", "select", "radio", "checkbox", "yesno", "calc", "file", "section", "descriptive"}:
+            errors.append(f"Field {code or index} uses unsupported type {field_type or '(blank)'}.")
+        if field_type in {"select", "radio", "checkbox"}:
+            choices = normalize_choices(field.get("choices") or field.get("options") or [])
+            choice_values = [item["value"] for item in choices]
+            if not choices:
+                errors.append(f"Field {code} needs coded choices before publish.")
+            if len(choice_values) != len(set(choice_values)):
+                errors.append(f"Field {code} has duplicate coded choice values.")
+            if any(not item.get("label") for item in choices):
+                errors.append(f"Field {code} has an empty choice label.")
+        for logic_key in ("branching_logic", "calculation"):
+            expression = str(field.get(logic_key, "") or "")
+            if expression:
+                expression_for_refs = re.sub(r"'[^']*'|\"[^\"]*\"", "", expression)
+                referenced = {item for item in re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", expression_for_refs) if item.upper() not in {"AND", "OR", "IN"}}
+                unknown = sorted(item for item in referenced if item not in known_codes)
+                if unknown:
+                    errors.append(f"Field {code} {logic_key.replace('_', ' ')} references unknown field(s): {', '.join(unknown)}.")
+        if field_type == "file" and not (field.get("max_size_mb") or field.get("allowed_types")):
+            errors.append(f"File field {code} needs an allowed type or max size rule before publish.")
+    if len(codes) != len(set(codes)):
+        errors.append("CRF has duplicate variable names.")
+    return errors
+
+
 def validate_entry_data(schema: dict, data: dict) -> tuple[dict, list[dict]]:
     cleaned = {}
     issues = []
@@ -1683,6 +1927,7 @@ def form_schema_snapshot(form: dict, schema: dict | None = None) -> dict:
         "form_name": form.get("name", ""),
         "form_code": form.get("code", ""),
         "form_version": int(form.get("version") or 1),
+        "lifecycle_state": form_lifecycle_state(form),
         "repeatable": bool(schema.get("repeatable", False)),
         "fields": schema.get("fields", []),
     }
@@ -2500,7 +2745,7 @@ class App(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/healthz":
-            payload = health_payload()
+            payload = health_payload(self.headers.get("host", ""), self.headers.get("x-forwarded-proto", "https" if self.request_is_https() else "http"))
             self.send_json(payload, 200 if payload["ok"] else 503)
         elif parsed.path.startswith("/api/"):
             self.handle_api("GET", parsed.path, parse_qs(parsed.query))
@@ -2695,7 +2940,7 @@ class App(BaseHTTPRequestHandler):
                 if path == "/api/setup" and method == "POST":
                     return self.first_run_setup(conn)
                 if path == "/api/health" and method == "GET":
-                    payload = health_payload()
+                    payload = health_payload(self.headers.get("host", ""), self.headers.get("x-forwarded-proto", "https" if self.request_is_https() else "http"))
                     return self.send_json(payload, 200 if payload["ok"] else 503)
 
                 user = self.require_user(conn)
@@ -2776,7 +3021,13 @@ class App(BaseHTTPRequestHandler):
         audit(conn, user["id"], "login", "session", None, None, {"username": username}, **self.audit_context())
         conn.commit()
         self.queue_header("Set-Cookie", self.session_cookie_header(token))
-        self.send_json({"token": token, "session": "cookie", "user": {"id": user["id"], "username": user["username"], "display_name": user["display_name"], "role": user["role"], "must_change_password": user.get("must_change_password", 0)}})
+        self.send_json(
+            {
+                "session": "cookie",
+                "csrf_required": True,
+                "user": {"id": user["id"], "username": user["username"], "display_name": user["display_name"], "role": user["role"], "must_change_password": user.get("must_change_password", 0)},
+            }
+        )
 
     def first_run_setup(self, conn: sqlite3.Connection) -> None:
         if not setup_required(conn):
@@ -2952,7 +3203,7 @@ class App(BaseHTTPRequestHandler):
                     text_lines.append(value)
             writer = csv.DictWriter(Sink(), fieldnames=fields)
             writer.writeheader()
-            writer.writerows(data)
+            writer.writerows(csv_safe_row(item) for item in data)
             content = "".join(text_lines).encode("utf-8-sig")
             self.send_response(200)
             self.send_header("content-type", "text/csv; charset=utf-8")
@@ -3088,6 +3339,7 @@ class App(BaseHTTPRequestHandler):
             )
             after = row(conn, "SELECT id, username, display_name, role, active, must_change_password, created_at FROM users WHERE id = ?", (cur.lastrowid,))
             audit(conn, user["id"], "create", "user", cur.lastrowid, None, after)
+            conn.commit()
             self.send_json({"user": after}, 201)
             return
         self.send_error_json("Unsupported user operation", 405)
@@ -3099,9 +3351,10 @@ class App(BaseHTTPRequestHandler):
         parts = path.strip("/").split("/")
         if path == "/api/admin/status" and method == "GET":
             disk = shutil.disk_usage(ROOT)
+            health = health_payload(self.headers.get("host", ""), self.headers.get("x-forwarded-proto", "https" if self.request_is_https() else "http"))
             self.send_json(
                 {
-                    "health": health_payload(),
+                    "health": health,
                     "disk": {"total": disk.total, "used": disk.used, "free": disk.free},
                     "logs": {"path": str(LOG_FILE), "exists": LOG_FILE.exists()},
                     "backups": {"directory": str(BACKUPS), "latest_backup_at": latest_backup_time()},
@@ -3128,13 +3381,14 @@ class App(BaseHTTPRequestHandler):
                 if item.is_file() and not item.name.endswith(".verify.json") and item.suffix in {".sqlite3", ".cdsenc", ".dump", ".gz"}:
                     backup_type = "full" if item.name.startswith("full_") or ".full." in item.name else ("postgres" if item.name.startswith("postgres_") or item.name.endswith(".dump") else "database")
                     files.append(latest_full_backup_info(item) if backup_type == "full" else backup_file_info(item, backup_type))
-            self.send_json({"backups": files, "summary": health_payload()["backup"]})
+            self.send_json({"backups": files, "summary": health_payload(self.headers.get("host", ""), self.headers.get("x-forwarded-proto", "https" if self.request_is_https() else "http"))["backup"]})
             return
         if path == "/api/admin/backup" and method == "POST":
             payload = self.body()
             conn.commit()
             backup = create_database_backup(str(payload.get("passphrase", "")) or SETTINGS.backup_passphrase)
             audit(conn, user["id"], "create_encrypted" if backup["encrypted"] else "create", "backup", None, None, backup, **self.audit_context())
+            conn.commit()
             self.send_json({"backup": backup}, 201)
             return
         if path == "/api/admin/backup/full" and method == "POST":
@@ -3142,6 +3396,7 @@ class App(BaseHTTPRequestHandler):
             conn.commit()
             backup = create_full_backup(str(payload.get("passphrase", "")) or SETTINGS.backup_passphrase)
             audit(conn, user["id"], "create_full", "backup", None, None, backup, **self.audit_context())
+            conn.commit()
             self.send_json({"backup": backup}, 201)
             return
         if path == "/api/admin/backups/verify" and method == "POST":
@@ -3154,6 +3409,17 @@ class App(BaseHTTPRequestHandler):
             verification = verify_full_backup(target, str(payload.get("passphrase", "")) or SETTINGS.backup_passphrase, record=True)
             audit(conn, user["id"], "verify", "backup", None, None, {"filename": target.name, "ok": verification["ok"]}, **self.audit_context())
             self.send_json({"verification": verification})
+            return
+        if path == "/api/admin/backups/dry-run" and method == "POST":
+            payload = self.body()
+            filename = Path(str(payload.get("filename", ""))).name
+            target = (BACKUPS / filename).resolve() if filename else (full_backup_candidates()[0] if full_backup_candidates() else None)
+            if not target or not str(target).startswith(str(BACKUPS.resolve())) or not target.exists():
+                self.send_error_json("Full backup not found", 404)
+                return
+            verification = verify_full_backup(target, str(payload.get("passphrase", "")) or SETTINGS.backup_passphrase, record=False)
+            audit(conn, user["id"], "restore_dry_run", "backup", None, None, {"filename": target.name, "ok": verification["ok"]}, **self.audit_context())
+            self.send_json({"dry_run": True, "verification": verification})
             return
         if len(parts) == 4 and parts[:3] == ["api", "admin", "backups"] and method == "GET":
             filename = Path(parts[3]).name
@@ -3376,15 +3642,37 @@ class App(BaseHTTPRequestHandler):
         raise ValueError("Unsupported AI workbench purpose")
 
     def ai_routes(self, conn, user, method, study_id, parts, membership) -> None:
+        if method == "GET" and len(parts) == 5 and parts[4] == "policy":
+            if not (membership_has(membership, "manage_study") or membership_has(membership, "review_data") or membership_has(membership, "view_analysis")):
+                self.send_error_json("AI policy permission required", 403)
+                return
+            self.send_json({"policy": study_ai_policy(conn, study_id), "ai": ai_status()})
+            return
+        if method == "PATCH" and len(parts) == 5 and parts[4] == "policy":
+            if not membership_has(membership, "manage_study"):
+                self.send_error_json("Study management permission required", 403)
+                return
+            before = row(conn, "SELECT ai_policy_json FROM studies WHERE id = ?", (study_id,))
+            policy = normalize_ai_policy(self.body())
+            conn.execute("UPDATE studies SET ai_policy_json = ?, updated_at = ? WHERE id = ?", (json.dumps(policy, sort_keys=True), now(), study_id))
+            audit(conn, user["id"], "update", "ai_policy", study_id, before, {"policy": policy}, study_id=study_id, **self.audit_context())
+            conn.commit()
+            self.send_json({"policy": policy})
+            return
+        policy = study_ai_policy(conn, study_id)
         if method == "GET" and len(parts) == 5 and parts[4] == "audit":
             if not (membership_has(membership, "manage_study") or membership_has(membership, "review_data")):
                 self.send_error_json("AI audit permission required", 403)
                 return
-            self.send_json({"ai_audit": self.ai_audit_rows(conn, study_id), "ai": ai_status()})
+            self.send_json({"ai_audit": self.ai_audit_rows(conn, study_id), "ai": ai_status(), "policy": policy})
             return
         if method == "POST" and len(parts) == 5 and parts[4] == "safety-preview":
             if not membership_has(membership, "use_ai"):
                 self.send_error_json("AI permission required", 403)
+                return
+            allowed, reason = ai_policy_allows(policy, "case_summary", external=False)
+            if not allowed:
+                self.send_error_json(reason, 403)
                 return
             payload = self.body()
             text = str(payload.get("text", ""))
@@ -3413,6 +3701,7 @@ class App(BaseHTTPRequestHandler):
                         "requires_admin_confirmation": bool(findings),
                     },
                     "ai": ai_status(),
+                    "policy": policy,
                     "audit_id": ai_audit_id,
                 }
             )
@@ -3426,6 +3715,10 @@ class App(BaseHTTPRequestHandler):
             text = str(payload.get("text", ""))
             case_id = int(payload.get("case_id") or 0) or None
             findings = detect_phi_findings(text)
+            allowed, reason = ai_policy_allows(policy, purpose, external=False, phi_detected=bool(findings))
+            if not allowed:
+                self.send_error_json(reason, 403)
+                return
             result = self.local_ai_workbench_result(conn, study_id, membership, user, purpose, text, case_id)
             ai_audit_id = record_ai_audit(
                 conn,
@@ -3440,7 +3733,7 @@ class App(BaseHTTPRequestHandler):
                 status_value="ok",
             )
             audit(conn, user["id"], "ai_request", "ai_audit", ai_audit_id, None, {"purpose": purpose, "mode": "local", "phi_detected": bool(findings)}, study_id=study_id, **self.audit_context())
-            self.send_json({"result": result, "ai": ai_status(), "audit_id": ai_audit_id})
+            self.send_json({"result": result, "ai": ai_status(), "policy": policy, "audit_id": ai_audit_id})
             return
         self.send_error_json("Unsupported AI operation", 405)
 
@@ -3470,6 +3763,7 @@ class App(BaseHTTPRequestHandler):
             (cur.lastrowid, user["id"], timestamp, timestamp),
         )
         audit(conn, user["id"], "create", "study", cur.lastrowid, None, study)
+        conn.commit()
         self.send_json({"study": study}, 201)
 
     def public_survey(self, conn: sqlite3.Connection, method: str, path: str) -> None:
@@ -3770,7 +4064,24 @@ class App(BaseHTTPRequestHandler):
             if not membership_has(membership, "export_data"):
                 self.send_error_json("Export permission required", 403)
                 return
-            audit(conn, user["id"], "export", "records", study_id, None, {"deidentified": membership.get("role") == "analyst"}, study_id=study_id, **self.audit_context())
+            export_filters = self.export_filters_from_query(membership, query)
+            record_count = len(self.record_payload(conn, study_id, membership, export_filters))
+            audit(
+                conn,
+                user["id"],
+                "export",
+                "records",
+                study_id,
+                None,
+                {
+                    "export_type": "deidentified" if export_filters["deidentified"] else "full",
+                    "deidentified": export_filters["deidentified"],
+                    "choice_format": export_filters["choice_format"],
+                    "record_count": record_count,
+                },
+                study_id=study_id,
+                **self.audit_context(),
+            )
             return self.export_csv(conn, study_id, membership, query)
         if resource == "odm" and method == "GET":
             if not membership_has(membership, "export_data"):
@@ -3856,9 +4167,12 @@ class App(BaseHTTPRequestHandler):
             payload = self.body()
             timestamp = now()
             schema = normalize_schema(payload.get("schema") or {"fields": []})
+            lifecycle_state = str(payload.get("lifecycle_state") or "published").strip().lower()
+            if lifecycle_state not in FORM_LIFECYCLE_STATES:
+                lifecycle_state = "published"
             cur = conn.execute(
-                "INSERT INTO forms(study_id, name, code, schema_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (study_id, str(payload.get("name", "")).strip() or "Untitled Form", normalize_code(str(payload.get("code", "")), f"form_{timestamp}"), json.dumps(schema), timestamp, timestamp),
+                "INSERT INTO forms(study_id, name, code, schema_json, lifecycle_state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (study_id, str(payload.get("name", "")).strip() or "Untitled Form", normalize_code(str(payload.get("code", "")), f"form_{timestamp}"), json.dumps(schema), lifecycle_state, timestamp, timestamp),
             )
             event_ids = payload.get("event_ids") or []
             if not event_ids:
@@ -3875,6 +4189,7 @@ class App(BaseHTTPRequestHandler):
                     )
             after = row(conn, "SELECT * FROM forms WHERE id = ?", (cur.lastrowid,))
             audit(conn, user["id"], "create", "form", cur.lastrowid, None, after)
+            conn.commit()
             self.send_json({"form": after}, 201)
             return
         if method == "PATCH" and len(parts) == 5:
@@ -3884,14 +4199,40 @@ class App(BaseHTTPRequestHandler):
                 self.send_error_json("Form not found", 404)
                 return
             payload = self.body()
+            action = str(payload.get("action", "")).strip().lower()
+            if action in {"validate", "publish", "retire", "lock", "unlock", "save_draft"}:
+                current_schema = load_json(before["schema_json"], {"fields": []})
+                errors = validate_crf_for_publish(current_schema)
+                if action == "validate":
+                    self.send_json({"valid": not errors, "errors": errors, "lifecycle_state": form_lifecycle_state(before)})
+                    return
+                if action == "publish" and errors:
+                    self.send_json({"errors": errors}, 422)
+                    return
+                next_state = {
+                    "publish": "published",
+                    "retire": "retired",
+                    "lock": "locked",
+                    "unlock": "published",
+                    "save_draft": "draft",
+                }[action]
+                conn.execute("UPDATE forms SET lifecycle_state = ?, active = ?, updated_at = ? WHERE id = ? AND study_id = ?", (next_state, 0 if next_state == "retired" else 1, now(), form_id, study_id))
+                after = row(conn, "SELECT * FROM forms WHERE id = ?", (form_id,))
+                audit(conn, user["id"], action, "form", form_id, before, after, study_id=study_id, **self.audit_context())
+                conn.commit()
+                self.send_json({"form": after})
+                return
             schema = normalize_schema(payload.get("schema", load_json(before["schema_json"], {})))
+            lifecycle_state = str(payload.get("lifecycle_state") or before.get("lifecycle_state") or "published").strip().lower()
+            if lifecycle_state not in FORM_LIFECYCLE_STATES:
+                lifecycle_state = form_lifecycle_state(before)
             conn.execute(
                 "INSERT INTO form_versions(form_id, study_id, version, name, code, schema_json, saved_by, saved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (form_id, study_id, before["version"], before["name"], before["code"], before["schema_json"], user["id"], now()),
             )
             conn.execute(
-                "UPDATE forms SET name = ?, code = ?, schema_json = ?, version = version + 1, updated_at = ? WHERE id = ? AND study_id = ?",
-                (str(payload.get("name", before["name"])).strip(), normalize_code(str(payload.get("code", before["code"])), before["code"]), json.dumps(schema), now(), form_id, study_id),
+                "UPDATE forms SET name = ?, code = ?, schema_json = ?, lifecycle_state = ?, version = version + 1, updated_at = ? WHERE id = ? AND study_id = ?",
+                (str(payload.get("name", before["name"])).strip(), normalize_code(str(payload.get("code", before["code"])), before["code"]), json.dumps(schema), lifecycle_state, now(), form_id, study_id),
             )
             after = row(conn, "SELECT * FROM forms WHERE id = ?", (form_id,))
             audit(conn, user["id"], "update", "form", form_id, before, after)
@@ -4093,7 +4434,7 @@ class App(BaseHTTPRequestHandler):
                 self.send_error_json("Invitation not found", 404)
                 return
             payload = self.body()
-            action = str(payload.get("action", "")).strip()
+            action = str(payload.get("action", "")).strip().lower()
             timestamp = now()
             if action == "mark_sent":
                 conn.execute(
@@ -4213,6 +4554,7 @@ class App(BaseHTTPRequestHandler):
                     )
             imported.append({"form_id": form_id, "code": item["code"], "action": action})
         audit(conn, user["id"], "import", "dictionary", study_id, None, {"forms": imported})
+        conn.commit()
         self.send_json({"imported": imported})
 
     def import_records(self, conn, user, study_id: int, membership) -> None:
@@ -4272,6 +4614,10 @@ class App(BaseHTTPRequestHandler):
                             break
             if not form:
                 imported["errors"].append({"row": row_index, "message": "Could not identify CRF/form"})
+                continue
+            lifecycle_state = form_lifecycle_state(form)
+            if lifecycle_state not in FORM_ENTRY_ALLOWED_STATES:
+                imported["errors"].append({"row": row_index, "message": f"CRF is {lifecycle_state}; only published CRFs accept imported records"})
                 continue
             schema = load_json(form["schema_json"], {"fields": []})
             form_snapshot = form_schema_snapshot(form, schema)
@@ -4444,6 +4790,11 @@ class App(BaseHTTPRequestHandler):
             if membership.get("data_group_id") and participant.get("data_group_id") != membership["data_group_id"]:
                 self.send_error_json("Participant is outside your data access group", 403)
                 return
+            existing = row(conn, "SELECT * FROM entries WHERE participant_id = ? AND form_id = ? AND event_name = ? AND repeat_instance = ?", (participant_id, form_id, event_name, repeat_instance))
+            lifecycle_state = form_lifecycle_state(form)
+            if lifecycle_state not in FORM_ENTRY_ALLOWED_STATES:
+                self.send_error_json(f"CRF is {lifecycle_state}; data entry is allowed only for published CRFs.", 423 if lifecycle_state == "locked" else 409)
+                return
             schema = load_json(form["schema_json"], {"fields": []})
             snapshot = form_schema_snapshot(form, schema)
             form_version = int(form.get("version") or 1)
@@ -4456,7 +4807,6 @@ class App(BaseHTTPRequestHandler):
                 return
             digest = entry_hash(cleaned, form_version, snapshot)
             snapshot_json = json.dumps(snapshot, sort_keys=True)
-            existing = row(conn, "SELECT * FROM entries WHERE participant_id = ? AND form_id = ? AND event_name = ? AND repeat_instance = ?", (participant_id, form_id, event_name, repeat_instance))
             if existing:
                 if_match_updated_at = payload.get("if_match_updated_at")
                 if_match_entry_hash = str(payload.get("if_match_entry_hash") or "").strip()
@@ -4476,7 +4826,13 @@ class App(BaseHTTPRequestHandler):
                     audit(conn, user["id"], "sync_conflict", "entry", existing["id"], {"if_match_updated_at": if_match_updated_at, "if_match_entry_hash": if_match_entry_hash}, conflict_payload, study_id=study_id, **self.audit_context())
                     self.send_json({"error": "Entry was changed on the server. Review conflict before syncing.", "server_entry": conflict_payload}, 409)
                     return
+                if existing.get("status") == "frozen":
+                    self.send_error_json("Entry is frozen for analysis. Unfreeze with a reason before editing.", 423)
+                    return
                 if existing.get("locked_at"):
+                    if not (membership_has(membership, "review_data") or membership_has(membership, "manage_study")):
+                        self.send_error_json("Entry is locked and cannot be edited by data entry users.", 423)
+                        return
                     reason = str(payload.get("change_reason", "")).strip()
                     if not reason:
                         self.send_error_json("Change reason is required before editing a locked CRF", 423)
@@ -4512,21 +4868,36 @@ class App(BaseHTTPRequestHandler):
                 return
             payload = self.body()
             action = str(payload.get("action", "")).strip()
-            if action == "lock":
-                reason = str(payload.get("reason", "")).strip() or "Reviewed and locked"
-                conn.execute("UPDATE entries SET locked_at = ?, locked_by = ?, lock_reason = ?, status = 'complete', updated_by = ?, updated_at = ? WHERE id = ?", (now(), user["id"], reason, user["id"], now(), entry_id))
+            if action in {"lock", "freeze"}:
+                if not (membership_has(membership, "review_data") or membership_has(membership, "manage_study")):
+                    self.send_error_json("Review permission required", 403)
+                    return
+                reason = str(payload.get("reason", "")).strip()
+                if not reason:
+                    self.send_error_json("Reason is required", 400)
+                    return
+                next_status = "frozen" if action == "freeze" else "complete"
+                conn.execute("UPDATE entries SET locked_at = ?, locked_by = ?, lock_reason = ?, status = ?, updated_by = ?, updated_at = ? WHERE id = ?", (now(), user["id"], reason, next_status, user["id"], now(), entry_id))
                 after = row(conn, "SELECT * FROM entries WHERE id = ?", (entry_id,))
-                audit(conn, user["id"], "lock", "entry", entry_id, before, after)
+                audit(conn, user["id"], action, "entry", entry_id, before, after, study_id=study_id, **self.audit_context())
+                conn.commit()
                 self.send_json({"entry": after})
                 return
-            if action == "unlock":
+            if action in {"unlock", "unfreeze"}:
+                if not (membership_has(membership, "review_data") or membership_has(membership, "manage_study")):
+                    self.send_error_json("Review permission required", 403)
+                    return
                 reason = str(payload.get("reason", "")).strip()
                 if not reason:
                     self.send_error_json("Unlock reason is required", 400)
                     return
-                conn.execute("UPDATE entries SET locked_at = NULL, locked_by = NULL, lock_reason = '', updated_by = ?, updated_at = ? WHERE id = ?", (user["id"], now(), entry_id))
+                next_status = "reviewed" if action == "unfreeze" else before.get("status", "complete")
+                if next_status == "frozen":
+                    next_status = "reviewed"
+                conn.execute("UPDATE entries SET locked_at = NULL, locked_by = NULL, lock_reason = '', status = ?, updated_by = ?, updated_at = ? WHERE id = ?", (next_status, user["id"], now(), entry_id))
                 after = row(conn, "SELECT * FROM entries WHERE id = ?", (entry_id,))
-                audit(conn, user["id"], "unlock", "entry", entry_id, before, {"entry": after, "reason": reason})
+                audit(conn, user["id"], action, "entry", entry_id, before, {"entry": after, "reason": reason}, study_id=study_id, **self.audit_context())
+                conn.commit()
                 self.send_json({"entry": after})
                 return
             if action in {"verify_field", "freeze_field"}:
@@ -4543,7 +4914,8 @@ class App(BaseHTTPRequestHandler):
                     """,
                     (entry_id, field_code, state, reason, user["id"], now()),
                 )
-                audit(conn, user["id"], action, "entry", entry_id, before, {"field_code": field_code, "state": state, "reason": reason})
+                audit(conn, user["id"], action, "entry", entry_id, before, {"field_code": field_code, "state": state, "reason": reason}, study_id=study_id, **self.audit_context())
+                conn.commit()
                 self.send_json({"field_state": {"entry_id": entry_id, "field_code": field_code, "state": state}})
                 return
             self.send_error_json("Unsupported entry action", 405)
@@ -4703,20 +5075,24 @@ class App(BaseHTTPRequestHandler):
             all_cases = self.case_rows(conn, study_id, membership, user)
             case_item = self.case_payload(conn, case_row)
             status = ai_status()
+            policy = study_ai_policy(conn, study_id)
             mode = "local"
             findings = detect_phi_findings(str(case_item.get("source_text", "")) + "\n" + question)
             ai_error = ""
+            file_count = len(case_item.get("files", []))
+            external_allowed, policy_reason = ai_policy_allows(policy, "case_publication_review", external=True, input_type="mixed" if file_count else "text", phi_detected=bool(findings))
             try:
-                if status["external_ai_enabled"]:
+                if status["external_ai_enabled"] and external_allowed:
                     response = openai_academic_case_review(conn, study_id, case_item, all_cases, question)
                     mode = "openai"
                 else:
                     response = local_academic_case_review(case_item, all_cases, question)
+                    if status["external_ai_enabled"] and policy_reason:
+                        response["safety_notes"].append(policy_reason)
             except Exception as exc:
                 ai_error = str(exc)
                 response = local_academic_case_review(case_item, all_cases, question)
                 response["safety_notes"].append(f"External AI review failed; local fallback used: {exc}")
-            file_count = len(case_item.get("files", []))
             timestamp = now()
             cur = conn.execute(
                 """
@@ -4842,7 +5218,8 @@ class App(BaseHTTPRequestHandler):
             clinical = extracted.get("clinical", {})
             demographics = extracted.get("demographics", {})
             writer.writerow(
-                {
+                csv_safe_row(
+                    {
                     "case_uid": item["case_uid"],
                     "title": item["title"],
                     "status": item["status"],
@@ -4858,7 +5235,8 @@ class App(BaseHTTPRequestHandler):
                     "warnings": "; ".join(extracted.get("warnings", [])),
                     "file_count": len(item.get("files", [])),
                     "updated_at": item["updated_at"],
-                }
+                    }
+                )
             )
         content = "".join(text_lines).encode("utf-8-sig")
         self.send_response(200)
@@ -4957,6 +5335,7 @@ class App(BaseHTTPRequestHandler):
             )
             after = row(conn, "SELECT * FROM data_groups WHERE id = ?", (cur.lastrowid,))
             audit(conn, user["id"], "create", "data_group", cur.lastrowid, None, after)
+            conn.commit()
             self.send_json({"group": after}, 201)
             return
         self.send_error_json("Unsupported group operation", 405)
@@ -5001,6 +5380,7 @@ class App(BaseHTTPRequestHandler):
                 )
                 after = row(conn, "SELECT * FROM study_memberships WHERE id = ?", (existing["id"],))
                 audit(conn, user["id"], "update", "membership", existing["id"], before, after)
+                conn.commit()
                 self.send_json({"membership": after})
                 return
             cur = conn.execute(
@@ -5012,6 +5392,7 @@ class App(BaseHTTPRequestHandler):
             )
             after = row(conn, "SELECT * FROM study_memberships WHERE id = ?", (cur.lastrowid,))
             audit(conn, user["id"], "create", "membership", cur.lastrowid, None, after)
+            conn.commit()
             self.send_json({"membership": after}, 201)
             return
         self.send_error_json("Unsupported membership operation", 405)
@@ -5554,7 +5935,7 @@ class App(BaseHTTPRequestHandler):
             }
         )
 
-    def export_csv(self, conn, study_id: int, membership, query: dict[str, list[str]] | None = None) -> None:
+    def export_filters_from_query(self, membership, query: dict[str, list[str]] | None = None) -> dict:
         deidentified = membership.get("role") == "analyst"
         if query:
             value = (query.get("deidentified") or query.get("deidentified_export") or [""])[0].strip().lower()
@@ -5562,8 +5943,12 @@ class App(BaseHTTPRequestHandler):
         choice_format = ((query or {}).get("choice_format") or ["raw"])[0].strip().lower()
         if choice_format not in {"raw", "labels", "both"}:
             choice_format = "raw"
-        filename = "clinical_data_deidentified_export.csv" if deidentified else "clinical_data_export.csv"
-        return self.export_entries_csv(conn, study_id, membership, {"deidentified": deidentified, "choice_format": choice_format}, filename)
+        return {"deidentified": deidentified, "choice_format": choice_format}
+
+    def export_csv(self, conn, study_id: int, membership, query: dict[str, list[str]] | None = None) -> None:
+        filters = self.export_filters_from_query(membership, query)
+        filename = "clinical_data_deidentified_export.csv" if filters["deidentified"] else "clinical_data_export.csv"
+        return self.export_entries_csv(conn, study_id, membership, filters, filename)
 
     def record_payload(self, conn, study_id: int, membership, filters: dict) -> list[dict]:
         deidentified = bool(filters.get("deidentified")) or membership.get("role") == "analyst"
@@ -5623,6 +6008,8 @@ class App(BaseHTTPRequestHandler):
                 field_code = field.get("code", "")
                 if not field_code:
                     continue
+                if deidentified and omit_field_from_deidentified_export(field):
+                    continue
                 code = f"{form_code}__{field_code}"
                 value = data.get(field_code, "")
                 if field.get("choices") and choice_format in {"labels", "both"}:
@@ -5647,7 +6034,7 @@ class App(BaseHTTPRequestHandler):
                 text_lines.append(value)
         writer = csv.DictWriter(Sink(), fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(records)
+        writer.writerows(csv_safe_row(record) for record in records)
         content = "".join(text_lines).encode("utf-8-sig")
         self.send_response(200)
         self.send_header("content-type", "text/csv; charset=utf-8")
@@ -5681,7 +6068,7 @@ class App(BaseHTTPRequestHandler):
                 text_lines.append(value)
         writer = csv.DictWriter(Sink(), fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows([dict(item) for item in audit_rows])
+        writer.writerows(csv_safe_row(dict(item)) for item in audit_rows)
         content = "".join(text_lines).encode("utf-8-sig")
         self.send_response(200)
         self.send_header("content-type", "text/csv; charset=utf-8")
@@ -5793,6 +6180,7 @@ class App(BaseHTTPRequestHandler):
             ],
             "cv_markdown": academic_cv_markdown(study, cv_items, opportunities, outputs),
             "ai": ai_status(),
+            "ai_policy": study_ai_policy(conn, study_id),
             "guidance": [
                 "Use Case Intake for messy notes, photos, audio, PDFs, and scanned case details.",
                 "Run Academic AI review only on de-identified material unless policy explicitly allows PHI.",
@@ -5818,7 +6206,7 @@ class App(BaseHTTPRequestHandler):
                 writer = csv.DictWriter(Sink(), fieldnames=fields)
                 writer.writeheader()
                 for item in payload["cv_items"]:
-                    writer.writerow({field: item.get(field, "") for field in fields})
+                    writer.writerow(csv_safe_row({field: item.get(field, "") for field in fields}))
                 content = "".join(text_lines).encode("utf-8-sig")
                 self.send_response(200)
                 self.send_header("content-type", "text/csv; charset=utf-8")
@@ -6062,7 +6450,7 @@ class App(BaseHTTPRequestHandler):
                         csv_lines.append(value)
                 writer = csv.DictWriter(Sink(), fieldnames=fields)
                 writer.writeheader()
-                writer.writerows(records)
+                writer.writerows(csv_safe_row(record) for record in records)
                 archive.writestr("clinical_data_export.csv", "".join(csv_lines))
                 extension = "R" if package == "r" else package
                 archive.writestr(f"clinical_data_import.{extension}", syntax[package])
@@ -6089,6 +6477,7 @@ class App(BaseHTTPRequestHandler):
             passphrase = str(payload.get("passphrase", "")) or SETTINGS.backup_passphrase
             backup = create_database_backup(passphrase, study_id)
             audit(conn, user["id"], "create_encrypted" if backup["encrypted"] else "create", "backup", study_id, None, {"filename": backup["name"], "backend": backup["backend"]}, study_id=study_id, **self.audit_context())
+            conn.commit()
             self.send_json({"backup": backup}, 201)
             return
         if method == "GET" and len(parts) == 5:
@@ -6175,7 +6564,7 @@ class App(BaseHTTPRequestHandler):
                 text_lines.append(value)
 
         writer = csv.writer(Sink())
-        writer.writerows(output)
+        writer.writerows(csv_safe_row(item) for item in output)
         content = "".join(text_lines).encode("utf-8-sig")
         self.send_response(200)
         self.send_header("content-type", "text/csv; charset=utf-8")

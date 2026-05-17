@@ -448,15 +448,16 @@ def backup_name(prefix: str = "system") -> str:
 
 
 def create_database_backup(passphrase: str = "", study_id: int | None = None) -> dict:
-    BACKUPS.mkdir(parents=True, exist_ok=True)
+    backup_dir = BACKUPS
+    backup_dir.mkdir(parents=True, exist_ok=True)
     prefix = f"study_{study_id}" if study_id else "system"
     stem = backup_name(prefix)
     if DATABASE_BACKEND == "postgres":
-        dump_target = BACKUPS / f"{stem}.dump"
+        dump_target = backup_dir / f"{stem}.dump"
         command = ["pg_dump", "--format=custom", "--file", str(dump_target), DATABASE_URL]
         subprocess.run(command, check=True, capture_output=True, text=True, timeout=300)
         if passphrase:
-            encrypted = BACKUPS / f"{stem}.cdsenc"
+            encrypted = backup_dir / f"{stem}.cdsenc"
             encrypted.parent.mkdir(parents=True, exist_ok=True)
             encrypted.write_bytes(encrypted_archive_bytes(dump_target.read_bytes(), passphrase))
             dump_target.unlink(missing_ok=True)
@@ -465,10 +466,10 @@ def create_database_backup(passphrase: str = "", study_id: int | None = None) ->
             target = dump_target
         return {"name": target.name, "size": target.stat().st_size, "created_at": int(target.stat().st_mtime), "encrypted": target.suffix == ".cdsenc", "backend": "postgres"}
     with closing(db()) as conn:
-        plain_target = BACKUPS / f"{stem}.sqlite3"
+        plain_target = backup_dir / f"{stem}.sqlite3"
         write_sqlite_backup(conn, plain_target)
     if passphrase:
-        encrypted = BACKUPS / f"{stem}.cdsenc"
+        encrypted = backup_dir / f"{stem}.cdsenc"
         encrypted.parent.mkdir(parents=True, exist_ok=True)
         encrypted.write_bytes(encrypted_archive_bytes(plain_target.read_bytes(), passphrase))
         plain_target.unlink(missing_ok=True)
@@ -3338,6 +3339,7 @@ class App(BaseHTTPRequestHandler):
             )
             after = row(conn, "SELECT id, username, display_name, role, active, must_change_password, created_at FROM users WHERE id = ?", (cur.lastrowid,))
             audit(conn, user["id"], "create", "user", cur.lastrowid, None, after)
+            conn.commit()
             self.send_json({"user": after}, 201)
             return
         self.send_error_json("Unsupported user operation", 405)
@@ -3386,6 +3388,7 @@ class App(BaseHTTPRequestHandler):
             conn.commit()
             backup = create_database_backup(str(payload.get("passphrase", "")) or SETTINGS.backup_passphrase)
             audit(conn, user["id"], "create_encrypted" if backup["encrypted"] else "create", "backup", None, None, backup, **self.audit_context())
+            conn.commit()
             self.send_json({"backup": backup}, 201)
             return
         if path == "/api/admin/backup/full" and method == "POST":
@@ -3393,6 +3396,7 @@ class App(BaseHTTPRequestHandler):
             conn.commit()
             backup = create_full_backup(str(payload.get("passphrase", "")) or SETTINGS.backup_passphrase)
             audit(conn, user["id"], "create_full", "backup", None, None, backup, **self.audit_context())
+            conn.commit()
             self.send_json({"backup": backup}, 201)
             return
         if path == "/api/admin/backups/verify" and method == "POST":
@@ -3759,6 +3763,7 @@ class App(BaseHTTPRequestHandler):
             (cur.lastrowid, user["id"], timestamp, timestamp),
         )
         audit(conn, user["id"], "create", "study", cur.lastrowid, None, study)
+        conn.commit()
         self.send_json({"study": study}, 201)
 
     def public_survey(self, conn: sqlite3.Connection, method: str, path: str) -> None:
@@ -5330,6 +5335,7 @@ class App(BaseHTTPRequestHandler):
             )
             after = row(conn, "SELECT * FROM data_groups WHERE id = ?", (cur.lastrowid,))
             audit(conn, user["id"], "create", "data_group", cur.lastrowid, None, after)
+            conn.commit()
             self.send_json({"group": after}, 201)
             return
         self.send_error_json("Unsupported group operation", 405)
@@ -5374,6 +5380,7 @@ class App(BaseHTTPRequestHandler):
                 )
                 after = row(conn, "SELECT * FROM study_memberships WHERE id = ?", (existing["id"],))
                 audit(conn, user["id"], "update", "membership", existing["id"], before, after)
+                conn.commit()
                 self.send_json({"membership": after})
                 return
             cur = conn.execute(
@@ -5385,6 +5392,7 @@ class App(BaseHTTPRequestHandler):
             )
             after = row(conn, "SELECT * FROM study_memberships WHERE id = ?", (cur.lastrowid,))
             audit(conn, user["id"], "create", "membership", cur.lastrowid, None, after)
+            conn.commit()
             self.send_json({"membership": after}, 201)
             return
         self.send_error_json("Unsupported membership operation", 405)

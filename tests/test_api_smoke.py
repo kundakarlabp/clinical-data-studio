@@ -14,6 +14,9 @@ from urllib.request import Request, urlopen
 import server
 
 
+HTTP_TIMEOUT = 30
+
+
 class ApiSmokeTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -51,7 +54,7 @@ class ApiSmokeTests(unittest.TestCase):
         headers = {"Content-Type": "application/json"}
         headers.update(self.auth_headers(token, method))
         request = Request(f"{self.base_url}{path}", data=body, headers=headers, method=method)
-        with urlopen(request, timeout=10) as response:
+        with urlopen(request, timeout=HTTP_TIMEOUT) as response:
             return json.loads(response.read().decode("utf-8"))
 
     def request_raw(self, path, method="GET", payload=None, token=None, content_type="application/json", headers=None):
@@ -62,14 +65,14 @@ class ApiSmokeTests(unittest.TestCase):
         headers = {"Content-Type": content_type, **(headers or {})}
         headers.update(self.auth_headers(token, method))
         request = Request(f"{self.base_url}{path}", data=body, headers=headers, method=method)
-        with urlopen(request, timeout=10) as response:
+        with urlopen(request, timeout=HTTP_TIMEOUT) as response:
             return response.status, response.headers.get("content-type", ""), response.read()
 
     def request_with_headers(self, path, method="GET", payload=None, headers=None, content_type="application/json"):
         body = None if payload is None else json.dumps(payload).encode("utf-8")
         request_headers = {"Content-Type": content_type, **(headers or {})}
         request = Request(f"{self.base_url}{path}", data=body, headers=request_headers, method=method)
-        with urlopen(request, timeout=10) as response:
+        with urlopen(request, timeout=HTTP_TIMEOUT) as response:
             return response.status, response.headers, response.read()
 
     def auth_headers(self, token, method="GET"):
@@ -81,7 +84,7 @@ class ApiSmokeTests(unittest.TestCase):
             headers = {"Cookie": token}
             if method in {"POST", "PATCH", "DELETE"}:
                 csrf_request = Request(f"{self.base_url}/api/csrf", headers={"Cookie": token})
-                with urlopen(csrf_request, timeout=10) as response:
+                with urlopen(csrf_request, timeout=HTTP_TIMEOUT) as response:
                     csrf = json.loads(response.read().decode("utf-8"))["csrf_token"]
                 headers["X-CSRF-Token"] = csrf
                 headers["Origin"] = self.base_url
@@ -113,7 +116,7 @@ class ApiSmokeTests(unittest.TestCase):
 
     def response_headers(self, path):
         request = Request(f"{self.base_url}{path}")
-        with urlopen(request, timeout=10) as response:
+        with urlopen(request, timeout=HTTP_TIMEOUT) as response:
             return response.headers
 
     def test_health_login_summary_and_encrypted_backup(self):

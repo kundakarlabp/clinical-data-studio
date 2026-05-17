@@ -1561,6 +1561,7 @@ function backupsView() {
   const backupSummary = state.adminBackups?.summary || state.adminStatus?.health?.backup || {};
   const latestFull = backupSummary.latest_full_backup;
   const latestPostgres = backupSummary.latest_postgres_backup;
+  const latestVerifiedFull = backupSummary.latest_verified_full_backup;
   const fullBackups = state.adminBackups?.backups?.filter((item) => item.backup_type === "full") || [];
   return `
     ${isSuperAdmin() ? `
@@ -1573,14 +1574,19 @@ function backupsView() {
         <div class="split-actions">
           <button id="full-backup-create">Create Full Backup</button>
           <button class="secondary" id="full-backup-verify">Verify Latest Backup</button>
+          <button class="secondary" id="full-backup-dry-run">Dry Run Restore Check</button>
           ${latestFull ? `<button class="secondary" id="full-backup-download">Download Full Backup</button>` : ""}
         </div>
       </div>
       ${latestFull?.verified ? `<div class="notice ok">Latest full backup verified at ${fmtTime(latestFull.verified_at)}.</div>` : `<div class="notice warn">No verified full backup is recorded. Create and verify a full backup before relying on this deployment.</div>`}
+      <div class="notice">Download one encrypted full backup weekly or configure external storage. Lightsail snapshots alone are not enough.</div>
       <div class="grid three">
         <div><span class="small">Latest PostgreSQL backup</span><strong>${latestPostgres ? `${escapeHtml(latestPostgres.name)} (${Math.round(latestPostgres.size / 1024)} KB)` : "Not found"}</strong></div>
         <div><span class="small">Latest full backup</span><strong>${latestFull ? `${escapeHtml(latestFull.name)} (${Math.round(latestFull.size / 1024)} KB)` : "Not found"}</strong></div>
-        <div><span class="small">Uploads included</span><strong>${latestFull?.uploads_included ? "Yes" : "No verified full backup"}</strong></div>
+        <div><span class="small">Latest verified full</span><strong>${latestVerifiedFull ? `${escapeHtml(latestVerifiedFull.name)} (${fmtTime(latestVerifiedFull.verified_at)})` : "Not found"}</strong></div>
+        <div><span class="small">Uploads included</span><strong>${latestFull?.includes_uploads ? "Yes" : "No verified full backup"}</strong></div>
+        <div><span class="small">Manifest included</span><strong>${latestFull?.includes_manifest ? "Yes" : "Needs verification"}</strong></div>
+        <div><span class="small">Checksum verified</span><strong>${latestFull?.checksum_verified ? "Yes" : "Needs verification"}</strong></div>
         <div><span class="small">Uploads folder</span><strong>${backupSummary.uploads?.exists ? `${backupSummary.uploads.file_count || 0} file(s)` : "Missing"}</strong></div>
         <div><span class="small">Backup directory</span><strong>${escapeHtml(backupSummary.directory || "")}</strong></div>
         <div><span class="small">Verification</span><strong>${latestFull?.verified ? "Passed" : "Needs verification"}</strong></div>
@@ -1588,14 +1594,16 @@ function backupsView() {
       ${fullBackups.length ? `
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Full backup</th><th>Size</th><th>Created</th><th>Verified</th><th></th></tr></thead>
+            <thead><tr><th>Full backup</th><th>Type</th><th>Size</th><th>Created</th><th>Verified</th><th>Contents</th><th></th></tr></thead>
             <tbody>
               ${fullBackups.map((backup) => `
                 <tr>
                   <td>${escapeHtml(backup.name)} <span class="pill ok">encrypted</span></td>
+                  <td>${escapeHtml(backup.backup_contents || "full database + uploads")}</td>
                   <td>${Math.round(backup.size / 1024)} KB</td>
                   <td>${fmtTime(backup.created_at)}</td>
-                  <td>${backup.verified ? `Yes (${fmtTime(backup.verified_at)})` : "No"}</td>
+                  <td>${backup.verified ? `Yes (${fmtTime(backup.verified_at)})` : "No"}<br><span class="small">${escapeHtml(backup.verification_status || "not_verified")}</span></td>
+                  <td class="small">uploads=${backup.includes_uploads ? "yes" : "no"} manifest=${backup.includes_manifest ? "yes" : "no"} checksum=${backup.checksum_verified ? "yes" : "no"}</td>
                   <td><button class="secondary" data-download-admin-backup="${escapeHtml(backup.name)}">Download</button></td>
                 </tr>
               `).join("")}
@@ -1608,9 +1616,9 @@ function backupsView() {
     <section class="panel">
       <div class="row">
         <h2>Backups</h2>
-        <button id="backup-create">Create Backup</button>
+        <button id="backup-create">Create PostgreSQL Backup</button>
       </div>
-      <p>Project database backups protect structured data. Full app backups also include uploaded case evidence files.</p>
+      <p>Project database backups protect structured data only. Full app backups also include uploaded case evidence files.</p>
       <form id="encrypted-backup-form" class="form-grid">
         <label>Archive passphrase<input name="passphrase" type="password" minlength="12" placeholder="12+ characters" /></label>
         <div><button class="secondary">Create Encrypted Archive</button></div>
@@ -1780,18 +1788,36 @@ function accessView() {
 
 function settingsView() {
   const health = state.adminStatus?.health;
+  const warnings = health?.public_base_url_warnings || [];
+  const counts = health?.counts || {};
   return `
     ${isSuperAdmin() ? `
     <section class="panel">
       <h2>System Status</h2>
+      ${warnings.map((warning) => `<div class="notice warn">${escapeHtml(warning)}</div>`).join("")}
       <div class="grid three">
         <div><span class="small">App</span><strong>${health?.ok ? "Running" : "Needs review"}</strong></div>
+        <div><span class="small">Version</span><strong>${escapeHtml(health?.version || "0.1")}</strong></div>
+        <div><span class="small">Git commit</span><strong>${escapeHtml(health?.commit || "unknown")}</strong></div>
         <div><span class="small">Mode</span><strong>${escapeHtml(health?.environment || "development")}</strong></div>
         <div><span class="small">Database</span><strong>${escapeHtml(health?.database_backend || "")}</strong></div>
+        <div><span class="small">PostgreSQL / DB status</span><strong>${health?.database?.ok ? "Connected" : "Error"}</strong></div>
+        <div><span class="small">Migration</span><strong>${escapeHtml(health?.migration_status || "")}</strong></div>
         <div><span class="small">HTTPS</span><strong>${health?.https_detected ? "Detected" : "Not detected"}</strong></div>
+        <div><span class="small">Public URL</span><strong>${escapeHtml(health?.public_base_url || "Not set")}</strong></div>
         <div><span class="small">AI</span><strong>${health?.ai?.external_ai_enabled ? "External enabled" : "Local/off"}</strong></div>
-        <div><span class="small">Latest backup</span><strong>${fmtTime(health?.backup?.latest_backup_at)}</strong></div>
+        <div><span class="small">PHI allowed</span><strong>${health?.ai?.phi_allowed ? "Yes" : "No"}</strong></div>
+        <div><span class="small">Latest full backup</span><strong>${health?.backup?.latest_full_backup?.name ? escapeHtml(health.backup.latest_full_backup.name) : "Not found"}</strong></div>
+        <div><span class="small">Latest verified full</span><strong>${health?.backup?.latest_verified_full_backup?.name ? escapeHtml(health.backup.latest_verified_full_backup.name) : "Not found"}</strong></div>
+        <div><span class="small">Uploads</span><strong>${health?.backup?.uploads?.exists ? `${health.backup.uploads.file_count || 0} file(s)` : "Missing"}</strong></div>
+        <div><span class="small">Backup directory</span><strong>${health?.backup?.directory_exists ? "Available" : "Missing"}</strong></div>
+        <div><span class="small">Disk free</span><strong>${health?.disk?.free ? `${Math.round(health.disk.free / 1024 / 1024)} MB` : ""}</strong></div>
+        <div><span class="small">Users</span><strong>${counts.users ?? ""}</strong></div>
+        <div><span class="small">Studies</span><strong>${counts.studies ?? ""}</strong></div>
+        <div><span class="small">Failed logins 7d</span><strong>${counts.recent_failed_logins ?? ""}</strong></div>
+        <div><span class="small">Exports 7d</span><strong>${counts.recent_exports ?? ""}</strong></div>
       </div>
+      <div class="notice">${escapeHtml(health?.backup?.off_server_reminder || "Download one encrypted full backup weekly.")}</div>
       <div class="split-actions">
         <button class="secondary" id="admin-backup">Create System Backup</button>
         <button class="secondary" id="refresh-admin">Refresh Status</button>
@@ -1920,6 +1946,7 @@ function bindRoute() {
   document.querySelector("#backup-create")?.addEventListener("click", createBackup);
   document.querySelector("#full-backup-create")?.addEventListener("click", createFullBackup);
   document.querySelector("#full-backup-verify")?.addEventListener("click", verifyLatestFullBackup);
+  document.querySelector("#full-backup-dry-run")?.addEventListener("click", dryRunLatestFullBackup);
   document.querySelector("#full-backup-download")?.addEventListener("click", downloadLatestFullBackup);
   document.querySelectorAll("[data-download-admin-backup]").forEach((button) => {
     button.addEventListener("click", () => downloadApi(`/api/admin/backups/${encodeURIComponent(button.dataset.downloadAdminBackup)}`, button.dataset.downloadAdminBackup));
@@ -2584,6 +2611,18 @@ async function verifyLatestFullBackup() {
     const result = await api("/api/admin/backups/verify", { method: "POST", body: "{}" });
     await loadStudy();
     state.error = result.verification?.ok ? "Latest full backup verified." : `Full backup verification failed: ${(result.verification?.errors || []).join("; ")}`;
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function dryRunLatestFullBackup() {
+  try {
+    const result = await api("/api/admin/backups/dry-run", { method: "POST", body: "{}" });
+    await loadStudy();
+    state.error = result.verification?.ok ? "Dry run restore check passed. No production data was overwritten." : `Dry run restore check failed: ${(result.verification?.errors || []).join("; ")}`;
     render();
   } catch (error) {
     state.error = error.message;

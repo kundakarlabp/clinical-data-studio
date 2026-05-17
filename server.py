@@ -329,6 +329,10 @@ def backup_file_info(path: Path, backup_type: str | None = None) -> dict:
         "size": path.stat().st_size,
         "created_at": int(path.stat().st_mtime),
         "encrypted": path.suffix == ".cdsenc",
+        "verification_status": "not_verified",
+        "includes_uploads": False,
+        "includes_manifest": False,
+        "checksum_verified": False,
     }
     if backup_type:
         info["backup_type"] = backup_type
@@ -471,7 +475,9 @@ def latest_full_backup_info(path: Path | None = None) -> dict | None:
     if not target:
         return None
     info = backup_file_info(target, "full")
+    info["includes_uploads"] = True
     info["uploads_included"] = True
+    info["backup_contents"] = "full database + uploads"
     sidecar = verification_sidecar_path(target)
     if sidecar.exists():
         try:
@@ -479,8 +485,14 @@ def latest_full_backup_info(path: Path | None = None) -> dict | None:
             info["verification"] = verification
             info["verified"] = bool(verification.get("ok"))
             info["verified_at"] = verification.get("checked_at")
+            info["verification_status"] = "passed" if info["verified"] else "failed"
+            info["includes_uploads"] = bool(verification.get("includes_uploads"))
+            info["uploads_included"] = info["includes_uploads"]
+            info["includes_manifest"] = bool(verification.get("includes_manifest"))
+            info["checksum_verified"] = bool(verification.get("checksum_verified"))
         except Exception:
             info["verified"] = False
+            info["verification_status"] = "failed"
     else:
         info["verified"] = False
     return info
@@ -507,27 +519,46 @@ def verify_full_backup(backup_file: Path, passphrase: str = "", record: bool = F
         "database_dump": "",
         "uploads_archive": "",
         "upload_file_count": 0,
+        "includes_uploads": False,
+        "includes_manifest": False,
+        "checksum_verified": False,
+        "database_dump_nonempty": False,
+        "archive_readable": False,
+        "uploads_archive_readable": False,
         "errors": [],
     }
     try:
         with zipfile.ZipFile(BytesIO(archive_bytes), "r") as archive:
+            bad_file = archive.testzip()
+            if bad_file:
+                result["errors"].append(f"Archive contains unreadable member: {bad_file}")
+            else:
+                result["archive_readable"] = True
             names = archive.namelist()
             result["contents"] = names
             required = {"manifest.json", "SHA256SUMS.txt", "uploads.zip"}
             missing = sorted(required - set(names))
             if missing:
                 result["errors"].append(f"Missing required file(s): {', '.join(missing)}")
+            result["includes_manifest"] = "manifest.json" in names
             manifest = json.loads(archive.read("manifest.json").decode("utf-8")) if "manifest.json" in names else {}
             result["manifest"] = manifest
             result["database_dump"] = str(manifest.get("database_dump") or "")
             result["uploads_archive"] = str(manifest.get("uploads_archive") or "")
             if result["database_dump"] not in names:
                 result["errors"].append("Database dump is missing")
+            elif len(archive.read(result["database_dump"])) == 0:
+                result["errors"].append("Database dump is empty")
+            else:
+                result["database_dump_nonempty"] = True
             if result["uploads_archive"] not in names:
                 result["errors"].append("Uploads archive is missing")
+            else:
+                result["includes_uploads"] = True
             if manifest.get("backup_type") != "full":
                 result["errors"].append("Manifest backup_type is not full")
             if "SHA256SUMS.txt" in names:
+                checksum_ok = True
                 checksum_lines = archive.read("SHA256SUMS.txt").decode("utf-8").splitlines()
                 for line in checksum_lines:
                     if not line.strip():
@@ -536,12 +567,20 @@ def verify_full_backup(backup_file: Path, passphrase: str = "", record: bool = F
                     filename = filename.strip()
                     if filename not in names:
                         result["errors"].append(f"Checksum target missing: {filename}")
+                        checksum_ok = False
                         continue
                     actual = sha256_bytes(archive.read(filename))
                     if actual != expected:
                         result["errors"].append(f"Checksum mismatch: {filename}")
+                        checksum_ok = False
+                result["checksum_verified"] = checksum_ok and bool(checksum_lines)
             if result["uploads_archive"] in names:
                 with zipfile.ZipFile(BytesIO(archive.read(result["uploads_archive"])), "r") as uploads:
+                    bad_upload = uploads.testzip()
+                    if bad_upload:
+                        result["errors"].append(f"Uploads archive contains unreadable member: {bad_upload}")
+                    else:
+                        result["uploads_archive_readable"] = True
                     result["upload_file_count"] = len([name for name in uploads.namelist() if not name.endswith("/") and name != "EMPTY_UPLOADS.txt"])
         result["ok"] = not result["errors"]
     except Exception as exc:
@@ -550,6 +589,42 @@ def verify_full_backup(backup_file: Path, passphrase: str = "", record: bool = F
     if record:
         verification_sidecar_path(target).write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
     return result
+
+
+def latest_verified_full_backup_info() -> dict | None:
+    verified = [info for info in (latest_full_backup_info(item) for item in full_backup_candidates()) if info and info.get("verified")]
+    return verified[0] if verified else None
+
+
+def public_base_url_warnings(request_host: str = "", request_scheme: str = "") -> list[str]:
+    warnings: list[str] = []
+    public_url = (SETTINGS.public_base_url or "").strip()
+    if SETTINGS.production and not public_url:
+        warnings.append("CDS_PUBLIC_BASE_URL is missing in production.")
+    if public_url and "your-domain.example" in public_url:
+        warnings.append("CDS_PUBLIC_BASE_URL still contains the placeholder your-domain.example.")
+    if SETTINGS.require_https and public_url.startswith("http://"):
+        warnings.append("CDS_REQUIRE_HTTPS=true but CDS_PUBLIC_BASE_URL starts with http://.")
+    if public_url and request_host:
+        parsed = urlparse(public_url)
+        if parsed.netloc and parsed.netloc.lower() != request_host.lower() and os.environ.get("CDS_ALLOW_PUBLIC_URL_HOST_MISMATCH", "").lower() not in {"1", "true", "yes", "on"}:
+            warnings.append(f"CDS_PUBLIC_BASE_URL host {parsed.netloc} does not match detected request host {request_host}.")
+        if request_scheme and parsed.scheme and SETTINGS.require_https and parsed.scheme != "https":
+            warnings.append("CDS_PUBLIC_BASE_URL should use https when HTTPS is required.")
+    return warnings
+
+
+def system_counts() -> dict:
+    try:
+        with closing(db()) as conn:
+            return {
+                "users": row(conn, "SELECT COUNT(*) AS count FROM users")["count"],
+                "studies": row(conn, "SELECT COUNT(*) AS count FROM studies")["count"],
+                "recent_failed_logins": row(conn, "SELECT COUNT(*) AS count FROM audit_log WHERE action = 'failed_login' AND created_at >= ?", (now() - 7 * 86400,))["count"],
+                "recent_exports": row(conn, "SELECT COUNT(*) AS count FROM audit_log WHERE action = 'export' AND created_at >= ?", (now() - 7 * 86400,))["count"],
+            }
+    except Exception as exc:
+        return {"error": str(exc)}
 
 
 def restore_database_backup(backup_file: Path, passphrase: str = "") -> dict:
@@ -582,9 +657,19 @@ def restore_database_backup(backup_file: Path, passphrase: str = "") -> dict:
     return {"restored": target.name, "backend": DATABASE_BACKEND}
 
 
-def health_payload() -> dict:
+def health_payload(request_host: str = "", request_scheme: str = "") -> dict:
     db_status = database_status()
     latest_full = latest_full_backup_info()
+    latest_verified_full = latest_verified_full_backup_info()
+    disk = shutil.disk_usage(ROOT)
+    full_backup_age_days = None
+    if latest_verified_full and latest_verified_full.get("verified_at"):
+        full_backup_age_days = round((now() - int(latest_verified_full["verified_at"])) / 86400, 1)
+    warnings = public_base_url_warnings(request_host, request_scheme)
+    if not latest_verified_full:
+        warnings.append("No verified full backup exists. Create and verify a full backup before updates or real data entry.")
+    elif full_backup_age_days is not None and full_backup_age_days > 7:
+        warnings.append("Latest verified full backup is older than 7 days.")
     return {
         "ok": db_status["ok"],
         "app": "Clinical Data Studio",
@@ -595,18 +680,27 @@ def health_payload() -> dict:
         "database_backend": DATABASE_BACKEND,
         "migration_status": "ok" if db_status["ok"] else "error",
         "public_base_url": SETTINGS.public_base_url,
+        "public_base_url_warnings": warnings,
         "host": HOST,
         "port": PORT,
         "require_https": SETTINGS.require_https,
-        "https_detected": SETTINGS.public_base_url.startswith("https://"),
+        "https_detected": (request_scheme == "https") or SETTINGS.public_base_url.startswith("https://"),
+        "request_host": request_host,
         "data_protection": data_protection_status(),
         "ai": ai_status(),
+        "disk": {"total": disk.total, "used": disk.used, "free": disk.free},
+        "counts": system_counts(),
         "backup": {
             "directory": str(BACKUPS),
+            "directory_exists": BACKUPS.exists(),
             "latest_backup_at": latest_backup_time(),
             "latest_postgres_backup": latest_postgres_backup_info(),
             "latest_full_backup": latest_full,
+            "latest_verified_full_backup": latest_verified_full,
             "latest_full_backup_verified": bool(latest_full and latest_full.get("verified")),
+            "latest_verified_full_backup_age_days": full_backup_age_days,
+            "retention_policy": {"daily": 7, "weekly": 4, "monthly": 3},
+            "off_server_reminder": "Download one encrypted full backup weekly or configure external storage. Lightsail snapshots alone are not enough.",
             "uploads": {
                 "directory": str(UPLOADS),
                 "exists": UPLOADS.exists(),
@@ -2500,7 +2594,7 @@ class App(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/healthz":
-            payload = health_payload()
+            payload = health_payload(self.headers.get("host", ""), self.headers.get("x-forwarded-proto", "https" if self.request_is_https() else "http"))
             self.send_json(payload, 200 if payload["ok"] else 503)
         elif parsed.path.startswith("/api/"):
             self.handle_api("GET", parsed.path, parse_qs(parsed.query))
@@ -2695,7 +2789,7 @@ class App(BaseHTTPRequestHandler):
                 if path == "/api/setup" and method == "POST":
                     return self.first_run_setup(conn)
                 if path == "/api/health" and method == "GET":
-                    payload = health_payload()
+                    payload = health_payload(self.headers.get("host", ""), self.headers.get("x-forwarded-proto", "https" if self.request_is_https() else "http"))
                     return self.send_json(payload, 200 if payload["ok"] else 503)
 
                 user = self.require_user(conn)
@@ -2776,7 +2870,13 @@ class App(BaseHTTPRequestHandler):
         audit(conn, user["id"], "login", "session", None, None, {"username": username}, **self.audit_context())
         conn.commit()
         self.queue_header("Set-Cookie", self.session_cookie_header(token))
-        self.send_json({"token": token, "session": "cookie", "user": {"id": user["id"], "username": user["username"], "display_name": user["display_name"], "role": user["role"], "must_change_password": user.get("must_change_password", 0)}})
+        self.send_json(
+            {
+                "session": "cookie",
+                "csrf_required": True,
+                "user": {"id": user["id"], "username": user["username"], "display_name": user["display_name"], "role": user["role"], "must_change_password": user.get("must_change_password", 0)},
+            }
+        )
 
     def first_run_setup(self, conn: sqlite3.Connection) -> None:
         if not setup_required(conn):
@@ -3099,9 +3199,10 @@ class App(BaseHTTPRequestHandler):
         parts = path.strip("/").split("/")
         if path == "/api/admin/status" and method == "GET":
             disk = shutil.disk_usage(ROOT)
+            health = health_payload(self.headers.get("host", ""), self.headers.get("x-forwarded-proto", "https" if self.request_is_https() else "http"))
             self.send_json(
                 {
-                    "health": health_payload(),
+                    "health": health,
                     "disk": {"total": disk.total, "used": disk.used, "free": disk.free},
                     "logs": {"path": str(LOG_FILE), "exists": LOG_FILE.exists()},
                     "backups": {"directory": str(BACKUPS), "latest_backup_at": latest_backup_time()},
@@ -3128,7 +3229,7 @@ class App(BaseHTTPRequestHandler):
                 if item.is_file() and not item.name.endswith(".verify.json") and item.suffix in {".sqlite3", ".cdsenc", ".dump", ".gz"}:
                     backup_type = "full" if item.name.startswith("full_") or ".full." in item.name else ("postgres" if item.name.startswith("postgres_") or item.name.endswith(".dump") else "database")
                     files.append(latest_full_backup_info(item) if backup_type == "full" else backup_file_info(item, backup_type))
-            self.send_json({"backups": files, "summary": health_payload()["backup"]})
+            self.send_json({"backups": files, "summary": health_payload(self.headers.get("host", ""), self.headers.get("x-forwarded-proto", "https" if self.request_is_https() else "http"))["backup"]})
             return
         if path == "/api/admin/backup" and method == "POST":
             payload = self.body()
@@ -3154,6 +3255,17 @@ class App(BaseHTTPRequestHandler):
             verification = verify_full_backup(target, str(payload.get("passphrase", "")) or SETTINGS.backup_passphrase, record=True)
             audit(conn, user["id"], "verify", "backup", None, None, {"filename": target.name, "ok": verification["ok"]}, **self.audit_context())
             self.send_json({"verification": verification})
+            return
+        if path == "/api/admin/backups/dry-run" and method == "POST":
+            payload = self.body()
+            filename = Path(str(payload.get("filename", ""))).name
+            target = (BACKUPS / filename).resolve() if filename else (full_backup_candidates()[0] if full_backup_candidates() else None)
+            if not target or not str(target).startswith(str(BACKUPS.resolve())) or not target.exists():
+                self.send_error_json("Full backup not found", 404)
+                return
+            verification = verify_full_backup(target, str(payload.get("passphrase", "")) or SETTINGS.backup_passphrase, record=False)
+            audit(conn, user["id"], "restore_dry_run", "backup", None, None, {"filename": target.name, "ok": verification["ok"]}, **self.audit_context())
+            self.send_json({"dry_run": True, "verification": verification})
             return
         if len(parts) == 4 and parts[:3] == ["api", "admin", "backups"] and method == "GET":
             filename = Path(parts[3]).name

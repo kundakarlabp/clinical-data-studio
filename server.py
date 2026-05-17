@@ -278,6 +278,42 @@ def deidentify_for_ai(text: str, replacement: str = "Study participant") -> str:
     return deidentify_text_for_ai(text, replacement)
 
 
+CSV_FORMULA_PREFIXES = ("=", "+", "-", "@")
+
+
+def csv_safe_cell(value):
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        value = json.dumps(value, ensure_ascii=False)
+    if isinstance(value, str) and value.lstrip()[:1] in CSV_FORMULA_PREFIXES:
+        return "'" + value
+    return value
+
+
+def csv_safe_row(row):
+    if isinstance(row, dict):
+        return {key: csv_safe_cell(value) for key, value in row.items()}
+    return [csv_safe_cell(value) for value in row]
+
+
+def field_truthy(field: dict, key: str) -> bool:
+    value = field.get(key)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def omit_field_from_deidentified_export(field: dict) -> bool:
+    field_type = str(field.get("type") or "").strip().lower()
+    return (
+        field_truthy(field, "identifier")
+        or field_truthy(field, "phi")
+        or field_truthy(field, "phi_sensitive")
+        or field_type in {"file", "file_upload", "attachment"}
+    )
+
+
 def assert_external_ai_safe(text: str) -> None:
     assert_ai_text_safe(text, ai_status())
 
@@ -366,6 +402,7 @@ def create_database_backup(passphrase: str = "", study_id: int | None = None) ->
         subprocess.run(command, check=True, capture_output=True, text=True, timeout=300)
         if passphrase:
             encrypted = BACKUPS / f"{stem}.cdsenc"
+            encrypted.parent.mkdir(parents=True, exist_ok=True)
             encrypted.write_bytes(encrypted_archive_bytes(dump_target.read_bytes(), passphrase))
             dump_target.unlink(missing_ok=True)
             target = encrypted
@@ -377,6 +414,7 @@ def create_database_backup(passphrase: str = "", study_id: int | None = None) ->
         write_sqlite_backup(conn, plain_target)
     if passphrase:
         encrypted = BACKUPS / f"{stem}.cdsenc"
+        encrypted.parent.mkdir(parents=True, exist_ok=True)
         encrypted.write_bytes(encrypted_archive_bytes(plain_target.read_bytes(), passphrase))
         plain_target.unlink(missing_ok=True)
         target = encrypted
@@ -3052,7 +3090,7 @@ class App(BaseHTTPRequestHandler):
                     text_lines.append(value)
             writer = csv.DictWriter(Sink(), fieldnames=fields)
             writer.writeheader()
-            writer.writerows(data)
+            writer.writerows(csv_safe_row(item) for item in data)
             content = "".join(text_lines).encode("utf-8-sig")
             self.send_response(200)
             self.send_header("content-type", "text/csv; charset=utf-8")
@@ -3882,7 +3920,24 @@ class App(BaseHTTPRequestHandler):
             if not membership_has(membership, "export_data"):
                 self.send_error_json("Export permission required", 403)
                 return
-            audit(conn, user["id"], "export", "records", study_id, None, {"deidentified": membership.get("role") == "analyst"}, study_id=study_id, **self.audit_context())
+            export_filters = self.export_filters_from_query(membership, query)
+            record_count = len(self.record_payload(conn, study_id, membership, export_filters))
+            audit(
+                conn,
+                user["id"],
+                "export",
+                "records",
+                study_id,
+                None,
+                {
+                    "export_type": "deidentified" if export_filters["deidentified"] else "full",
+                    "deidentified": export_filters["deidentified"],
+                    "choice_format": export_filters["choice_format"],
+                    "record_count": record_count,
+                },
+                study_id=study_id,
+                **self.audit_context(),
+            )
             return self.export_csv(conn, study_id, membership, query)
         if resource == "odm" and method == "GET":
             if not membership_has(membership, "export_data"):
@@ -4325,6 +4380,7 @@ class App(BaseHTTPRequestHandler):
                     )
             imported.append({"form_id": form_id, "code": item["code"], "action": action})
         audit(conn, user["id"], "import", "dictionary", study_id, None, {"forms": imported})
+        conn.commit()
         self.send_json({"imported": imported})
 
     def import_records(self, conn, user, study_id: int, membership) -> None:
@@ -4954,7 +5010,8 @@ class App(BaseHTTPRequestHandler):
             clinical = extracted.get("clinical", {})
             demographics = extracted.get("demographics", {})
             writer.writerow(
-                {
+                csv_safe_row(
+                    {
                     "case_uid": item["case_uid"],
                     "title": item["title"],
                     "status": item["status"],
@@ -4970,7 +5027,8 @@ class App(BaseHTTPRequestHandler):
                     "warnings": "; ".join(extracted.get("warnings", [])),
                     "file_count": len(item.get("files", [])),
                     "updated_at": item["updated_at"],
-                }
+                    }
+                )
             )
         content = "".join(text_lines).encode("utf-8-sig")
         self.send_response(200)
@@ -5666,7 +5724,7 @@ class App(BaseHTTPRequestHandler):
             }
         )
 
-    def export_csv(self, conn, study_id: int, membership, query: dict[str, list[str]] | None = None) -> None:
+    def export_filters_from_query(self, membership, query: dict[str, list[str]] | None = None) -> dict:
         deidentified = membership.get("role") == "analyst"
         if query:
             value = (query.get("deidentified") or query.get("deidentified_export") or [""])[0].strip().lower()
@@ -5674,8 +5732,12 @@ class App(BaseHTTPRequestHandler):
         choice_format = ((query or {}).get("choice_format") or ["raw"])[0].strip().lower()
         if choice_format not in {"raw", "labels", "both"}:
             choice_format = "raw"
-        filename = "clinical_data_deidentified_export.csv" if deidentified else "clinical_data_export.csv"
-        return self.export_entries_csv(conn, study_id, membership, {"deidentified": deidentified, "choice_format": choice_format}, filename)
+        return {"deidentified": deidentified, "choice_format": choice_format}
+
+    def export_csv(self, conn, study_id: int, membership, query: dict[str, list[str]] | None = None) -> None:
+        filters = self.export_filters_from_query(membership, query)
+        filename = "clinical_data_deidentified_export.csv" if filters["deidentified"] else "clinical_data_export.csv"
+        return self.export_entries_csv(conn, study_id, membership, filters, filename)
 
     def record_payload(self, conn, study_id: int, membership, filters: dict) -> list[dict]:
         deidentified = bool(filters.get("deidentified")) or membership.get("role") == "analyst"
@@ -5735,6 +5797,8 @@ class App(BaseHTTPRequestHandler):
                 field_code = field.get("code", "")
                 if not field_code:
                     continue
+                if deidentified and omit_field_from_deidentified_export(field):
+                    continue
                 code = f"{form_code}__{field_code}"
                 value = data.get(field_code, "")
                 if field.get("choices") and choice_format in {"labels", "both"}:
@@ -5759,7 +5823,7 @@ class App(BaseHTTPRequestHandler):
                 text_lines.append(value)
         writer = csv.DictWriter(Sink(), fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(records)
+        writer.writerows(csv_safe_row(record) for record in records)
         content = "".join(text_lines).encode("utf-8-sig")
         self.send_response(200)
         self.send_header("content-type", "text/csv; charset=utf-8")
@@ -5793,7 +5857,7 @@ class App(BaseHTTPRequestHandler):
                 text_lines.append(value)
         writer = csv.DictWriter(Sink(), fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows([dict(item) for item in audit_rows])
+        writer.writerows(csv_safe_row(dict(item)) for item in audit_rows)
         content = "".join(text_lines).encode("utf-8-sig")
         self.send_response(200)
         self.send_header("content-type", "text/csv; charset=utf-8")
@@ -5930,7 +5994,7 @@ class App(BaseHTTPRequestHandler):
                 writer = csv.DictWriter(Sink(), fieldnames=fields)
                 writer.writeheader()
                 for item in payload["cv_items"]:
-                    writer.writerow({field: item.get(field, "") for field in fields})
+                    writer.writerow(csv_safe_row({field: item.get(field, "") for field in fields}))
                 content = "".join(text_lines).encode("utf-8-sig")
                 self.send_response(200)
                 self.send_header("content-type", "text/csv; charset=utf-8")
@@ -6174,7 +6238,7 @@ class App(BaseHTTPRequestHandler):
                         csv_lines.append(value)
                 writer = csv.DictWriter(Sink(), fieldnames=fields)
                 writer.writeheader()
-                writer.writerows(records)
+                writer.writerows(csv_safe_row(record) for record in records)
                 archive.writestr("clinical_data_export.csv", "".join(csv_lines))
                 extension = "R" if package == "r" else package
                 archive.writestr(f"clinical_data_import.{extension}", syntax[package])
@@ -6201,6 +6265,7 @@ class App(BaseHTTPRequestHandler):
             passphrase = str(payload.get("passphrase", "")) or SETTINGS.backup_passphrase
             backup = create_database_backup(passphrase, study_id)
             audit(conn, user["id"], "create_encrypted" if backup["encrypted"] else "create", "backup", study_id, None, {"filename": backup["name"], "backend": backup["backend"]}, study_id=study_id, **self.audit_context())
+            conn.commit()
             self.send_json({"backup": backup}, 201)
             return
         if method == "GET" and len(parts) == 5:
@@ -6287,7 +6352,7 @@ class App(BaseHTTPRequestHandler):
                 text_lines.append(value)
 
         writer = csv.writer(Sink())
-        writer.writerows(output)
+        writer.writerows(csv_safe_row(item) for item in output)
         content = "".join(text_lines).encode("utf-8-sig")
         self.send_response(200)
         self.send_header("content-type", "text/csv; charset=utf-8")

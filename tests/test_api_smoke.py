@@ -444,6 +444,8 @@ class ApiSmokeTests(unittest.TestCase):
                 {"instrument_name": "coded_demo", "instrument_label": "Coded Demo", "field_order": 1, "field_name": "age", "field_label": "Age", "field_type": "integer", "required": "yes", "validation_min": 0, "validation_max": 120, "units": "years", "field_note": "Age at entry", "repeatable": "no"},
                 {"instrument_name": "coded_demo", "instrument_label": "Coded Demo", "field_order": 2, "field_name": "sex", "field_label": "Sex", "field_type": "radio", "required": "yes", "choices": "1, Male | 2, Female | 3, Other", "phi": "yes", "identifier": "yes", "repeatable": "no"},
                 {"instrument_name": "coded_demo", "instrument_label": "Coded Demo", "field_order": 3, "field_name": "pregnant", "field_label": "Pregnant", "field_type": "yesno", "required": "no", "branching_logic": "age >= 18 AND sex == 2", "repeatable": "no"},
+                {"instrument_name": "coded_demo", "instrument_label": "Coded Demo", "field_order": 4, "field_name": "patient_name", "field_label": "Patient Name", "field_type": "text", "required": "no", "phi": "yes", "identifier": "yes", "repeatable": "no"},
+                {"instrument_name": "coded_demo", "instrument_label": "Coded Demo", "field_order": 5, "field_name": "note", "field_label": "Note", "field_type": "textarea", "required": "no", "repeatable": "no"},
             ]
         )
         dictionary = dictionary_buffer.getvalue()
@@ -461,15 +463,29 @@ class ApiSmokeTests(unittest.TestCase):
         self.request_json(
             f"/api/studies/{study_id}/entries",
             "POST",
-            {"participant_id": participant["id"], "form_id": form_id, "status": "complete", "data": {"age": "24", "sex": "2", "pregnant": "1"}},
+            {"participant_id": participant["id"], "form_id": form_id, "status": "complete", "data": {"age": "24", "sex": "2", "pregnant": "1", "patient_name": "Jane Doe", "note": "=1+1"}},
             token,
         )
         _, raw_type, raw_body = self.request_raw(f"/api/studies/{study_id}/export", token=token)
         self.assertIn("text/csv", raw_type)
-        self.assertIn("coded_demo__sex", raw_body.decode("utf-8-sig"))
+        raw_text = raw_body.decode("utf-8-sig")
+        self.assertIn("coded_demo__sex", raw_text)
+        self.assertIn("'=1+1", raw_text)
         _, label_type, label_body = self.request_raw(f"/api/studies/{study_id}/export?choice_format=labels", token=token)
         self.assertIn("text/csv", label_type)
         self.assertIn("Female", label_body.decode("utf-8-sig"))
+        _, both_type, both_body = self.request_raw(f"/api/studies/{study_id}/export?choice_format=both", token=token)
+        self.assertIn("text/csv", both_type)
+        both_text = both_body.decode("utf-8-sig")
+        self.assertIn("coded_demo__sex__label", both_text)
+        self.assertIn("Female", both_text)
+        _, deid_type, deid_body = self.request_raw(f"/api/studies/{study_id}/export?deidentified=1", token=token)
+        self.assertIn("text/csv", deid_type)
+        deid_text = deid_body.decode("utf-8-sig")
+        self.assertNotIn("coded_demo__patient_name", deid_text)
+        self.assertNotIn("Jane Doe", deid_text)
+        self.assertNotIn("coded_demo__sex", deid_text)
+        self.assertIn("'=1+1", deid_text)
         _, codebook_type, codebook_body = self.request_raw(f"/api/studies/{study_id}/codebook", token=token)
         self.assertIn("text/csv", codebook_type)
         self.assertIn("1, Male | 2, Female", codebook_body.decode("utf-8-sig"))

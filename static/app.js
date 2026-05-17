@@ -1321,6 +1321,7 @@ function academicView() {
   const aiAudit = academic.ai_audit || [];
   const promptTemplates = academic.prompt_templates || [];
   const ai = academic.ai || { provider: "local", model: "local-rules", external_ai_enabled: false, phi_allowed: false, multimodal_enabled: false };
+  const aiPolicy = academic.ai_policy || { enabled: true, local_ai_allowed: true, external_ai_allowed: false, phi_allowed: false, multimodal_allowed: false, allowed_purposes: [] };
   return `
     <section class="metrics-grid">
       ${metric("Captured Cases", metrics.case_count || 0, "Messy evidence organized")}
@@ -1342,9 +1343,25 @@ function academicView() {
       </div>
       <div class="grid two">
         <div class="notice">AI mode: ${escapeHtml(ai.provider || "local")} / ${escapeHtml(ai.model || "local-rules")}. ${ai.external_ai_enabled ? (ai.phi_allowed ? "External enabled, PHI allowed by policy." : "External enabled, PHI blocked.") : "External AI off or local fallback active."} ${ai.multimodal_enabled ? "Multimodal enabled." : "Photo/audio AI is not automatic."}</div>
+        <div class="notice">Project AI policy: ${aiPolicy.enabled ? "enabled" : "disabled"}; local ${aiPolicy.local_ai_allowed ? "allowed" : "blocked"}; external ${aiPolicy.external_ai_allowed ? "allowed" : "blocked"}; PHI ${aiPolicy.phi_allowed ? "allowed" : "blocked"}.</div>
         <div class="notice">${escapeHtml((academic.guidance || []).join(" "))}</div>
       </div>
     </section>
+    ${can("manage_study") ? `
+      <section class="panel">
+        <h2>Project AI Policy</h2>
+        <form id="ai-policy-form" class="form-grid">
+          <label class="check"><input type="checkbox" name="enabled" ${aiPolicy.enabled ? "checked" : ""} />AI helpers enabled</label>
+          <label class="check"><input type="checkbox" name="local_ai_allowed" ${aiPolicy.local_ai_allowed ? "checked" : ""} />Local AI allowed</label>
+          <label class="check"><input type="checkbox" name="external_ai_allowed" ${aiPolicy.external_ai_allowed ? "checked" : ""} />External AI allowed</label>
+          <label class="check"><input type="checkbox" name="phi_allowed" ${aiPolicy.phi_allowed ? "checked" : ""} />External PHI allowed</label>
+          <label class="check"><input type="checkbox" name="multimodal_allowed" ${aiPolicy.multimodal_allowed ? "checked" : ""} />External photo/PDF/audio AI allowed</label>
+          <label class="full">Allowed purposes<input name="allowed_purposes" value="${escapeHtml((aiPolicy.allowed_purposes || []).join(", "))}" /></label>
+          <div class="full"><button class="secondary">Save AI Policy</button></div>
+        </form>
+        <div class="notice warn">External AI and PHI remain blocked unless both server settings and this project policy allow them.</div>
+      </section>
+    ` : ""}
     <section class="panel">
       <h2>AI Safety and Prompts</h2>
       <div class="grid two">
@@ -1939,6 +1956,7 @@ function bindRoute() {
   document.querySelector("#academic-cv-form")?.addEventListener("submit", submitAcademicCvItem);
   document.querySelector("#ai-safety-form")?.addEventListener("submit", submitAiSafetyPreview);
   document.querySelector("#ai-workbench-form")?.addEventListener("submit", submitAiWorkbench);
+  document.querySelector("#ai-policy-form")?.addEventListener("submit", submitAiPolicy);
   document.querySelector("#academic-export-md")?.addEventListener("click", () => downloadApi(`/api/studies/${state.studyId}/academic/export?format=md`, "academic_portfolio.md"));
   document.querySelector("#academic-export-csv")?.addEventListener("click", () => downloadApi(`/api/studies/${state.studyId}/academic/export?format=csv`, "academic_cv_tracker.csv"));
   document.querySelector("#refresh-drafts")?.addEventListener("click", renderDraftList);
@@ -2448,6 +2466,34 @@ async function submitAiWorkbench(event) {
   } catch (error) {
     if (output) output.value = error.message;
     state.error = error.message;
+  }
+}
+
+async function submitAiPolicy(event) {
+  event.preventDefault();
+  const formData = new FormData(event.target);
+  const allowedPurposes = String(formData.get("allowed_purposes") || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  try {
+    await api(`/api/studies/${state.studyId}/ai/policy`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        enabled: formData.has("enabled"),
+        local_ai_allowed: formData.has("local_ai_allowed"),
+        external_ai_allowed: formData.has("external_ai_allowed"),
+        phi_allowed: formData.has("phi_allowed"),
+        multimodal_allowed: formData.has("multimodal_allowed"),
+        allowed_purposes: allowedPurposes,
+      }),
+    });
+    state.notice = "AI policy updated.";
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
   }
 }
 

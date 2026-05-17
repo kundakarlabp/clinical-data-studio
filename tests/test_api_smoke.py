@@ -710,6 +710,30 @@ class ApiSmokeTests(unittest.TestCase):
         )
         self.assertEqual(workbench["result"]["purpose"], "cv_item")
         self.assertIn("suggested_item", workbench["result"])
+        policy = self.request_json(f"/api/studies/{study_id}/ai/policy", token=token)["policy"]
+        self.assertFalse(policy["external_ai_allowed"])
+        restricted_policy = self.request_json(
+            f"/api/studies/{study_id}/ai/policy",
+            "PATCH",
+            {"enabled": True, "local_ai_allowed": True, "external_ai_allowed": False, "phi_allowed": False, "multimodal_allowed": False, "allowed_purposes": ["case_summary"]},
+            token,
+        )["policy"]
+        self.assertEqual(restricted_policy["allowed_purposes"], ["case_summary"])
+        with self.assertRaises(HTTPError) as policy_denied:
+            self.request_json(
+                f"/api/studies/{study_id}/ai/workbench",
+                "POST",
+                {"purpose": "cv_item", "text": "Presented another abstract"},
+                token,
+            )
+        self.assertEqual(policy_denied.exception.code, 403)
+        policy_denied.exception.close()
+        self.request_json(
+            f"/api/studies/{study_id}/ai/policy",
+            "PATCH",
+            {"enabled": True, "local_ai_allowed": True, "external_ai_allowed": False, "phi_allowed": False, "multimodal_allowed": False, "allowed_purposes": ["case_summary", "cv_item", "missing_fields", "inconsistency_detection", "publication_idea"]},
+            token,
+        )
         ai_audit = self.request_json(f"/api/studies/{study_id}/ai/audit", token=token)["ai_audit"]
         purposes = {item["purpose"] for item in ai_audit}
         self.assertTrue({"deidentify_preview", "cv_item"}.issubset(purposes))

@@ -192,6 +192,7 @@ CREATE TABLE IF NOT EXISTS studies (
     protocol_id TEXT NOT NULL DEFAULT '',
     description TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'active',
+    ai_policy_json TEXT NOT NULL DEFAULT '{}',
     created_at BIGINT NOT NULL,
     updated_at BIGINT NOT NULL
 );

@@ -253,6 +253,61 @@ def ai_status() -> dict:
     return ai_status_payload(SETTINGS, os.environ, DEFAULT_OPENAI_MODEL, DEFAULT_TRANSCRIBE_MODEL)
 
 
+AI_ALLOWED_PURPOSES = {"protocol_to_crf", "case_summary", "missing_fields", "inconsistency_detection", "publication_idea", "cv_item", "case_publication_review"}
+
+
+def default_ai_policy() -> dict:
+    return {
+        "enabled": True,
+        "local_ai_allowed": True,
+        "external_ai_allowed": False,
+        "phi_allowed": False,
+        "multimodal_allowed": False,
+        "allowed_purposes": sorted(AI_ALLOWED_PURPOSES),
+        "monthly_budget_limit": "",
+    }
+
+
+def normalize_ai_policy(value) -> dict:
+    raw = value if isinstance(value, dict) else load_json(value, {})
+    policy = default_ai_policy()
+    if isinstance(raw, dict):
+        policy.update({key: raw[key] for key in policy.keys() if key in raw})
+    policy["enabled"] = bool(policy.get("enabled"))
+    policy["local_ai_allowed"] = bool(policy.get("local_ai_allowed"))
+    policy["external_ai_allowed"] = bool(policy.get("external_ai_allowed"))
+    policy["phi_allowed"] = bool(policy.get("phi_allowed"))
+    policy["multimodal_allowed"] = bool(policy.get("multimodal_allowed"))
+    requested = policy.get("allowed_purposes") or []
+    if isinstance(requested, str):
+        requested = [item.strip() for item in requested.split(",")]
+    policy["allowed_purposes"] = sorted({item for item in requested if item in AI_ALLOWED_PURPOSES}) or sorted(AI_ALLOWED_PURPOSES)
+    return policy
+
+
+def study_ai_policy(conn: sqlite3.Connection, study_id: int) -> dict:
+    study = row(conn, "SELECT ai_policy_json FROM studies WHERE id = ?", (study_id,))
+    return normalize_ai_policy(study.get("ai_policy_json") if study else {})
+
+
+def ai_policy_allows(policy: dict, purpose: str, external: bool = False, input_type: str = "text", phi_detected: bool = False) -> tuple[bool, str]:
+    purpose = purpose.strip().lower().replace("-", "_")
+    if not policy.get("enabled"):
+        return False, "AI is disabled for this project."
+    if purpose not in set(policy.get("allowed_purposes") or []):
+        return False, "This AI purpose is not allowed for this project."
+    if external:
+        if not policy.get("external_ai_allowed"):
+            return False, "External AI is disabled for this project."
+        if phi_detected and not policy.get("phi_allowed"):
+            return False, "Project policy blocks sending likely PHI to external AI."
+        if input_type in {"image", "pdf", "audio", "mixed"} and not policy.get("multimodal_allowed"):
+            return False, "Project policy blocks external file/photo/audio AI."
+    elif not policy.get("local_ai_allowed"):
+        return False, "Local AI helpers are disabled for this project."
+    return True, ""
+
+
 def is_super_admin(user: dict | None) -> bool:
     return authz_is_super_admin(user)
 
@@ -1030,6 +1085,7 @@ def migrate() -> None:
             add_column(conn, "audit_log", "request_id", "TEXT NOT NULL DEFAULT ''")
             add_column(conn, "forms", "active", "INTEGER NOT NULL DEFAULT 1")
             add_column(conn, "forms", "lifecycle_state", "TEXT NOT NULL DEFAULT 'published'")
+            add_column(conn, "studies", "ai_policy_json", "TEXT NOT NULL DEFAULT '{}'")
             add_column(conn, "survey_links", "expires_at", "BIGINT")
             add_column(conn, "survey_links", "one_time", "INTEGER NOT NULL DEFAULT 0")
             add_column(conn, "academic_cv_items", "active", "INTEGER NOT NULL DEFAULT 1")
@@ -1088,6 +1144,7 @@ def migrate() -> None:
                 protocol_id TEXT NOT NULL DEFAULT '',
                 description TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'draft',
+                ai_policy_json TEXT NOT NULL DEFAULT '{}',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -1433,6 +1490,7 @@ def migrate() -> None:
         add_column(conn, "audit_log", "request_id", "TEXT NOT NULL DEFAULT ''")
         add_column(conn, "forms", "active", "INTEGER NOT NULL DEFAULT 1")
         add_column(conn, "forms", "lifecycle_state", "TEXT NOT NULL DEFAULT 'published'")
+        add_column(conn, "studies", "ai_policy_json", "TEXT NOT NULL DEFAULT '{}'")
         add_column(conn, "survey_links", "expires_at", "INTEGER")
         add_column(conn, "survey_links", "one_time", "INTEGER NOT NULL DEFAULT 0")
         add_column(conn, "academic_cv_items", "active", "INTEGER NOT NULL DEFAULT 1")
@@ -3580,15 +3638,37 @@ class App(BaseHTTPRequestHandler):
         raise ValueError("Unsupported AI workbench purpose")
 
     def ai_routes(self, conn, user, method, study_id, parts, membership) -> None:
+        if method == "GET" and len(parts) == 5 and parts[4] == "policy":
+            if not (membership_has(membership, "manage_study") or membership_has(membership, "review_data") or membership_has(membership, "view_analysis")):
+                self.send_error_json("AI policy permission required", 403)
+                return
+            self.send_json({"policy": study_ai_policy(conn, study_id), "ai": ai_status()})
+            return
+        if method == "PATCH" and len(parts) == 5 and parts[4] == "policy":
+            if not membership_has(membership, "manage_study"):
+                self.send_error_json("Study management permission required", 403)
+                return
+            before = row(conn, "SELECT ai_policy_json FROM studies WHERE id = ?", (study_id,))
+            policy = normalize_ai_policy(self.body())
+            conn.execute("UPDATE studies SET ai_policy_json = ?, updated_at = ? WHERE id = ?", (json.dumps(policy, sort_keys=True), now(), study_id))
+            audit(conn, user["id"], "update", "ai_policy", study_id, before, {"policy": policy}, study_id=study_id, **self.audit_context())
+            conn.commit()
+            self.send_json({"policy": policy})
+            return
+        policy = study_ai_policy(conn, study_id)
         if method == "GET" and len(parts) == 5 and parts[4] == "audit":
             if not (membership_has(membership, "manage_study") or membership_has(membership, "review_data")):
                 self.send_error_json("AI audit permission required", 403)
                 return
-            self.send_json({"ai_audit": self.ai_audit_rows(conn, study_id), "ai": ai_status()})
+            self.send_json({"ai_audit": self.ai_audit_rows(conn, study_id), "ai": ai_status(), "policy": policy})
             return
         if method == "POST" and len(parts) == 5 and parts[4] == "safety-preview":
             if not membership_has(membership, "use_ai"):
                 self.send_error_json("AI permission required", 403)
+                return
+            allowed, reason = ai_policy_allows(policy, "case_summary", external=False)
+            if not allowed:
+                self.send_error_json(reason, 403)
                 return
             payload = self.body()
             text = str(payload.get("text", ""))
@@ -3617,6 +3697,7 @@ class App(BaseHTTPRequestHandler):
                         "requires_admin_confirmation": bool(findings),
                     },
                     "ai": ai_status(),
+                    "policy": policy,
                     "audit_id": ai_audit_id,
                 }
             )
@@ -3630,6 +3711,10 @@ class App(BaseHTTPRequestHandler):
             text = str(payload.get("text", ""))
             case_id = int(payload.get("case_id") or 0) or None
             findings = detect_phi_findings(text)
+            allowed, reason = ai_policy_allows(policy, purpose, external=False, phi_detected=bool(findings))
+            if not allowed:
+                self.send_error_json(reason, 403)
+                return
             result = self.local_ai_workbench_result(conn, study_id, membership, user, purpose, text, case_id)
             ai_audit_id = record_ai_audit(
                 conn,
@@ -3644,7 +3729,7 @@ class App(BaseHTTPRequestHandler):
                 status_value="ok",
             )
             audit(conn, user["id"], "ai_request", "ai_audit", ai_audit_id, None, {"purpose": purpose, "mode": "local", "phi_detected": bool(findings)}, study_id=study_id, **self.audit_context())
-            self.send_json({"result": result, "ai": ai_status(), "audit_id": ai_audit_id})
+            self.send_json({"result": result, "ai": ai_status(), "policy": policy, "audit_id": ai_audit_id})
             return
         self.send_error_json("Unsupported AI operation", 405)
 
@@ -4963,20 +5048,24 @@ class App(BaseHTTPRequestHandler):
             all_cases = self.case_rows(conn, study_id, membership, user)
             case_item = self.case_payload(conn, case_row)
             status = ai_status()
+            policy = study_ai_policy(conn, study_id)
             mode = "local"
             findings = detect_phi_findings(str(case_item.get("source_text", "")) + "\n" + question)
             ai_error = ""
+            file_count = len(case_item.get("files", []))
+            external_allowed, policy_reason = ai_policy_allows(policy, "case_publication_review", external=True, input_type="mixed" if file_count else "text", phi_detected=bool(findings))
             try:
-                if status["external_ai_enabled"]:
+                if status["external_ai_enabled"] and external_allowed:
                     response = openai_academic_case_review(conn, study_id, case_item, all_cases, question)
                     mode = "openai"
                 else:
                     response = local_academic_case_review(case_item, all_cases, question)
+                    if status["external_ai_enabled"] and policy_reason:
+                        response["safety_notes"].append(policy_reason)
             except Exception as exc:
                 ai_error = str(exc)
                 response = local_academic_case_review(case_item, all_cases, question)
                 response["safety_notes"].append(f"External AI review failed; local fallback used: {exc}")
-            file_count = len(case_item.get("files", []))
             timestamp = now()
             cur = conn.execute(
                 """
@@ -6061,6 +6150,7 @@ class App(BaseHTTPRequestHandler):
             ],
             "cv_markdown": academic_cv_markdown(study, cv_items, opportunities, outputs),
             "ai": ai_status(),
+            "ai_policy": study_ai_policy(conn, study_id),
             "guidance": [
                 "Use Case Intake for messy notes, photos, audio, PDFs, and scanned case details.",
                 "Run Academic AI review only on de-identified material unless policy explicitly allows PHI.",

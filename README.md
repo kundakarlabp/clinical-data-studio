@@ -67,6 +67,7 @@ Implemented foundation:
 - Smart Case Intake for unstructured retrospective case notes, photos, audio evidence, local extraction, grouping, and case-series CSV export
 - Optional OpenAI Academic AI review for multimodal case interpretation, adaptive CRF suggestions, and publication guidance
 - AI safety gate, de-identification preview, AI audit table, and local prompt helpers for CRF drafts, missing-data checks, publication ideas, and CV item suggestions
+- Project-level AI policy gates for OpenAI use, PHI blocking, multimodal file blocking, and allowed AI purposes
 - Academic Workbench for publication opportunities, typed academic outputs, CV item tracking, and Markdown/CSV academic portfolio export
 - Encrypted full backup workflow for PostgreSQL plus uploaded evidence files
 - Cookie-based browser sessions with CSRF protection while keeping scoped REDCap-style API tokens
@@ -116,7 +117,7 @@ $env:OPENAI_API_KEY = "your_api_key"
 
 Do not send patient identifiers or PHI to external AI unless your study policy and data agreement allow it. AI drafts must be reviewed before use.
 
-For case-report and case-series AI review with images/audio, see [docs/OPENAI_ACADEMIC_AI.md](docs/OPENAI_ACADEMIC_AI.md). A ChatGPT subscription does not automatically give this local app API access; configure an OpenAI API key on the study computer.
+For case-report and case-series AI review with images/audio, see [docs/OPENAI_ACADEMIC_AI.md](docs/OPENAI_ACADEMIC_AI.md). For the practical ChatGPT/OpenAI connection steps, see [docs/OPENAI_CHATGPT_SETUP.md](docs/OPENAI_CHATGPT_SETUP.md). A ChatGPT subscription does not automatically give this local app API access; configure an OpenAI API key on the study computer or Lightsail server.
 
 ## Case Reports And Case Series
 

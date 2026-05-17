@@ -1007,19 +1007,28 @@ function queriesView() {
       ${state.queries.length ? `
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Status</th><th>Participant</th><th>Form</th><th>Field</th><th>Message</th><th></th></tr></thead>
+            <thead><tr><th>Status</th><th>Participant</th><th>Form</th><th>Field</th><th>Assigned</th><th>Message / History</th><th></th></tr></thead>
             <tbody>
               ${state.queries.map((query) => `
                 <tr>
-                  <td><span class="pill ${query.status === "open" ? "bad" : "ok"}">${escapeHtml(query.status)}</span></td>
+                  <td>
+                    <span class="pill ${query.status === "open" ? "bad" : query.status === "responded" ? "warn" : "ok"}">${escapeHtml(query.status)}</span>
+                    ${query.overdue ? `<br><span class="pill bad">overdue</span>` : ""}
+                  </td>
                   <td>${escapeHtml(query.study_uid || "")}</td>
                   <td>${escapeHtml(query.form_name || "")}</td>
                   <td>${escapeHtml(query.field_code || "")}</td>
-                  <td>${escapeHtml(query.message)}</td>
                   <td>
-                    <span class="small">${(query.responses || []).length} response(s)</span>
-                    <button class="secondary" data-respond-query="${query.id}">Respond</button>
-                    ${query.status === "open" ? `<button class="secondary" data-close-query="${query.id}">Close</button>` : ""}
+                    ${escapeHtml(query.assigned_to_name || "Unassigned")}
+                    ${query.due_at ? `<br><span class="small">Due ${fmtTime(query.due_at)}</span>` : ""}
+                  </td>
+                  <td>
+                    <strong>${escapeHtml(query.message)}</strong>
+                    ${(query.responses || []).length ? `<div class="query-history">${query.responses.map((response) => `<div><span class="small">${fmtTime(response.created_at)} ${escapeHtml(response.display_name || "")}</span><br>${escapeHtml(response.message)}</div>`).join("")}</div>` : `<br><span class="small">No responses yet.</span>`}
+                  </td>
+                  <td>
+                    ${query.status !== "closed" ? `<button class="secondary" data-respond-query="${query.id}">Respond</button>` : ""}
+                    ${query.status !== "closed" ? `<button class="secondary" data-close-query="${query.id}">Close</button>` : ""}
                   </td>
                 </tr>
               `).join("")}
@@ -1087,6 +1096,7 @@ function caseIntakeView() {
   const series = state.caseIntake?.series || { case_count: 0, group_count: 0, groups: [], missing_field_count: 0, warning_count: 0, draft_outline: [], adaptive_fields: [] };
   const ai = state.caseIntake?.ai || { provider: "local", external_ai_enabled: false, multimodal_enabled: false, model: "local-rules" };
   const review = state.caseAiReview?.response;
+  const insecureRemote = !window.isSecureContext && !["localhost", "127.0.0.1"].includes(location.hostname);
   return `
     <section class="metrics-grid">
       ${metric("Cases", series.case_count || 0, "Unstructured case records")}
@@ -1118,8 +1128,8 @@ function caseIntakeView() {
         </div>
         <label>Typed notes / OCR text / dictated transcript<textarea name="source_text" id="case-source-text" placeholder="Paste case details, Google Lens text, discharge summary notes, or dictate using the button below."></textarea></label>
         <div class="split-actions">
-          <button type="button" class="secondary" id="case-dictate">Start Dictation</button>
-          <span class="small">Dictation works only in browsers that support speech recognition. Uploaded audio is stored as evidence; local transcription is not automatic.</span>
+          <button type="button" class="secondary" id="case-dictate" ${insecureRemote ? "disabled" : ""}>Start Dictation</button>
+          <span class="small">${insecureRemote ? "Microphone dictation needs HTTPS on remote servers. Type, paste OCR text, or upload the audio file until HTTPS is enabled." : "Dictation works only in browsers that support speech recognition. Uploaded audio is stored as evidence; local transcription is not automatic."}</span>
         </div>
         <label>Evidence files<input name="files" type="file" multiple accept="image/*,audio/*,application/pdf,text/plain,text/csv,.pdf,.txt,.csv" /></label>
         <div id="case-file-preview" class="file-preview"></div>
@@ -2543,6 +2553,11 @@ function previewCaseFiles(event) {
 }
 
 function startCaseDictation() {
+  if (!window.isSecureContext && !["localhost", "127.0.0.1"].includes(location.hostname)) {
+    state.error = "Microphone dictation needs HTTPS on a remote server. Enable HTTPS, or type/paste text and upload the audio file as evidence.";
+    render();
+    return;
+  }
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SpeechRecognition) {
     state.error = "This browser does not support built-in dictation. Record audio as a file or type/paste the transcript.";

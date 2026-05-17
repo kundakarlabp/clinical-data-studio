@@ -315,11 +315,15 @@ CREATE TABLE IF NOT EXISTS queries (
     study_id BIGINT NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
     participant_id BIGINT REFERENCES participants(id) ON DELETE CASCADE,
     form_id BIGINT REFERENCES forms(id) ON DELETE SET NULL,
+    entry_id BIGINT REFERENCES entries(id) ON DELETE SET NULL,
     field_code TEXT NOT NULL DEFAULT '',
     message TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'open',
     created_by BIGINT REFERENCES users(id),
     assigned_to BIGINT REFERENCES users(id),
+    due_at BIGINT,
+    closed_at BIGINT,
+    closed_by BIGINT REFERENCES users(id),
     created_at BIGINT NOT NULL,
     updated_at BIGINT NOT NULL
 );
@@ -530,6 +534,9 @@ CREATE INDEX IF NOT EXISTS idx_participants_study_id ON participants(study_id);
 CREATE INDEX IF NOT EXISTS idx_entries_study_id ON entries(study_id);
 CREATE INDEX IF NOT EXISTS idx_entries_participant_id ON entries(participant_id);
 CREATE INDEX IF NOT EXISTS idx_entries_form_id ON entries(form_id);
+CREATE INDEX IF NOT EXISTS idx_queries_study_id ON queries(study_id);
+CREATE INDEX IF NOT EXISTS idx_queries_assigned_to ON queries(assigned_to);
+CREATE INDEX IF NOT EXISTS idx_queries_entry_id ON queries(entry_id);
 CREATE INDEX IF NOT EXISTS idx_audit_log_user_id ON audit_log(user_id);
 CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON audit_log(created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_log_entity ON audit_log(entity_type, entity_id);

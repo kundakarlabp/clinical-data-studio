@@ -80,6 +80,7 @@ class FrontendStaticTests(unittest.TestCase):
         self.assertIn("case-intake", app_js)
         self.assertIn("Case Intake", app_js)
         self.assertIn("startCaseDictation", app_js)
+        self.assertIn("Microphone dictation needs HTTPS", app_js)
         self.assertIn("downloadApi", app_js)
         self.assertIn("data-case-file", app_js)
         self.assertIn("Academic AI Review", app_js)
@@ -109,6 +110,7 @@ class FrontendStaticTests(unittest.TestCase):
         css = (ROOT / "static" / "styles.css").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         deployment = (ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
+        openai_setup = (ROOT / "docs" / "OPENAI_CHATGPT_SETUP.md").read_text(encoding="utf-8")
         self.assertIn("Remote Access", app_js)
         self.assertIn("remoteAccessView", app_js)
         self.assertIn("start_easy_remote.ps1", app_js)
@@ -125,6 +127,8 @@ class FrontendStaticTests(unittest.TestCase):
         self.assertIn("Remote Access Options", deployment)
         self.assertIn("Free Remote Access Setup", deployment)
         self.assertIn("GitHub Pages: useful for documentation", deployment)
+        self.assertIn("OpenAI API key", openai_setup)
+        self.assertIn("must never be committed to GitHub", openai_setup)
 
     def test_remote_access_helper_script_is_present(self):
         helper = (ROOT / "remote_access.ps1").read_text(encoding="utf-8")

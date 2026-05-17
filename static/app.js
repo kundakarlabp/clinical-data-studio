@@ -289,6 +289,7 @@ function render() {
           ${state.user?.must_change_password ? `<div class="notice error">Default password is still active. Change it in Study Setup before real use.</div>` : ""}
           ${state.online ? "" : `<div class="notice error">This device is offline. You can open installed pages, but clinical data saves require connection to the study computer.</div>`}
           ${state.error ? `<div class="notice error">${escapeHtml(state.error)}</div>` : ""}
+          ${state.notice ? `<div class="notice ok">${escapeHtml(state.notice)}</div>` : ""}
           ${route()}
         </div>
         ${mobileBottomNav()}
@@ -681,6 +682,11 @@ function formsView() {
               <option value="true" ${editing?.schema?.repeatable ? "selected" : ""}>Yes</option>
             </select>
           </label>
+          <label>Lifecycle
+            <select name="lifecycle_state">
+              ${["draft", "published", "retired", "locked"].map((stateName) => `<option value="${stateName}" ${(editing?.lifecycle_state || "published") === stateName ? "selected" : ""}>${stateName}</option>`).join("")}
+            </select>
+          </label>
           <fieldset class="full">
             <legend>Assign to events</legend>
             ${state.events.map((event) => `<label class="check"><input type="checkbox" name="event_ids" value="${event.id}" ${event.code === "baseline" ? "checked" : ""} />${escapeHtml(event.name)}</label>`).join("")}
@@ -702,13 +708,17 @@ function formsView() {
         ${state.forms.map((form) => `
           <article class="card">
             <h3>${escapeHtml(form.name)}</h3>
-            <p>${escapeHtml(form.code)} - v${form.version} - ${form.schema.fields.length} fields${form.schema.repeatable ? " - repeatable" : ""}</p>
+            <p>${escapeHtml(form.code)} - v${form.version} - ${(form.lifecycle_state || "published")} - ${form.schema.fields.length} fields${form.schema.repeatable ? " - repeatable" : ""}</p>
             <div class="stack">
               ${form.schema.fields.map((field) => `<span class="pill">${escapeHtml(field.label)} (${escapeHtml(field.type)})</span>`).join("")}
             </div>
             <div class="split-actions">
               <button class="secondary" data-edit-form="${form.id}">Edit</button>
               <button class="secondary" data-form-versions="${form.id}">Versions</button>
+              <button class="secondary" data-form-action="validate" data-form-id="${form.id}">Validate</button>
+              ${(form.lifecycle_state || "published") !== "published" ? `<button class="secondary" data-form-action="publish" data-form-id="${form.id}">Publish</button>` : ""}
+              ${(form.lifecycle_state || "published") !== "retired" ? `<button class="secondary" data-form-action="retire" data-form-id="${form.id}">Retire</button>` : ""}
+              ${(form.lifecycle_state || "published") !== "locked" ? `<button class="warning" data-form-action="lock" data-form-id="${form.id}">Lock</button>` : `<button class="secondary" data-form-action="unlock" data-form-id="${form.id}">Unlock</button>`}
             </div>
           </article>
         `).join("")}
@@ -2013,6 +2023,7 @@ function bindRoute() {
     render();
   }));
   document.querySelectorAll("[data-form-versions]").forEach((button) => button.addEventListener("click", () => showFormVersions(button.dataset.formVersions)));
+  document.querySelectorAll("[data-form-action]").forEach((button) => button.addEventListener("click", () => setFormLifecycle(button.dataset.formId, button.dataset.formAction)));
 }
 
 function applyBranching(form) {
@@ -2695,9 +2706,28 @@ async function submitFormDefinition(event) {
     const path = state.editingFormId ? `/api/studies/${state.studyId}/forms/${state.editingFormId}` : `/api/studies/${state.studyId}/forms`;
     await api(path, {
       method: state.editingFormId ? "PATCH" : "POST",
-      body: JSON.stringify({ name: formData.get("name"), code: formData.get("code"), event_ids: eventIds, schema: { fields, repeatable: formData.get("repeatable") === "true" } }),
+      body: JSON.stringify({ name: formData.get("name"), code: formData.get("code"), lifecycle_state: formData.get("lifecycle_state"), event_ids: eventIds, schema: { fields, repeatable: formData.get("repeatable") === "true" } }),
     });
     state.editingFormId = 0;
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function setFormLifecycle(formId, action) {
+  const labels = { publish: "publish this CRF for data entry", retire: "retire this CRF", lock: "lock this CRF", unlock: "unlock this CRF", validate: "validate this CRF" };
+  if (action !== "validate" && !confirm(`Do you want to ${labels[action] || action}?`)) return;
+  try {
+    const result = await api(`/api/studies/${state.studyId}/forms/${formId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ action }),
+    });
+    if (action === "validate") {
+      state.notice = result.valid ? "CRF validation passed." : `CRF validation needs review: ${(result.errors || []).join("; ")}`;
+    }
     await loadStudy();
     render();
   } catch (error) {

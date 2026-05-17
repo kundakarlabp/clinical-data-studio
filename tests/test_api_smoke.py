@@ -428,6 +428,77 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertIn("kept value", csv_text)
         self.assertIn("older_form_version", csv_text)
 
+    def test_crf_lifecycle_blocks_unpublished_forms_and_publish_validates(self):
+        token = self.login_session()
+        study_id = self.request_json("/api/studies", token=token)["studies"][0]["id"]
+        participant = self.request_json(
+            f"/api/studies/{study_id}/participants",
+            "POST",
+            {"study_uid": "LIFE001", "initials": "LC", "status": "enrolled"},
+            token,
+        )["participant"]
+        draft_form = self.request_json(
+            f"/api/studies/{study_id}/forms",
+            "POST",
+            {
+                "name": "Lifecycle CRF",
+                "code": "lifecycle_crf",
+                "lifecycle_state": "draft",
+                "schema": {"fields": [{"code": "finding", "label": "Finding", "type": "text"}]},
+            },
+            token,
+        )["form"]
+        self.assertEqual(draft_form["lifecycle_state"], "draft")
+        with self.assertRaises(HTTPError) as draft_denied:
+            self.request_json(
+                f"/api/studies/{study_id}/entries",
+                "POST",
+                {"participant_id": participant["id"], "form_id": draft_form["id"], "status": "complete", "data": {"finding": "not yet"}},
+                token,
+            )
+        self.assertEqual(draft_denied.exception.code, 409)
+        draft_denied.exception.close()
+
+        validation = self.request_json(f"/api/studies/{study_id}/forms/{draft_form['id']}", "PATCH", {"action": "validate"}, token)
+        self.assertTrue(validation["valid"])
+        published = self.request_json(f"/api/studies/{study_id}/forms/{draft_form['id']}", "PATCH", {"action": "publish"}, token)["form"]
+        self.assertEqual(published["lifecycle_state"], "published")
+        entry = self.request_json(
+            f"/api/studies/{study_id}/entries",
+            "POST",
+            {"participant_id": participant["id"], "form_id": draft_form["id"], "status": "complete", "data": {"finding": "published entry"}},
+            token,
+        )["entry"]
+        self.assertEqual(entry["form_version"], 1)
+
+        locked = self.request_json(f"/api/studies/{study_id}/forms/{draft_form['id']}", "PATCH", {"action": "lock"}, token)["form"]
+        self.assertEqual(locked["lifecycle_state"], "locked")
+        with self.assertRaises(HTTPError) as locked_denied:
+            self.request_json(
+                f"/api/studies/{study_id}/entries",
+                "POST",
+                {"participant_id": participant["id"], "form_id": draft_form["id"], "status": "complete", "data": {"finding": "blocked"}},
+                token,
+            )
+        self.assertEqual(locked_denied.exception.code, 423)
+        locked_denied.exception.close()
+
+        invalid_form = self.request_json(
+            f"/api/studies/{study_id}/forms",
+            "POST",
+            {
+                "name": "Invalid File CRF",
+                "code": "invalid_file_crf",
+                "lifecycle_state": "draft",
+                "schema": {"fields": [{"code": "attachment", "label": "Attachment", "type": "file"}]},
+            },
+            token,
+        )["form"]
+        with self.assertRaises(HTTPError) as publish_denied:
+            self.request_json(f"/api/studies/{study_id}/forms/{invalid_form['id']}", "PATCH", {"action": "publish"}, token)
+        self.assertEqual(publish_denied.exception.code, 422)
+        publish_denied.exception.close()
+
     def test_data_dictionary_coded_choices_round_trip_and_label_export(self):
         token = self.login_session()
         study_id = self.request_json("/api/studies", token=token)["studies"][0]["id"]

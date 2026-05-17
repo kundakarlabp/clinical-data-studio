@@ -1029,6 +1029,7 @@ def migrate() -> None:
             add_column(conn, "audit_log", "user_agent", "TEXT NOT NULL DEFAULT ''")
             add_column(conn, "audit_log", "request_id", "TEXT NOT NULL DEFAULT ''")
             add_column(conn, "forms", "active", "INTEGER NOT NULL DEFAULT 1")
+            add_column(conn, "forms", "lifecycle_state", "TEXT NOT NULL DEFAULT 'published'")
             add_column(conn, "survey_links", "expires_at", "BIGINT")
             add_column(conn, "survey_links", "one_time", "INTEGER NOT NULL DEFAULT 0")
             add_column(conn, "academic_cv_items", "active", "INTEGER NOT NULL DEFAULT 1")
@@ -1099,6 +1100,7 @@ def migrate() -> None:
                 schema_json TEXT NOT NULL,
                 version INTEGER NOT NULL DEFAULT 1,
                 active INTEGER NOT NULL DEFAULT 1,
+                lifecycle_state TEXT NOT NULL DEFAULT 'published',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 UNIQUE(study_id, code)
@@ -1430,6 +1432,7 @@ def migrate() -> None:
         add_column(conn, "audit_log", "user_agent", "TEXT NOT NULL DEFAULT ''")
         add_column(conn, "audit_log", "request_id", "TEXT NOT NULL DEFAULT ''")
         add_column(conn, "forms", "active", "INTEGER NOT NULL DEFAULT 1")
+        add_column(conn, "forms", "lifecycle_state", "TEXT NOT NULL DEFAULT 'published'")
         add_column(conn, "survey_links", "expires_at", "INTEGER")
         add_column(conn, "survey_links", "one_time", "INTEGER NOT NULL DEFAULT 0")
         add_column(conn, "academic_cv_items", "active", "INTEGER NOT NULL DEFAULT 1")
@@ -1715,6 +1718,56 @@ def normalize_schema(schema: dict) -> dict:
     return {"fields": fields, "repeatable": bool(schema.get("repeatable", False))}
 
 
+FORM_LIFECYCLE_STATES = {"draft", "published", "retired", "locked"}
+FORM_ENTRY_ALLOWED_STATES = {"published"}
+
+
+def form_lifecycle_state(form: dict | None) -> str:
+    state = str((form or {}).get("lifecycle_state") or "published").strip().lower()
+    return state if state in FORM_LIFECYCLE_STATES else "published"
+
+
+def validate_crf_for_publish(schema: dict) -> list[str]:
+    errors: list[str] = []
+    fields = schema.get("fields", [])
+    codes = [str(field.get("code", "")).strip() for field in fields]
+    known_codes = set(codes)
+    if not fields:
+        errors.append("CRF must contain at least one field.")
+    for index, field in enumerate(fields, start=1):
+        code = str(field.get("code", "")).strip()
+        label = str(field.get("label", "")).strip()
+        field_type = str(field.get("type", "")).strip().lower()
+        if not re.fullmatch(r"[a-z][a-z0-9_]*", code):
+            errors.append(f"Field {index} has an invalid variable name: {code or '(blank)'}.")
+        if not label:
+            errors.append(f"Field {code or index} is missing a label.")
+        if field_type not in {"text", "textarea", "number", "integer", "decimal", "date", "datetime", "select", "radio", "checkbox", "yesno", "calc", "file", "section", "descriptive"}:
+            errors.append(f"Field {code or index} uses unsupported type {field_type or '(blank)'}.")
+        if field_type in {"select", "radio", "checkbox"}:
+            choices = normalize_choices(field.get("choices") or field.get("options") or [])
+            choice_values = [item["value"] for item in choices]
+            if not choices:
+                errors.append(f"Field {code} needs coded choices before publish.")
+            if len(choice_values) != len(set(choice_values)):
+                errors.append(f"Field {code} has duplicate coded choice values.")
+            if any(not item.get("label") for item in choices):
+                errors.append(f"Field {code} has an empty choice label.")
+        for logic_key in ("branching_logic", "calculation"):
+            expression = str(field.get(logic_key, "") or "")
+            if expression:
+                expression_for_refs = re.sub(r"'[^']*'|\"[^\"]*\"", "", expression)
+                referenced = {item for item in re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", expression_for_refs) if item.upper() not in {"AND", "OR", "IN"}}
+                unknown = sorted(item for item in referenced if item not in known_codes)
+                if unknown:
+                    errors.append(f"Field {code} {logic_key.replace('_', ' ')} references unknown field(s): {', '.join(unknown)}.")
+        if field_type == "file" and not (field.get("max_size_mb") or field.get("allowed_types")):
+            errors.append(f"File field {code} needs an allowed type or max size rule before publish.")
+    if len(codes) != len(set(codes)):
+        errors.append("CRF has duplicate variable names.")
+    return errors
+
+
 def validate_entry_data(schema: dict, data: dict) -> tuple[dict, list[dict]]:
     cleaned = {}
     issues = []
@@ -1815,6 +1868,7 @@ def form_schema_snapshot(form: dict, schema: dict | None = None) -> dict:
         "form_name": form.get("name", ""),
         "form_code": form.get("code", ""),
         "form_version": int(form.get("version") or 1),
+        "lifecycle_state": form_lifecycle_state(form),
         "repeatable": bool(schema.get("repeatable", False)),
         "fields": schema.get("fields", []),
     }
@@ -4023,9 +4077,12 @@ class App(BaseHTTPRequestHandler):
             payload = self.body()
             timestamp = now()
             schema = normalize_schema(payload.get("schema") or {"fields": []})
+            lifecycle_state = str(payload.get("lifecycle_state") or "published").strip().lower()
+            if lifecycle_state not in FORM_LIFECYCLE_STATES:
+                lifecycle_state = "published"
             cur = conn.execute(
-                "INSERT INTO forms(study_id, name, code, schema_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (study_id, str(payload.get("name", "")).strip() or "Untitled Form", normalize_code(str(payload.get("code", "")), f"form_{timestamp}"), json.dumps(schema), timestamp, timestamp),
+                "INSERT INTO forms(study_id, name, code, schema_json, lifecycle_state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (study_id, str(payload.get("name", "")).strip() or "Untitled Form", normalize_code(str(payload.get("code", "")), f"form_{timestamp}"), json.dumps(schema), lifecycle_state, timestamp, timestamp),
             )
             event_ids = payload.get("event_ids") or []
             if not event_ids:
@@ -4042,6 +4099,7 @@ class App(BaseHTTPRequestHandler):
                     )
             after = row(conn, "SELECT * FROM forms WHERE id = ?", (cur.lastrowid,))
             audit(conn, user["id"], "create", "form", cur.lastrowid, None, after)
+            conn.commit()
             self.send_json({"form": after}, 201)
             return
         if method == "PATCH" and len(parts) == 5:
@@ -4051,14 +4109,40 @@ class App(BaseHTTPRequestHandler):
                 self.send_error_json("Form not found", 404)
                 return
             payload = self.body()
+            action = str(payload.get("action", "")).strip().lower()
+            if action in {"validate", "publish", "retire", "lock", "unlock", "save_draft"}:
+                current_schema = load_json(before["schema_json"], {"fields": []})
+                errors = validate_crf_for_publish(current_schema)
+                if action == "validate":
+                    self.send_json({"valid": not errors, "errors": errors, "lifecycle_state": form_lifecycle_state(before)})
+                    return
+                if action == "publish" and errors:
+                    self.send_json({"errors": errors}, 422)
+                    return
+                next_state = {
+                    "publish": "published",
+                    "retire": "retired",
+                    "lock": "locked",
+                    "unlock": "published",
+                    "save_draft": "draft",
+                }[action]
+                conn.execute("UPDATE forms SET lifecycle_state = ?, active = ?, updated_at = ? WHERE id = ? AND study_id = ?", (next_state, 0 if next_state == "retired" else 1, now(), form_id, study_id))
+                after = row(conn, "SELECT * FROM forms WHERE id = ?", (form_id,))
+                audit(conn, user["id"], action, "form", form_id, before, after, study_id=study_id, **self.audit_context())
+                conn.commit()
+                self.send_json({"form": after})
+                return
             schema = normalize_schema(payload.get("schema", load_json(before["schema_json"], {})))
+            lifecycle_state = str(payload.get("lifecycle_state") or before.get("lifecycle_state") or "published").strip().lower()
+            if lifecycle_state not in FORM_LIFECYCLE_STATES:
+                lifecycle_state = form_lifecycle_state(before)
             conn.execute(
                 "INSERT INTO form_versions(form_id, study_id, version, name, code, schema_json, saved_by, saved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (form_id, study_id, before["version"], before["name"], before["code"], before["schema_json"], user["id"], now()),
             )
             conn.execute(
-                "UPDATE forms SET name = ?, code = ?, schema_json = ?, version = version + 1, updated_at = ? WHERE id = ? AND study_id = ?",
-                (str(payload.get("name", before["name"])).strip(), normalize_code(str(payload.get("code", before["code"])), before["code"]), json.dumps(schema), now(), form_id, study_id),
+                "UPDATE forms SET name = ?, code = ?, schema_json = ?, lifecycle_state = ?, version = version + 1, updated_at = ? WHERE id = ? AND study_id = ?",
+                (str(payload.get("name", before["name"])).strip(), normalize_code(str(payload.get("code", before["code"])), before["code"]), json.dumps(schema), lifecycle_state, now(), form_id, study_id),
             )
             after = row(conn, "SELECT * FROM forms WHERE id = ?", (form_id,))
             audit(conn, user["id"], "update", "form", form_id, before, after)
@@ -4441,6 +4525,10 @@ class App(BaseHTTPRequestHandler):
             if not form:
                 imported["errors"].append({"row": row_index, "message": "Could not identify CRF/form"})
                 continue
+            lifecycle_state = form_lifecycle_state(form)
+            if lifecycle_state not in FORM_ENTRY_ALLOWED_STATES:
+                imported["errors"].append({"row": row_index, "message": f"CRF is {lifecycle_state}; only published CRFs accept imported records"})
+                continue
             schema = load_json(form["schema_json"], {"fields": []})
             form_snapshot = form_schema_snapshot(form, schema)
             form_version = int(form.get("version") or 1)
@@ -4612,6 +4700,11 @@ class App(BaseHTTPRequestHandler):
             if membership.get("data_group_id") and participant.get("data_group_id") != membership["data_group_id"]:
                 self.send_error_json("Participant is outside your data access group", 403)
                 return
+            existing = row(conn, "SELECT * FROM entries WHERE participant_id = ? AND form_id = ? AND event_name = ? AND repeat_instance = ?", (participant_id, form_id, event_name, repeat_instance))
+            lifecycle_state = form_lifecycle_state(form)
+            if lifecycle_state not in FORM_ENTRY_ALLOWED_STATES:
+                self.send_error_json(f"CRF is {lifecycle_state}; data entry is allowed only for published CRFs.", 423 if lifecycle_state == "locked" else 409)
+                return
             schema = load_json(form["schema_json"], {"fields": []})
             snapshot = form_schema_snapshot(form, schema)
             form_version = int(form.get("version") or 1)
@@ -4624,7 +4717,6 @@ class App(BaseHTTPRequestHandler):
                 return
             digest = entry_hash(cleaned, form_version, snapshot)
             snapshot_json = json.dumps(snapshot, sort_keys=True)
-            existing = row(conn, "SELECT * FROM entries WHERE participant_id = ? AND form_id = ? AND event_name = ? AND repeat_instance = ?", (participant_id, form_id, event_name, repeat_instance))
             if existing:
                 if_match_updated_at = payload.get("if_match_updated_at")
                 if_match_entry_hash = str(payload.get("if_match_entry_hash") or "").strip()

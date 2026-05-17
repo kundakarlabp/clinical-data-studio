@@ -89,3 +89,9 @@ Default safe settings:
 - allowed purposes limited to approved clinical-research helpers.
 
 External AI is used only if both the server configuration and the project AI policy allow it. Data Entry users cannot run external AI by default. Every AI request is recorded in the AI audit trail.
+
+## ChatGPT / OpenAI Setup
+
+Your personal ChatGPT login is not used as the app credential. The deployed server needs an OpenAI API key in `.env`, and that key must never be committed to GitHub.
+
+Use [OPENAI_CHATGPT_SETUP.md](OPENAI_CHATGPT_SETUP.md) for the step-by-step setup. Keep `CDS_AI_ALLOW_PHI=false` unless you have explicit approval for identifiable patient data.

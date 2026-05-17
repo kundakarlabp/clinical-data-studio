@@ -560,6 +560,12 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertNotIn("Jane Doe", deid_text)
         self.assertNotIn("coded_demo__sex", deid_text)
         self.assertIn("'=1+1", deid_text)
+        _, publication_type, publication_body = self.request_raw(f"/api/studies/{study_id}/export?export_profile=publication_safe", token=token)
+        self.assertIn("text/csv", publication_type)
+        publication_text = publication_body.decode("utf-8-sig")
+        self.assertNotIn("coded_demo__patient_name", publication_text)
+        self.assertNotIn("coded_demo__note", publication_text)
+        self.assertIn("EXP00001", publication_text)
         _, codebook_type, codebook_body = self.request_raw(f"/api/studies/{study_id}/codebook", token=token)
         self.assertIn("text/csv", codebook_type)
         self.assertIn("1, Male | 2, Female", codebook_body.decode("utf-8-sig"))
@@ -1015,6 +1021,41 @@ class ApiSmokeTests(unittest.TestCase):
             },
             entry_token,
         )["entry"]
+        query = self.request_json(
+            f"/api/studies/{study_id}/queries",
+            "POST",
+            {
+                "participant_id": created["id"],
+                "form_id": form_id,
+                "entry_id": entry["id"],
+                "field_code": "diagnosis",
+                "message": "Please confirm the diagnosis.",
+                "assigned_to": data_user["id"],
+                "due_at": 1,
+            },
+            admin_token,
+        )["query"]
+        self.assertEqual(query["status"], "open")
+        entry_after_query = self.request_json(f"/api/studies/{study_id}/entries", token=admin_token)["entries"][0]
+        self.assertEqual(entry_after_query["status"], "query_open")
+        response = self.request_json(
+            f"/api/studies/{study_id}/queries/{query['id']}/responses",
+            "POST",
+            {"message": "Diagnosis confirmed against source note."},
+            entry_token,
+        )["response"]
+        self.assertEqual(response["message"], "Diagnosis confirmed against source note.")
+        query_list = self.request_json(f"/api/studies/{study_id}/queries", token=admin_token)["queries"]
+        reviewed_query = next(item for item in query_list if item["id"] == query["id"])
+        self.assertEqual(reviewed_query["status"], "responded")
+        self.assertTrue(reviewed_query["overdue"])
+        self.assertEqual(len(reviewed_query["responses"]), 1)
+        closed_query = self.request_json(f"/api/studies/{study_id}/queries/{query['id']}", "PATCH", {"status": "closed"}, admin_token)["query"]
+        self.assertEqual(closed_query["status"], "closed")
+        with self.assertRaises(HTTPError) as closed_response_denied:
+            self.request_json(f"/api/studies/{study_id}/queries/{query['id']}/responses", "POST", {"message": "Late extra response"}, entry_token)
+        self.assertEqual(closed_response_denied.exception.code, 409)
+        closed_response_denied.exception.close()
         with self.assertRaises(HTTPError) as data_lock_denied:
             self.request_json(f"/api/studies/{study_id}/entries/{entry['id']}", "PATCH", {"action": "lock", "reason": "review"}, entry_token)
         self.assertEqual(data_lock_denied.exception.code, 403)

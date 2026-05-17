@@ -85,8 +85,11 @@ ACADEMIC_OUTPUT_TYPES = {
     "audit_project",
     "teaching_session",
     "grant_proposal",
+    "sop_guideline",
     "cv_item",
 }
+ENTRY_STATUSES = {"draft", "submitted", "complete", "query_open", "responded", "reviewed", "locked", "frozen"}
+QUERY_STATUSES = {"open", "responded", "closed"}
 SETTINGS.log_dir.mkdir(parents=True, exist_ok=True)
 LOG_FILE = SETTINGS.log_dir / "clinical-data-studio.log"
 logging.basicConfig(
@@ -367,6 +370,21 @@ def omit_field_from_deidentified_export(field: dict) -> bool:
         or field_truthy(field, "phi_sensitive")
         or field_type in {"file", "file_upload", "attachment"}
     )
+
+
+def omit_field_from_publication_safe_export(field: dict) -> bool:
+    field_type = str(field.get("type") or "").strip().lower()
+    return omit_field_from_deidentified_export(field) or field_truthy(field, "free_text_identifier_risk") or field_type in {"textarea", "descriptive"}
+
+
+def normalize_entry_status(value: str | None, default: str = "draft") -> str:
+    status = str(value or default).strip().lower()
+    return status if status in ENTRY_STATUSES else default
+
+
+def normalize_query_status(value: str | None, default: str = "open") -> str:
+    status = str(value or default).strip().lower()
+    return status if status in QUERY_STATUSES else default
 
 
 def assert_external_ai_safe(text: str) -> None:
@@ -1087,6 +1105,10 @@ def migrate() -> None:
             add_column(conn, "forms", "active", "INTEGER NOT NULL DEFAULT 1")
             add_column(conn, "forms", "lifecycle_state", "TEXT NOT NULL DEFAULT 'published'")
             add_column(conn, "studies", "ai_policy_json", "TEXT NOT NULL DEFAULT '{}'")
+            add_column(conn, "queries", "entry_id", "BIGINT REFERENCES entries(id) ON DELETE SET NULL")
+            add_column(conn, "queries", "due_at", "BIGINT")
+            add_column(conn, "queries", "closed_at", "BIGINT")
+            add_column(conn, "queries", "closed_by", "BIGINT REFERENCES users(id)")
             add_column(conn, "survey_links", "expires_at", "BIGINT")
             add_column(conn, "survey_links", "one_time", "INTEGER NOT NULL DEFAULT 0")
             add_column(conn, "academic_cv_items", "active", "INTEGER NOT NULL DEFAULT 1")
@@ -1257,11 +1279,15 @@ def migrate() -> None:
                 study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
                 participant_id INTEGER REFERENCES participants(id) ON DELETE CASCADE,
                 form_id INTEGER REFERENCES forms(id) ON DELETE CASCADE,
+                entry_id INTEGER REFERENCES entries(id) ON DELETE SET NULL,
                 field_code TEXT NOT NULL DEFAULT '',
                 message TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'open',
                 created_by INTEGER REFERENCES users(id),
                 assigned_to INTEGER REFERENCES users(id),
+                due_at INTEGER,
+                closed_at INTEGER,
+                closed_by INTEGER REFERENCES users(id),
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -1480,6 +1506,10 @@ def migrate() -> None:
         add_column(conn, "entries", "form_version", "INTEGER NOT NULL DEFAULT 1")
         add_column(conn, "entries", "schema_snapshot_json", "TEXT NOT NULL DEFAULT '{}'")
         add_column(conn, "entries", "entry_hash", "TEXT NOT NULL DEFAULT ''")
+        add_column(conn, "queries", "entry_id", "INTEGER REFERENCES entries(id) ON DELETE SET NULL")
+        add_column(conn, "queries", "due_at", "INTEGER")
+        add_column(conn, "queries", "closed_at", "INTEGER")
+        add_column(conn, "queries", "closed_by", "INTEGER REFERENCES users(id)")
         add_column(conn, "participants", "data_group_id", "INTEGER REFERENCES data_groups(id) ON DELETE SET NULL")
         add_column(conn, "users", "must_change_password", "INTEGER NOT NULL DEFAULT 0")
         add_column(conn, "users", "failed_login_count", "INTEGER NOT NULL DEFAULT 0")
@@ -1540,6 +1570,9 @@ def add_production_indexes(conn) -> None:
         "CREATE INDEX IF NOT EXISTS idx_entries_study_id ON entries(study_id)",
         "CREATE INDEX IF NOT EXISTS idx_entries_participant_id ON entries(participant_id)",
         "CREATE INDEX IF NOT EXISTS idx_entries_form_id ON entries(form_id)",
+        "CREATE INDEX IF NOT EXISTS idx_queries_study_id ON queries(study_id)",
+        "CREATE INDEX IF NOT EXISTS idx_queries_assigned_to ON queries(assigned_to)",
+        "CREATE INDEX IF NOT EXISTS idx_queries_entry_id ON queries(entry_id)",
         "CREATE INDEX IF NOT EXISTS idx_audit_log_user_id ON audit_log(user_id)",
         "CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON audit_log(created_at)",
         "CREATE INDEX IF NOT EXISTS idx_audit_log_entity ON audit_log(entity_type, entity_id)",
@@ -3990,7 +4023,8 @@ class App(BaseHTTPRequestHandler):
                 return
             return self.case_intake(conn, user, method, study_id, parts, membership)
         if resource == "queries":
-            if method != "GET" and not membership_has(membership, "review_data"):
+            response_route = method == "POST" and len(parts) == 6 and parts[5] == "responses"
+            if method != "GET" and not response_route and not membership_has(membership, "review_data"):
                 self.send_error_json("Review permission required", 403)
                 return
             return self.queries(conn, user, method, study_id, parts, membership)
@@ -4778,7 +4812,7 @@ class App(BaseHTTPRequestHandler):
                 event_name = "Baseline"
             repeat_instance = max(int(payload.get("repeat_instance", 1) or 1), 1)
             data = payload.get("data", {})
-            status = str(payload.get("status", "draft"))
+            status = normalize_entry_status(payload.get("status"), "draft")
             form = row(conn, "SELECT * FROM forms WHERE id = ? AND study_id = ?", (form_id, study_id))
             participant = row(conn, "SELECT * FROM participants WHERE id = ? AND study_id = ?", (participant_id, study_id))
             if not form or not participant:
@@ -4876,7 +4910,7 @@ class App(BaseHTTPRequestHandler):
                 if not reason:
                     self.send_error_json("Reason is required", 400)
                     return
-                next_status = "frozen" if action == "freeze" else "complete"
+                next_status = "frozen" if action == "freeze" else "locked"
                 conn.execute("UPDATE entries SET locked_at = ?, locked_by = ?, lock_reason = ?, status = ?, updated_by = ?, updated_at = ? WHERE id = ?", (now(), user["id"], reason, next_status, user["id"], now(), entry_id))
                 after = row(conn, "SELECT * FROM entries WHERE id = ?", (entry_id,))
                 audit(conn, user["id"], action, "entry", entry_id, before, after, study_id=study_id, **self.audit_context())
@@ -4891,8 +4925,8 @@ class App(BaseHTTPRequestHandler):
                 if not reason:
                     self.send_error_json("Unlock reason is required", 400)
                     return
-                next_status = "reviewed" if action == "unfreeze" else before.get("status", "complete")
-                if next_status == "frozen":
+                next_status = "reviewed" if action in {"unlock", "unfreeze"} else before.get("status", "complete")
+                if next_status in {"locked", "frozen"}:
                     next_status = "reviewed"
                 conn.execute("UPDATE entries SET locked_at = NULL, locked_by = NULL, lock_reason = '', status = ?, updated_by = ?, updated_at = ? WHERE id = ?", (next_status, user["id"], now(), entry_id))
                 after = row(conn, "SELECT * FROM entries WHERE id = ?", (entry_id,))
@@ -5252,67 +5286,162 @@ class App(BaseHTTPRequestHandler):
                 data = rows(
                     conn,
                     """
-                    SELECT queries.*, participants.study_uid, forms.name AS form_name
+                    SELECT queries.*, participants.study_uid, forms.name AS form_name,
+                           assignee.display_name AS assigned_to_name, creator.display_name AS created_by_name
                     FROM queries
                     LEFT JOIN participants ON participants.id = queries.participant_id
                     LEFT JOIN forms ON forms.id = queries.form_id
+                    LEFT JOIN users assignee ON assignee.id = queries.assigned_to
+                    LEFT JOIN users creator ON creator.id = queries.created_by
                     WHERE queries.study_id = ? AND (participants.data_group_id = ? OR queries.participant_id IS NULL)
                     ORDER BY queries.status, queries.updated_at DESC
                     """,
                     (study_id, membership["data_group_id"]),
                 )
             else:
-                data = rows(conn, "SELECT queries.*, participants.study_uid, forms.name AS form_name FROM queries LEFT JOIN participants ON participants.id = queries.participant_id LEFT JOIN forms ON forms.id = queries.form_id WHERE queries.study_id = ? ORDER BY queries.status, queries.updated_at DESC", (study_id,))
+                data = rows(
+                    conn,
+                    """
+                    SELECT queries.*, participants.study_uid, forms.name AS form_name,
+                           assignee.display_name AS assigned_to_name, creator.display_name AS created_by_name
+                    FROM queries
+                    LEFT JOIN participants ON participants.id = queries.participant_id
+                    LEFT JOIN forms ON forms.id = queries.form_id
+                    LEFT JOIN users assignee ON assignee.id = queries.assigned_to
+                    LEFT JOIN users creator ON creator.id = queries.created_by
+                    WHERE queries.study_id = ?
+                    ORDER BY queries.status, queries.updated_at DESC
+                    """,
+                    (study_id,),
+                )
             responses = rows(conn, "SELECT query_responses.*, users.display_name FROM query_responses LEFT JOIN users ON users.id = query_responses.user_id WHERE query_id IN (SELECT id FROM queries WHERE study_id = ?) ORDER BY created_at", (study_id,))
             by_query: dict[int, list[dict]] = {}
             for response in responses:
                 by_query.setdefault(response["query_id"], []).append(response)
             for query_item in data:
                 query_item["responses"] = by_query.get(query_item["id"], [])
+                query_item["overdue"] = bool(query_item.get("due_at") and query_item["status"] != "closed" and int(query_item["due_at"]) < now())
             self.send_json({"queries": data})
             return
         if method == "POST" and len(parts) == 4:
             payload = self.body()
             timestamp = now()
-            participant_id = payload.get("participant_id")
-            if participant_id and membership.get("data_group_id"):
+            message = str(payload.get("message", "")).strip()
+            if not message:
+                self.send_error_json("Query message is required", 400)
+                return
+            participant_id = int(payload.get("participant_id") or 0) or None
+            form_id = int(payload.get("form_id") or 0) or None
+            entry_id = int(payload.get("entry_id") or 0) or None
+            entry = None
+            if entry_id:
+                entry = row(conn, "SELECT * FROM entries WHERE id = ? AND study_id = ?", (entry_id, study_id))
+                if not entry:
+                    self.send_error_json("Entry not found", 404)
+                    return
+                participant_id = entry["participant_id"]
+                form_id = entry["form_id"]
+            participant = None
+            if participant_id:
+                participant = row(conn, "SELECT * FROM participants WHERE id = ? AND study_id = ?", (participant_id, study_id))
+                if not participant:
+                    self.send_error_json("Participant not found", 404)
+                    return
+            if form_id and not row(conn, "SELECT id FROM forms WHERE id = ? AND study_id = ?", (form_id, study_id)):
+                self.send_error_json("Form not found", 404)
+                return
+            if participant and membership.get("data_group_id"):
                 participant = row(conn, "SELECT data_group_id FROM participants WHERE id = ? AND study_id = ?", (participant_id, study_id))
                 if not participant or participant.get("data_group_id") != membership["data_group_id"]:
                     self.send_error_json("Participant is outside your data access group", 403)
                     return
+            assigned_to = int(payload.get("assigned_to") or 0) or None
+            if assigned_to and not row(conn, "SELECT id FROM study_memberships WHERE study_id = ? AND user_id = ? AND active = 1", (study_id, assigned_to)):
+                self.send_error_json("Assigned user is not active in this study", 400)
+                return
+            due_at = int(payload.get("due_at") or 0) or None
             cur = conn.execute(
-                "INSERT INTO queries(study_id, participant_id, form_id, field_code, message, status, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (study_id, participant_id, payload.get("form_id"), str(payload.get("field_code", "")), str(payload.get("message", "")).strip(), "open", user["id"], timestamp, timestamp),
+                "INSERT INTO queries(study_id, participant_id, form_id, entry_id, field_code, message, status, created_by, assigned_to, due_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (study_id, participant_id, form_id, entry_id, normalize_code(str(payload.get("field_code", ""))), message, "open", user["id"], assigned_to, due_at, timestamp, timestamp),
             )
             after = row(conn, "SELECT * FROM queries WHERE id = ?", (cur.lastrowid,))
-            audit(conn, user["id"], "create", "query", cur.lastrowid, None, after)
+            if entry_id:
+                conn.execute("UPDATE entries SET status = ?, updated_by = ?, updated_at = ? WHERE id = ? AND status NOT IN ('locked', 'frozen')", ("query_open", user["id"], timestamp, entry_id))
+            audit(conn, user["id"], "create", "query", cur.lastrowid, None, after, study_id=study_id, **self.audit_context())
+            conn.commit()
             self.send_json({"query": after}, 201)
             return
         if method == "PATCH" and len(parts) == 5:
             query_id = int(parts[4])
             before = row(conn, "SELECT * FROM queries WHERE id = ? AND study_id = ?", (query_id, study_id))
+            if not before:
+                self.send_error_json("Query not found", 404)
+                return
+            if before.get("participant_id") and membership.get("data_group_id"):
+                participant = row(conn, "SELECT data_group_id FROM participants WHERE id = ? AND study_id = ?", (before["participant_id"], study_id))
+                if not participant or participant.get("data_group_id") != membership["data_group_id"]:
+                    self.send_error_json("Query is outside your data access group", 403)
+                    return
             payload = self.body()
-            conn.execute("UPDATE queries SET status = ?, updated_at = ? WHERE id = ? AND study_id = ?", (str(payload.get("status", before["status"])), now(), query_id, study_id))
+            new_status = normalize_query_status(payload.get("status"), before["status"])
+            assigned_to = int(payload.get("assigned_to") or before.get("assigned_to") or 0) or None
+            if assigned_to and not row(conn, "SELECT id FROM study_memberships WHERE study_id = ? AND user_id = ? AND active = 1", (study_id, assigned_to)):
+                self.send_error_json("Assigned user is not active in this study", 400)
+                return
+            closed_at = now() if new_status == "closed" else None
+            closed_by = user["id"] if new_status == "closed" else None
+            conn.execute(
+                "UPDATE queries SET status = ?, assigned_to = ?, due_at = ?, closed_at = ?, closed_by = ?, updated_at = ? WHERE id = ? AND study_id = ?",
+                (new_status, assigned_to, int(payload.get("due_at") or 0) or None, closed_at, closed_by, now(), query_id, study_id),
+            )
             after = row(conn, "SELECT * FROM queries WHERE id = ?", (query_id,))
-            audit(conn, user["id"], "update", "query", query_id, before, after)
+            if new_status == "closed" and before.get("entry_id"):
+                remaining = row(conn, "SELECT COUNT(*) AS count FROM queries WHERE entry_id = ? AND status != 'closed'", (before["entry_id"],))
+                if not remaining or int(remaining["count"] or 0) == 0:
+                    conn.execute("UPDATE entries SET status = ?, updated_by = ?, updated_at = ? WHERE id = ? AND status NOT IN ('locked', 'frozen')", ("reviewed", user["id"], now(), before["entry_id"]))
+            audit(conn, user["id"], "update", "query", query_id, before, after, study_id=study_id, **self.audit_context())
+            conn.commit()
             self.send_json({"query": after})
             return
         if method == "POST" and len(parts) == 6 and parts[5] == "responses":
             query_id = int(parts[4])
-            if not row(conn, "SELECT id FROM queries WHERE id = ? AND study_id = ?", (query_id, study_id)):
+            query_row = row(conn, "SELECT * FROM queries WHERE id = ? AND study_id = ?", (query_id, study_id))
+            if not query_row:
                 self.send_error_json("Query not found", 404)
+                return
+            if query_row.get("status") == "closed":
+                self.send_error_json("Closed queries cannot receive new responses", 409)
+                return
+            if query_row.get("participant_id") and membership.get("data_group_id"):
+                participant = row(conn, "SELECT data_group_id FROM participants WHERE id = ? AND study_id = ?", (query_row["participant_id"], study_id))
+                if not participant or participant.get("data_group_id") != membership["data_group_id"]:
+                    self.send_error_json("Query is outside your data access group", 403)
+                    return
+            can_respond = (
+                membership_has(membership, "review_data")
+                or membership_has(membership, "manage_study")
+                or query_row.get("assigned_to") == user["id"]
+                or membership_has(membership, "enter_data")
+            )
+            if not can_respond:
+                self.send_error_json("Query response permission required", 403)
                 return
             payload = self.body()
             message = str(payload.get("message", "")).strip()
             if not message:
                 self.send_error_json("Response message is required", 400)
                 return
+            timestamp = now()
             cur = conn.execute(
                 "INSERT INTO query_responses(query_id, user_id, message, created_at) VALUES (?, ?, ?, ?)",
-                (query_id, user["id"], message, now()),
+                (query_id, user["id"], message, timestamp),
             )
+            conn.execute("UPDATE queries SET status = ?, updated_at = ? WHERE id = ?", ("responded", timestamp, query_id))
+            if query_row.get("entry_id"):
+                conn.execute("UPDATE entries SET status = ?, updated_by = ?, updated_at = ? WHERE id = ? AND status NOT IN ('locked', 'frozen')", ("responded", user["id"], timestamp, query_row["entry_id"]))
             after = row(conn, "SELECT * FROM query_responses WHERE id = ?", (cur.lastrowid,))
-            audit(conn, user["id"], "respond", "query", query_id, None, after)
+            audit(conn, user["id"], "respond", "query", query_id, query_row, after, study_id=study_id, **self.audit_context())
+            conn.commit()
             self.send_json({"response": after}, 201)
             return
         self.send_error_json("Unsupported queries operation", 405)
@@ -5936,18 +6065,30 @@ class App(BaseHTTPRequestHandler):
         )
 
     def export_filters_from_query(self, membership, query: dict[str, list[str]] | None = None) -> dict:
+        profile = ((query or {}).get("export_profile") or (query or {}).get("profile") or ["full"])[0].strip().lower()
+        if profile not in {"full", "limited_dataset", "deidentified", "publication_safe", "analysis_ready"}:
+            profile = "full"
         deidentified = membership.get("role") == "analyst"
         if query:
             value = (query.get("deidentified") or query.get("deidentified_export") or [""])[0].strip().lower()
             deidentified = deidentified or value in {"1", "true", "yes", "on"}
+        if profile in {"limited_dataset", "deidentified", "publication_safe"}:
+            deidentified = True
         choice_format = ((query or {}).get("choice_format") or ["raw"])[0].strip().lower()
         if choice_format not in {"raw", "labels", "both"}:
             choice_format = "raw"
-        return {"deidentified": deidentified, "choice_format": choice_format}
+        filters = {"deidentified": deidentified, "choice_format": choice_format, "export_profile": profile}
+        if profile == "analysis_ready":
+            filters["entry_status_group"] = "analysis_ready"
+        return filters
 
     def export_csv(self, conn, study_id: int, membership, query: dict[str, list[str]] | None = None) -> None:
         filters = self.export_filters_from_query(membership, query)
-        filename = "clinical_data_deidentified_export.csv" if filters["deidentified"] else "clinical_data_export.csv"
+        profile = filters.get("export_profile", "full")
+        if profile == "full":
+            filename = "clinical_data_deidentified_export.csv" if filters["deidentified"] else "clinical_data_export.csv"
+        else:
+            filename = f"clinical_data_{profile}_export.csv"
         return self.export_entries_csv(conn, study_id, membership, filters, filename)
 
     def record_payload(self, conn, study_id: int, membership, filters: dict) -> list[dict]:
@@ -5961,6 +6102,8 @@ class App(BaseHTTPRequestHandler):
         if filters.get("entry_status"):
             where.append("entries.status = ?")
             params.append(filters["entry_status"])
+        if filters.get("entry_status_group") == "analysis_ready":
+            where.append("entries.status IN ('complete', 'reviewed', 'locked', 'frozen')")
         if filters.get("event_id"):
             where.append("entries.event_id = ?")
             params.append(int(filters["event_id"]))
@@ -6008,6 +6151,8 @@ class App(BaseHTTPRequestHandler):
                 field_code = field.get("code", "")
                 if not field_code:
                     continue
+                if filters.get("export_profile") == "publication_safe" and omit_field_from_publication_safe_export(field):
+                    continue
                 if deidentified and omit_field_from_deidentified_export(field):
                     continue
                 code = f"{form_code}__{field_code}"
@@ -6040,6 +6185,7 @@ class App(BaseHTTPRequestHandler):
         self.send_header("content-type", "text/csv; charset=utf-8")
         self.send_header("content-disposition", f"attachment; filename={filename}")
         self.send_header("x-cds-deidentified-export", "1" if filters.get("deidentified") or membership.get("role") == "analyst" else "0")
+        self.send_header("x-cds-export-profile", str(filters.get("export_profile") or "full"))
         self.send_header("content-length", str(len(content)))
         self.end_headers()
         self.wfile.write(content)

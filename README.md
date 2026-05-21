@@ -80,6 +80,7 @@ Implemented foundation:
 - REDCap-style token API for project, metadata, instruments, events, records, and randomization
 - REDCap-style user-rights, data access group, arm, and API-version exports
 - API token usage audit entries and token revoke workflow
+- Read-only ChatGPT MCP connector for de-identified study summaries, CRF dictionaries, missing data summaries, publication suggestions, and CV items
 - ODM-like XML project export
 - R, SAS, SPSS, and Stata import package exports
 - Simple allocation randomization module
@@ -118,6 +119,8 @@ $env:OPENAI_API_KEY = "your_api_key"
 Do not send patient identifiers or PHI to external AI unless your study policy and data agreement allow it. AI drafts must be reviewed before use.
 
 For case-report and case-series AI review with images/audio, see [docs/OPENAI_ACADEMIC_AI.md](docs/OPENAI_ACADEMIC_AI.md). For the practical ChatGPT/OpenAI connection steps, see [docs/OPENAI_CHATGPT_SETUP.md](docs/OPENAI_CHATGPT_SETUP.md). A ChatGPT subscription does not automatically give this local app API access; configure an OpenAI API key on the study computer or Lightsail server.
+
+For a no-OpenAI-API-cost ChatGPT Plus workflow, use the read-only MCP connector. It lets ChatGPT query de-identified CDS summaries through `/mcp` without exposing raw patient records, files, or write actions. See [docs/MCP_CONNECTOR_SETUP.md](docs/MCP_CONNECTOR_SETUP.md).
 
 ## Case Reports And Case Series
 

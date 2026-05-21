@@ -9,6 +9,7 @@ const state = {
   groups: [],
   studyMembers: [],
   apiTokens: [],
+  mcpTokens: { tokens: [], audit: [], enabled: false, scopes: [], tools: [] },
   randomization: { lists: [], allocations: [] },
   events: [],
   formEvents: [],
@@ -141,7 +142,7 @@ async function loadStudy() {
   const manageUsers = can("manage_users");
   const viewAnalysis = can("view_analysis") || can("review_data");
   const readinessAllowed = can("manage_study") || can("review_data") || can("view_analysis");
-  const [forms, events, formEvents, surveyLinks, invitations, reports, academic, caseIntake, backups, participants, entries, queries, quality, analysis, assistantSummary, readiness, audit, groups, studyMembers, apiTokens, randomization, users, adminStatus, adminLogs, adminBackups] = await Promise.all([
+  const [forms, events, formEvents, surveyLinks, invitations, reports, academic, caseIntake, backups, participants, entries, queries, quality, analysis, assistantSummary, readiness, audit, groups, studyMembers, apiTokens, mcpTokens, randomization, users, adminStatus, adminLogs, adminBackups] = await Promise.all([
     api(`/api/studies/${state.studyId}/forms`),
     api(`/api/studies/${state.studyId}/events`),
     api(`/api/studies/${state.studyId}/form-events`),
@@ -162,6 +163,7 @@ async function loadStudy() {
     api(`/api/studies/${state.studyId}/groups`),
     manageUsers ? api(`/api/studies/${state.studyId}/memberships`) : Promise.resolve({ memberships: [] }),
     manageUsers ? api(`/api/studies/${state.studyId}/api-tokens`) : Promise.resolve({ tokens: [] }),
+    manageUsers ? api(`/api/studies/${state.studyId}/mcp-tokens`) : Promise.resolve({ tokens: [], audit: [], enabled: false, scopes: [], tools: [] }),
     can("manage_study") || can("review_data") ? api(`/api/studies/${state.studyId}/randomization`) : Promise.resolve({ lists: [], allocations: [] }),
     isSuperAdmin() ? api("/api/users") : Promise.resolve({ users: [] }),
     isSuperAdmin() ? api("/api/admin/status") : Promise.resolve(null),
@@ -191,6 +193,7 @@ async function loadStudy() {
   state.groups = groups.groups;
   state.studyMembers = studyMembers.memberships;
   state.apiTokens = apiTokens.tokens;
+  state.mcpTokens = mcpTokens;
   state.randomization = randomization;
   state.users = users.users;
   state.adminStatus = adminStatus;
@@ -1718,6 +1721,7 @@ function accessView() {
   const roleOptions = ["project_admin", "pi", "data_entry", "reviewer", "analyst", "viewer"];
   const globalRoleOptions = ["super_admin", "data_entry", "reviewer", "analyst", "viewer"];
   const scopeOptions = ["metadata:read", "records:read", "records:write", "export:read", "randomization:write", "ai:use"];
+  const mcpScopeOptions = state.mcpTokens?.scopes?.length ? state.mcpTokens.scopes : ["mcp:studies:read", "mcp:crf:read", "mcp:summary:read", "mcp:missing-data:read", "mcp:dataset-summary:read", "mcp:publication:read", "mcp:cv:read", "mcp:audit-summary:read"];
   return `
     <section class="grid two">
       <section class="panel">
@@ -1824,6 +1828,66 @@ function accessView() {
         </table>
       </div>
     </section>
+    <section class="panel">
+      <h2>MCP / ChatGPT Connector</h2>
+      <div class="notice ${state.mcpTokens?.enabled ? "" : "warn"}">
+        MCP is ${state.mcpTokens?.enabled ? "enabled" : "disabled"}. It is read-only and de-identified by default. Do not enable PHI or file access.
+      </div>
+      <form id="mcp-token-form" class="form-grid">
+        <label>Token display name<input name="display_name" required placeholder="ChatGPT study summary connector" /></label>
+        <label>Expires in days<input name="expires_in_days" type="number" min="1" max="365" value="30" /></label>
+        <label>Rate limit per hour<input name="rate_limit_per_hour" type="number" min="10" max="1000" value="100" /></label>
+        <label class="full">Allowed studies
+          <select name="allowed_study_ids" multiple size="4">
+            ${state.studies.map((study) => `<option value="${study.id}" ${study.id === state.studyId ? "selected" : ""}>${escapeHtml(study.name || study.protocol_id || study.id)}</option>`).join("")}
+          </select>
+        </label>
+        <label class="full">Read-only scopes
+          <select name="scopes" multiple size="8">
+            ${mcpScopeOptions.map((scope) => `<option value="${scope}" selected>${escapeHtml(scope)}</option>`).join("")}
+          </select>
+        </label>
+        <div class="full"><button>Create MCP Token</button></div>
+      </form>
+      <p class="small">Use HTTPS URL <code>/mcp</code> in ChatGPT connector developer mode. The raw token is shown only once.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Name</th><th>Studies</th><th>Scopes</th><th>Expires</th><th>Last Used</th><th>Calls</th><th>PHI Blocks</th><th></th></tr></thead>
+          <tbody>
+            ${(state.mcpTokens?.tokens || []).map((item) => `
+              <tr>
+                <td>${escapeHtml(item.display_name)}</td>
+                <td><span class="small">${escapeHtml((item.allowed_study_ids || []).join(", "))}</span></td>
+                <td><span class="small">${escapeHtml((item.scopes || []).join(", "))}</span></td>
+                <td>${fmtTime(item.expires_at)}</td>
+                <td>${fmtTime(item.last_used_at)}</td>
+                <td>${item.call_count || 0}</td>
+                <td>${item.blocked_phi_attempts || 0}</td>
+                <td>${item.revoked_at ? "Revoked" : `<button class="secondary" data-revoke-mcp-token="${item.id}">Revoke</button>`}</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      </div>
+      <h3>Recent MCP Calls</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Time</th><th>Token</th><th>Tool</th><th>Status</th><th>PHI Blocked</th><th>Error</th></tr></thead>
+          <tbody>
+            ${(state.mcpTokens?.audit || []).slice(0, 25).map((item) => `
+              <tr>
+                <td>${fmtTime(item.created_at)}</td>
+                <td>${escapeHtml(item.token_display_name || "")}</td>
+                <td>${escapeHtml(item.tool_name || "")}</td>
+                <td>${escapeHtml(item.response_status || "")}</td>
+                <td>${item.phi_blocked ? "Yes" : "No"}</td>
+                <td><span class="small">${escapeHtml(item.error_message || "")}</span></td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      </div>
+    </section>
   `;
 }
 
@@ -1857,6 +1921,11 @@ function settingsView() {
         <div><span class="small">Studies</span><strong>${counts.studies ?? ""}</strong></div>
         <div><span class="small">Failed logins 7d</span><strong>${counts.recent_failed_logins ?? ""}</strong></div>
         <div><span class="small">Exports 7d</span><strong>${counts.recent_exports ?? ""}</strong></div>
+        <div><span class="small">MCP</span><strong>${health?.mcp?.enabled ? "Enabled" : "Disabled"}</strong></div>
+        <div><span class="small">MCP endpoint</span><strong>${escapeHtml(health?.mcp?.endpoint || "/mcp")}</strong></div>
+        <div><span class="small">MCP active tokens</span><strong>${counts.mcp_tokens_active ?? ""}</strong></div>
+        <div><span class="small">MCP calls 24h</span><strong>${counts.mcp_calls_last_24h ?? ""}</strong></div>
+        <div><span class="small">MCP PHI blocks 24h</span><strong>${counts.mcp_blocked_phi_last_24h ?? ""}</strong></div>
       </div>
       <div class="notice">${escapeHtml(health?.backup?.off_server_reminder || "Download one encrypted full backup weekly.")}</div>
       <div class="split-actions">
@@ -1958,6 +2027,8 @@ function bindRoute() {
   document.querySelector("#membership-form")?.addEventListener("submit", submitMembership);
   document.querySelector("#api-token-form")?.addEventListener("submit", submitApiToken);
   document.querySelectorAll("[data-revoke-token]").forEach((button) => button.addEventListener("click", () => revokeApiToken(button.dataset.revokeToken)));
+  document.querySelector("#mcp-token-form")?.addEventListener("submit", submitMcpToken);
+  document.querySelectorAll("[data-revoke-mcp-token]").forEach((button) => button.addEventListener("click", () => revokeMcpToken(button.dataset.revokeMcpToken)));
   document.querySelector("#event-form")?.addEventListener("submit", submitEvent);
   document.querySelector("#form-event-form")?.addEventListener("submit", submitFormEvent);
   document.querySelector("#randomization-list-form")?.addEventListener("submit", submitRandomizationList);
@@ -2235,6 +2306,45 @@ async function revokeApiToken(tokenId) {
     await api(`/api/studies/${state.studyId}/api-tokens/${tokenId}`, {
       method: "PATCH",
       body: JSON.stringify({ active: false }),
+    });
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function submitMcpToken(event) {
+  event.preventDefault();
+  const formData = new FormData(event.target);
+  const data = Object.fromEntries(formData);
+  try {
+    const result = await api(`/api/studies/${state.studyId}/mcp-tokens`, {
+      method: "POST",
+      body: JSON.stringify({
+        display_name: data.display_name,
+        expires_in_days: Number(data.expires_in_days || 30),
+        rate_limit_per_hour: Number(data.rate_limit_per_hour || 100),
+        allowed_study_ids: formData.getAll("allowed_study_ids").map(Number),
+        scopes: formData.getAll("scopes"),
+      }),
+    });
+    alert(`MCP token. Store it now, it will not be shown again:\\n${result.token}`);
+    await loadStudy();
+    render();
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
+}
+
+async function revokeMcpToken(tokenId) {
+  if (!confirm("Revoke this MCP token? ChatGPT connector access will stop.")) return;
+  try {
+    await api(`/api/studies/${state.studyId}/mcp-tokens/${tokenId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ revoked: true }),
     });
     await loadStudy();
     render();

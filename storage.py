@@ -32,6 +32,8 @@ INSERT_ID_TABLES = {
     "case_ai_reviews",
     "ai_audit",
     "api_tokens",
+    "mcp_tokens",
+    "mcp_audit",
     "randomization_lists",
     "randomization_allocations",
 }
@@ -501,6 +503,42 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     created_at BIGINT NOT NULL,
     last_used_at BIGINT
 );
+CREATE TABLE IF NOT EXISTS mcp_tokens (
+    id BIGSERIAL PRIMARY KEY,
+    token_digest TEXT UNIQUE NOT NULL,
+    display_name TEXT NOT NULL,
+    created_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    created_at BIGINT NOT NULL,
+    expires_at BIGINT NOT NULL,
+    revoked_at BIGINT,
+    last_used_at BIGINT,
+    allowed_study_ids_json TEXT NOT NULL DEFAULT '[]',
+    scopes_json TEXT NOT NULL DEFAULT '[]',
+    read_only INTEGER NOT NULL DEFAULT 1,
+    deidentified_only INTEGER NOT NULL DEFAULT 1,
+    allow_phi INTEGER NOT NULL DEFAULT 0,
+    allow_files INTEGER NOT NULL DEFAULT 0,
+    rate_limit_per_hour INTEGER NOT NULL DEFAULT 100,
+    metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS mcp_audit (
+    id BIGSERIAL PRIMARY KEY,
+    token_id BIGINT REFERENCES mcp_tokens(id) ON DELETE SET NULL,
+    token_display_name TEXT NOT NULL DEFAULT '',
+    user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    study_id BIGINT REFERENCES studies(id) ON DELETE SET NULL,
+    tool_name TEXT NOT NULL DEFAULT '',
+    scopes_checked TEXT NOT NULL DEFAULT '[]',
+    request_params_json TEXT NOT NULL DEFAULT '{}',
+    response_status TEXT NOT NULL DEFAULT '',
+    phi_blocked INTEGER NOT NULL DEFAULT 0,
+    records_count INTEGER NOT NULL DEFAULT 0,
+    aggregate_count INTEGER NOT NULL DEFAULT 0,
+    ip_address TEXT NOT NULL DEFAULT '',
+    user_agent TEXT NOT NULL DEFAULT '',
+    error_message TEXT NOT NULL DEFAULT '',
+    created_at BIGINT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS randomization_lists (
     id BIGSERIAL PRIMARY KEY,
     study_id BIGINT NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
@@ -546,6 +584,10 @@ CREATE INDEX IF NOT EXISTS idx_ai_audit_study_id ON ai_audit(study_id);
 CREATE INDEX IF NOT EXISTS idx_ai_audit_user_id ON ai_audit(user_id);
 CREATE INDEX IF NOT EXISTS idx_api_tokens_study_id ON api_tokens(study_id);
 CREATE INDEX IF NOT EXISTS idx_api_tokens_token_hash ON api_tokens(token_hash);
+CREATE INDEX IF NOT EXISTS idx_mcp_tokens_token_digest ON mcp_tokens(token_digest);
+CREATE INDEX IF NOT EXISTS idx_mcp_audit_token_id ON mcp_audit(token_id);
+CREATE INDEX IF NOT EXISTS idx_mcp_audit_study_id ON mcp_audit(study_id);
+CREATE INDEX IF NOT EXISTS idx_mcp_audit_created_at ON mcp_audit(created_at);
 """
 
 

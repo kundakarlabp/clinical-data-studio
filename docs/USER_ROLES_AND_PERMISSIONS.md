@@ -48,4 +48,5 @@ Use data groups when different sites should see only their own participants. Ass
 - Analysts can view analysis and export de-identified data, but cannot edit clinical records.
 - Reviewers can review records, queries, and AI audit events, but should not create users.
 - Project Admin / PI users can run AI helpers for the assigned project, but external AI remains blocked unless the server owner enables it.
+- Only admins or PI/project-admin users with user-management permission should create MCP connector tokens. MCP tokens are read-only, study-scoped, expiring, and should be revoked when no longer needed.
 - Use one named account per person. Shared accounts make the audit trail unreliable.

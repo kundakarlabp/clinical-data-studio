@@ -12,6 +12,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import server
+from mcp.rate_limit import RATE_BUCKETS
 
 
 HTTP_TIMEOUT = 30
@@ -25,11 +26,14 @@ class ApiSmokeTests(unittest.TestCase):
         self.original_uploads = server.UPLOADS
         self.original_db = server.DB_PATH
         self.original_backend = server.DATABASE_BACKEND
+        self.original_mcp_enabled = server.MCP_ENABLED
         server.DATA = Path(self.tmp.name)
         server.BACKUPS = server.DATA / "backups"
         server.UPLOADS = server.DATA / "uploads"
         server.DB_PATH = server.DATA / "smoke.sqlite3"
         server.DATABASE_BACKEND = "sqlite"
+        server.MCP_ENABLED = False
+        RATE_BUCKETS.clear()
         server.migrate()
         with closing(server.db()) as conn, conn:
             conn.execute("UPDATE users SET must_change_password = 0 WHERE username = 'admin'")
@@ -47,6 +51,8 @@ class ApiSmokeTests(unittest.TestCase):
         server.UPLOADS = self.original_uploads
         server.DB_PATH = self.original_db
         server.DATABASE_BACKEND = self.original_backend
+        server.MCP_ENABLED = self.original_mcp_enabled
+        RATE_BUCKETS.clear()
         self.tmp.cleanup()
 
     def request_json(self, path, method="GET", payload=None, token=None):
@@ -118,6 +124,38 @@ class ApiSmokeTests(unittest.TestCase):
         request = Request(f"{self.base_url}{path}")
         with urlopen(request, timeout=HTTP_TIMEOUT) as response:
             return response.headers
+
+    def mcp_rpc(self, method, token=None, params=None, request_id=1):
+        payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}}
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        request = Request(f"{self.base_url}/mcp", data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+        with urlopen(request, timeout=HTTP_TIMEOUT) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+
+    def create_mcp_token(self, scopes=None, allowed_study_ids=None, expires_in_days=30, rate_limit_per_hour=100):
+        cookie = self.login_session()
+        login = self.request_json("/api/me", token=cookie)
+        study_id = self.request_json("/api/studies", token=cookie)["studies"][0]["id"]
+        payload = {
+            "display_name": "ChatGPT test connector",
+            "allowed_study_ids": allowed_study_ids or [study_id],
+            "scopes": scopes or [
+                "mcp:studies:read",
+                "mcp:crf:read",
+                "mcp:summary:read",
+                "mcp:missing-data:read",
+                "mcp:dataset-summary:read",
+                "mcp:publication:read",
+                "mcp:cv:read",
+                "mcp:audit-summary:read",
+            ],
+            "expires_in_days": expires_in_days,
+            "rate_limit_per_hour": rate_limit_per_hour,
+        }
+        result = self.request_json(f"/api/studies/{study_id}/mcp-tokens", "POST", payload, cookie)
+        return cookie, login["user"], study_id, result
 
     def test_health_login_summary_and_encrypted_backup(self):
         health = self.request_json("/api/health")
@@ -954,6 +992,130 @@ class ApiSmokeTests(unittest.TestCase):
             denied.close()
         else:
             self.fail("Revoked token should be rejected")
+
+    def test_mcp_disabled_valid_token_and_read_only_tools(self):
+        cookie, _user, study_id, result = self.create_mcp_token()
+        raw_token = result["token"]
+        self.assertTrue(raw_token.startswith("cds_mcp_"))
+        listed = self.request_json(f"/api/studies/{study_id}/mcp-tokens", token=cookie)
+        self.assertNotIn(raw_token, json.dumps(listed))
+        self.assertTrue(listed["tokens"])
+        self.assertEqual(listed["tokens"][0]["id"], result["record"]["id"])
+        self.assertNotIn("token_digest", listed["tokens"][0])
+        with self.assertRaises(HTTPError) as context:
+            self.mcp_rpc("tools/list", raw_token)
+        self.assertEqual(context.exception.code, 403)
+        context.exception.close()
+
+        server.MCP_ENABLED = True
+        status, payload = self.mcp_rpc("tools/list", raw_token)
+        self.assertEqual(status, 200)
+        tool_names = {tool["name"] for tool in payload["result"]["tools"]}
+        self.assertEqual(
+            tool_names,
+            {
+                "search_studies",
+                "get_study_summary",
+                "get_crf_dictionary",
+                "get_missing_data_summary",
+                "get_deidentified_dataset_summary",
+                "get_publication_opportunities",
+                "get_cv_items",
+                "get_ai_audit_summary",
+            },
+        )
+        self.assertFalse(any(name.startswith(("create_", "update_", "delete_", "edit_")) for name in tool_names))
+        status, result_payload = self.mcp_rpc("tools/call", raw_token, {"name": "search_studies", "arguments": {}})
+        self.assertEqual(status, 200)
+        studies = result_payload["result"]["structuredContent"]["studies"]
+        self.assertEqual([item["study_id"] for item in studies], [study_id])
+        with closing(server.db()) as conn:
+            audit_count = server.row(conn, "SELECT COUNT(*) AS count FROM mcp_audit WHERE tool_name = 'search_studies' AND response_status = 'ok'")["count"]
+        self.assertGreaterEqual(audit_count, 1)
+
+    def test_mcp_token_scope_expiry_revocation_and_study_scope(self):
+        cookie, _user, study_id, result = self.create_mcp_token(scopes=["mcp:studies:read"])
+        server.MCP_ENABLED = True
+        raw_token = result["token"]
+        with self.assertRaises(HTTPError) as context:
+            self.mcp_rpc("tools/call", raw_token, {"name": "get_study_summary", "arguments": {"study_id": study_id}})
+        self.assertEqual(context.exception.code, 403)
+        context.exception.close()
+        with self.assertRaises(HTTPError) as context:
+            self.mcp_rpc("tools/call", raw_token, {"name": "get_raw_patient_records", "arguments": {"study_id": study_id}})
+        self.assertEqual(context.exception.code, 403)
+        context.exception.close()
+        with self.assertRaises(HTTPError) as context:
+            self.mcp_rpc("tools/call", raw_token, {"name": "download_uploaded_file", "arguments": {"study_id": study_id, "file_id": 1}})
+        self.assertEqual(context.exception.code, 403)
+        context.exception.close()
+        with self.assertRaises(HTTPError) as context:
+            self.mcp_rpc("tools/call", raw_token, {"name": "search_studies", "arguments": {"study_id": study_id + 999}})
+        self.assertEqual(context.exception.code, 403)
+        context.exception.close()
+
+        revoked = self.request_json(f"/api/studies/{study_id}/mcp-tokens/{result['record']['id']}", "PATCH", {"revoked": True}, cookie)["token"]
+        self.assertTrue(revoked["revoked_at"])
+        with closing(server.db()) as conn, conn:
+            conn.execute("UPDATE mcp_tokens SET revoked_at = ? WHERE id = ?", (server.now(), result["record"]["id"]))
+        with self.assertRaises(HTTPError) as context:
+            self.mcp_rpc("tools/list", raw_token)
+        self.assertEqual(context.exception.code, 403)
+        context.exception.close()
+
+        _cookie2, _user2, _study_id2, expired = self.create_mcp_token()
+        with closing(server.db()) as conn, conn:
+            conn.execute("UPDATE mcp_tokens SET expires_at = ? WHERE id = ?", (server.now() - 1, expired["record"]["id"]))
+        with self.assertRaises(HTTPError) as context:
+            self.mcp_rpc("tools/list", expired["token"])
+        self.assertEqual(context.exception.code, 403)
+        context.exception.close()
+
+    def test_mcp_summaries_are_deidentified_and_phi_guard_blocks(self):
+        cookie, _user, study_id, result = self.create_mcp_token()
+        server.MCP_ENABLED = True
+        raw_token = result["token"]
+        participant = self.request_json(
+            f"/api/studies/{study_id}/participants",
+            "POST",
+            {"study_uid": "MCP001", "initials": "AA", "status": "enrolled"},
+            cookie,
+        )["participant"]
+        self.assertEqual(participant["study_uid"], "MCP001")
+        status, dictionary = self.mcp_rpc("tools/call", raw_token, {"name": "get_crf_dictionary", "arguments": {"study_id": study_id}})
+        self.assertEqual(status, 200)
+        dictionary_text = json.dumps(dictionary)
+        self.assertIn("fields", dictionary_text)
+        self.assertNotIn("MCP001", dictionary_text)
+        status, missing = self.mcp_rpc("tools/call", raw_token, {"name": "get_missing_data_summary", "arguments": {"study_id": study_id}})
+        self.assertEqual(status, 200)
+        self.assertIn("missing", missing["result"]["structuredContent"])
+        status, summary = self.mcp_rpc("tools/call", raw_token, {"name": "get_deidentified_dataset_summary", "arguments": {"study_id": study_id}})
+        self.assertEqual(status, 200)
+        text = json.dumps(summary)
+        self.assertNotIn("MCP001", text)
+        self.assertNotIn("AA", text)
+
+        with closing(server.db()) as conn, conn:
+            conn.execute("UPDATE studies SET name = ? WHERE id = ?", ("Patient name: John Doe phone 9876543210", study_id))
+        with self.assertRaises(HTTPError) as context:
+            self.mcp_rpc("tools/call", raw_token, {"name": "search_studies", "arguments": {}})
+        self.assertEqual(context.exception.code, 400)
+        context.exception.close()
+        with closing(server.db()) as conn:
+            blocked = server.row(conn, "SELECT COUNT(*) AS count FROM mcp_audit WHERE phi_blocked = 1")["count"]
+        self.assertGreaterEqual(blocked, 1)
+
+    def test_mcp_rate_limit(self):
+        _cookie, _user, _study_id, result = self.create_mcp_token(rate_limit_per_hour=1)
+        server.MCP_ENABLED = True
+        RATE_BUCKETS.clear()
+        raw_token = result["token"]
+        self.mcp_rpc("tools/call", raw_token, {"name": "search_studies", "arguments": {}})
+        with self.assertRaises(HTTPError) as context:
+            self.mcp_rpc("tools/call", raw_token, {"name": "search_studies", "arguments": {}})
+        self.assertEqual(context.exception.code, 403)
+        context.exception.close()
 
     def test_rbac_and_api_token_scope_enforcement(self):
         admin_token = self.login_session()

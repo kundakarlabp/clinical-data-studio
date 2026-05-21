@@ -33,6 +33,8 @@ from xml.etree import ElementTree
 from ai.safety import ai_status_payload, assert_external_ai_safe as assert_ai_text_safe, deidentify_for_ai as deidentify_text_for_ai, phi_findings as detect_phi_findings
 from authz import PROJECT_ADMIN_ROLES, ROLE_PERMISSIONS, SYSTEM_ADMIN_ROLES, can as authz_can, is_super_admin as authz_is_super_admin, membership_has as authz_membership_has, role_has as authz_role_has, safe_role as authz_safe_role
 from config import load_settings
+from mcp.server import handle_mcp_http
+from services.mcp_service import MCP_SCOPES, MCP_TOOLS, McpService
 from storage import connect_database, migrate_postgres
 
 ROOT = Path(__file__).resolve().parent
@@ -76,6 +78,7 @@ API_TOKEN_SCOPES = {
     "ai:use",
 }
 DEFAULT_API_TOKEN_SCOPES = sorted(API_TOKEN_SCOPES)
+MCP_ENABLED = os.environ.get("CDS_MCP_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 ACADEMIC_OUTPUT_TYPES = {
     "publication_idea",
     "abstract_draft",
@@ -322,6 +325,11 @@ def safe_role(role: str) -> str:
 def parse_token_scopes(value: str | None) -> set[str]:
     scopes = set(load_json(value, []))
     return {scope for scope in scopes if scope in API_TOKEN_SCOPES}
+
+
+def parse_mcp_scopes(value: str | None) -> set[str]:
+    scopes = set(load_json(value, []))
+    return {scope for scope in scopes if scope in MCP_SCOPES}
 
 
 def token_has_scope(token_row: dict, scope: str) -> bool:
@@ -734,6 +742,9 @@ def system_counts() -> dict:
                 "studies": row(conn, "SELECT COUNT(*) AS count FROM studies")["count"],
                 "recent_failed_logins": row(conn, "SELECT COUNT(*) AS count FROM audit_log WHERE action = 'failed_login' AND created_at >= ?", (now() - 7 * 86400,))["count"],
                 "recent_exports": row(conn, "SELECT COUNT(*) AS count FROM audit_log WHERE action = 'export' AND created_at >= ?", (now() - 7 * 86400,))["count"],
+                "mcp_tokens_active": row(conn, "SELECT COUNT(*) AS count FROM mcp_tokens WHERE revoked_at IS NULL AND expires_at > ?", (now(),))["count"],
+                "mcp_calls_last_24h": row(conn, "SELECT COUNT(*) AS count FROM mcp_audit WHERE created_at >= ?", (now() - 86400,))["count"],
+                "mcp_blocked_phi_last_24h": row(conn, "SELECT COUNT(*) AS count FROM mcp_audit WHERE phi_blocked = 1 AND created_at >= ?", (now() - 86400,))["count"],
             }
     except Exception as exc:
         return {"error": str(exc)}
@@ -802,6 +813,14 @@ def health_payload(request_host: str = "", request_scheme: str = "") -> dict:
         "ai": ai_status(),
         "disk": {"total": disk.total, "used": disk.used, "free": disk.free},
         "counts": system_counts(),
+        "mcp": {
+            "enabled": MCP_ENABLED,
+            "endpoint": "/mcp",
+            "transport": "streamable-http",
+            "read_only": True,
+            "scopes": sorted(MCP_SCOPES),
+            "tools": sorted(MCP_TOOLS),
+        },
         "backup": {
             "directory": str(BACKUPS),
             "directory_exists": BACKUPS.exists(),
@@ -1053,6 +1072,8 @@ STUDY_AUDIT_FILTER = """
     OR (audit_log.entity_type = 'data_group' AND audit_log.entity_id IN (SELECT id FROM data_groups WHERE study_id = ?))
     OR (audit_log.entity_type = 'membership' AND audit_log.entity_id IN (SELECT id FROM study_memberships WHERE study_id = ?))
     OR (audit_log.entity_type = 'api_token' AND audit_log.entity_id IN (SELECT id FROM api_tokens WHERE study_id = ?))
+    OR (audit_log.entity_type = 'mcp_token' AND audit_log.entity_id IN (SELECT id FROM mcp_tokens WHERE allowed_study_ids_json LIKE '%' || CAST(? AS TEXT) || '%'))
+    OR (audit_log.entity_type = 'mcp_audit' AND audit_log.entity_id IN (SELECT id FROM mcp_audit WHERE study_id = ?))
     OR (audit_log.entity_type = 'randomization_list' AND audit_log.entity_id IN (SELECT id FROM randomization_lists WHERE study_id = ?))
     OR (audit_log.entity_type = 'randomization' AND audit_log.entity_id IN (SELECT id FROM randomization_allocations WHERE study_id = ?))
     OR (audit_log.entity_type = 'survey_link' AND audit_log.entity_id IN (SELECT id FROM survey_links WHERE study_id = ?))
@@ -1093,11 +1114,62 @@ def audit_filters(study_id: int, query: dict[str, list[str]] | None = None) -> t
     return " AND ".join(f"({item})" for item in where), tuple(params)
 
 
+def ensure_mcp_tables(conn: sqlite3.Connection) -> None:
+    postgres = getattr(conn, "backend", "sqlite") == "postgres"
+    id_type = "BIGSERIAL PRIMARY KEY" if postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    bigint = "BIGINT" if postgres else "INTEGER"
+    conn.executescript(
+        f"""
+        CREATE TABLE IF NOT EXISTS mcp_tokens (
+            id {id_type},
+            token_digest TEXT UNIQUE NOT NULL,
+            display_name TEXT NOT NULL,
+            created_by {bigint} REFERENCES users(id) ON DELETE SET NULL,
+            created_at {bigint} NOT NULL,
+            expires_at {bigint} NOT NULL,
+            revoked_at {bigint},
+            last_used_at {bigint},
+            allowed_study_ids_json TEXT NOT NULL DEFAULT '[]',
+            scopes_json TEXT NOT NULL DEFAULT '[]',
+            read_only INTEGER NOT NULL DEFAULT 1,
+            deidentified_only INTEGER NOT NULL DEFAULT 1,
+            allow_phi INTEGER NOT NULL DEFAULT 0,
+            allow_files INTEGER NOT NULL DEFAULT 0,
+            rate_limit_per_hour INTEGER NOT NULL DEFAULT 100,
+            metadata_json TEXT NOT NULL DEFAULT '{{}}'
+        );
+        CREATE TABLE IF NOT EXISTS mcp_audit (
+            id {id_type},
+            token_id {bigint} REFERENCES mcp_tokens(id) ON DELETE SET NULL,
+            token_display_name TEXT NOT NULL DEFAULT '',
+            user_id {bigint} REFERENCES users(id) ON DELETE SET NULL,
+            study_id {bigint} REFERENCES studies(id) ON DELETE SET NULL,
+            tool_name TEXT NOT NULL DEFAULT '',
+            scopes_checked TEXT NOT NULL DEFAULT '[]',
+            request_params_json TEXT NOT NULL DEFAULT '{{}}',
+            response_status TEXT NOT NULL DEFAULT '',
+            phi_blocked INTEGER NOT NULL DEFAULT 0,
+            records_count INTEGER NOT NULL DEFAULT 0,
+            aggregate_count INTEGER NOT NULL DEFAULT 0,
+            ip_address TEXT NOT NULL DEFAULT '',
+            user_agent TEXT NOT NULL DEFAULT '',
+            error_message TEXT NOT NULL DEFAULT '',
+            created_at {bigint} NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mcp_tokens_token_digest ON mcp_tokens(token_digest);
+        CREATE INDEX IF NOT EXISTS idx_mcp_audit_token_id ON mcp_audit(token_id);
+        CREATE INDEX IF NOT EXISTS idx_mcp_audit_study_id ON mcp_audit(study_id);
+        CREATE INDEX IF NOT EXISTS idx_mcp_audit_created_at ON mcp_audit(created_at);
+        """
+    )
+
+
 def migrate() -> None:
     with closing(db()) as conn, conn:
         if getattr(conn, "backend", "sqlite") == "postgres":
             migrate_postgres(conn)
             add_column(conn, "api_tokens", "scopes_json", "TEXT NOT NULL DEFAULT '[]'")
+            ensure_mcp_tables(conn)
             add_column(conn, "audit_log", "study_id", "BIGINT")
             add_column(conn, "audit_log", "ip_address", "TEXT NOT NULL DEFAULT ''")
             add_column(conn, "audit_log", "user_agent", "TEXT NOT NULL DEFAULT ''")
@@ -1515,6 +1587,7 @@ def migrate() -> None:
         add_column(conn, "users", "failed_login_count", "INTEGER NOT NULL DEFAULT 0")
         add_column(conn, "users", "locked_until", "INTEGER NOT NULL DEFAULT 0")
         add_column(conn, "api_tokens", "scopes_json", "TEXT NOT NULL DEFAULT '[]'")
+        ensure_mcp_tables(conn)
         add_column(conn, "audit_log", "study_id", "INTEGER")
         add_column(conn, "audit_log", "ip_address", "TEXT NOT NULL DEFAULT ''")
         add_column(conn, "audit_log", "user_agent", "TEXT NOT NULL DEFAULT ''")
@@ -1582,6 +1655,10 @@ def add_production_indexes(conn) -> None:
         "CREATE INDEX IF NOT EXISTS idx_ai_audit_user_id ON ai_audit(user_id)",
         "CREATE INDEX IF NOT EXISTS idx_api_tokens_study_id ON api_tokens(study_id)",
         "CREATE INDEX IF NOT EXISTS idx_api_tokens_token_hash ON api_tokens(token_hash)",
+        "CREATE INDEX IF NOT EXISTS idx_mcp_tokens_token_digest ON mcp_tokens(token_digest)",
+        "CREATE INDEX IF NOT EXISTS idx_mcp_audit_token_id ON mcp_audit(token_id)",
+        "CREATE INDEX IF NOT EXISTS idx_mcp_audit_study_id ON mcp_audit(study_id)",
+        "CREATE INDEX IF NOT EXISTS idx_mcp_audit_created_at ON mcp_audit(created_at)",
     ]
     for statement in statements:
         conn.execute(statement)
@@ -2780,6 +2857,8 @@ class App(BaseHTTPRequestHandler):
         if parsed.path == "/healthz":
             payload = health_payload(self.headers.get("host", ""), self.headers.get("x-forwarded-proto", "https" if self.request_is_https() else "http"))
             self.send_json(payload, 200 if payload["ok"] else 503)
+        elif parsed.path == "/mcp":
+            self.handle_api("GET", parsed.path, parse_qs(parsed.query))
         elif parsed.path.startswith("/api/"):
             self.handle_api("GET", parsed.path, parse_qs(parsed.query))
         else:
@@ -2960,6 +3039,8 @@ class App(BaseHTTPRequestHandler):
     def handle_api(self, method: str, path: str, query: dict[str, list[str]]) -> None:
         try:
             with closing(db()) as conn, conn:
+                if path == "/mcp":
+                    return handle_mcp_http(self, conn, McpService(MCP_ENABLED), method)
                 if path == "/api/login" and method == "POST":
                     return self.login(conn)
                 if path == "/api/logout" and method == "POST":
@@ -3028,7 +3109,7 @@ class App(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             self.send_error_json("Invalid JSON body", 400)
         except Exception as exc:
-            self.send_error_json(f"Server error: {exc}", 500)
+            self.send_error_json("Server error", 500)
 
     def login(self, conn: sqlite3.Connection) -> None:
         payload = self.body()
@@ -4043,6 +4124,11 @@ class App(BaseHTTPRequestHandler):
                 self.send_error_json("User management permission required", 403)
                 return
             return self.api_tokens(conn, user, method, study_id, parts)
+        if resource == "mcp-tokens":
+            if not membership_has(membership, "manage_users"):
+                self.send_error_json("User management permission required", 403)
+                return
+            return self.mcp_tokens(conn, user, method, study_id, parts)
         if resource == "randomization":
             if method != "GET" and not membership_has(membership, "manage_study") and not membership_has(membership, "review_data"):
                 self.send_error_json("Study management or review permission required", 403)
@@ -4116,6 +4202,7 @@ class App(BaseHTTPRequestHandler):
                 study_id=study_id,
                 **self.audit_context(),
             )
+            conn.commit()
             return self.export_csv(conn, study_id, membership, query)
         if resource == "odm" and method == "GET":
             if not membership_has(membership, "export_data"):
@@ -4858,6 +4945,7 @@ class App(BaseHTTPRequestHandler):
                         "data": load_json(existing.get("data_json"), {}),
                     }
                     audit(conn, user["id"], "sync_conflict", "entry", existing["id"], {"if_match_updated_at": if_match_updated_at, "if_match_entry_hash": if_match_entry_hash}, conflict_payload, study_id=study_id, **self.audit_context())
+                    conn.commit()
                     self.send_json({"error": "Entry was changed on the server. Review conflict before syncing.", "server_entry": conflict_payload}, 409)
                     return
                 if existing.get("status") == "frozen":
@@ -5597,6 +5685,59 @@ class App(BaseHTTPRequestHandler):
             self.send_json({"token": after})
             return
         self.send_error_json("Unsupported API token operation", 405)
+
+    def mcp_tokens(self, conn, user, method, study_id, parts) -> None:
+        service = McpService(MCP_ENABLED)
+        if method == "GET" and len(parts) == 4:
+            payload = service.list_tokens(conn, study_id)
+            payload["enabled"] = MCP_ENABLED
+            payload["endpoint"] = "/mcp"
+            payload["scopes"] = sorted(MCP_SCOPES)
+            payload["tools"] = sorted(MCP_TOOLS)
+            self.send_json(payload)
+            return
+        if method == "POST" and len(parts) == 4:
+            payload = self.body()
+            display_name = str(payload.get("display_name") or payload.get("label") or "ChatGPT MCP token").strip()
+            allowed_study_ids = payload.get("allowed_study_ids")
+            if not isinstance(allowed_study_ids, list) or not allowed_study_ids:
+                allowed_study_ids = [study_id]
+            safe_study_ids = []
+            for raw_study_id in allowed_study_ids:
+                sid = int(raw_study_id)
+                if not user_membership(conn, user, sid):
+                    self.send_error_json("Cannot create MCP token for an unassigned study", 403)
+                    return
+                safe_study_ids.append(sid)
+            scopes = payload.get("scopes")
+            if not isinstance(scopes, list):
+                scopes = sorted(MCP_SCOPES)
+            scopes = [scope for scope in scopes if scope in MCP_SCOPES]
+            expires_at = int(payload.get("expires_at") or 0)
+            if not expires_at:
+                expires_at = now() + int(payload.get("expires_in_days") or 30) * 86400
+            result = service.create_token(
+                conn,
+                display_name=display_name,
+                created_by=user["id"],
+                allowed_study_ids=safe_study_ids,
+                scopes=scopes,
+                expires_at=expires_at,
+                rate_limit_per_hour=int(payload.get("rate_limit_per_hour") or os.environ.get("CDS_MCP_RATE_LIMIT_PER_TOKEN_PER_HOUR", "100")),
+            )
+            audit(conn, user["id"], "create", "mcp_token", result["record"]["id"], None, result["record"], study_id=study_id, **self.audit_context())
+            conn.commit()
+            self.send_json(result, 201)
+            return
+        if method == "PATCH" and len(parts) == 5:
+            token_id = int(parts[4])
+            before = row(conn, "SELECT * FROM mcp_tokens WHERE id = ?", (token_id,))
+            record = service.revoke_token(conn, token_id, study_id)
+            audit(conn, user["id"], "revoke", "mcp_token", token_id, before, record, study_id=study_id, **self.audit_context())
+            conn.commit()
+            self.send_json({"token": record})
+            return
+        self.send_error_json("Unsupported MCP token operation", 405)
 
     def randomization(self, conn, user, method, study_id, parts) -> None:
         if method == "GET" and len(parts) == 4:

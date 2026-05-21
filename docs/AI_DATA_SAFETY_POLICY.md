@@ -95,3 +95,18 @@ External AI is used only if both the server configuration and the project AI pol
 Your personal ChatGPT login is not used as the app credential. The deployed server needs an OpenAI API key in `.env`, and that key must never be committed to GitHub.
 
 Use [OPENAI_CHATGPT_SETUP.md](OPENAI_CHATGPT_SETUP.md) for the step-by-step setup. Keep `CDS_AI_ALLOW_PHI=false` unless you have explicit approval for identifiable patient data.
+
+## ChatGPT MCP Connector
+
+If you have ChatGPT Plus but do not want OpenAI API costs, use the read-only MCP connector instead of enabling external AI inside CDS.
+
+MCP rules:
+
+- `CDS_MCP_ENABLED=false` by default.
+- MCP tokens are separate from user passwords and API tokens.
+- MCP tokens are hashed at rest, revocable, expiring, and study-scoped.
+- MCP tools are read-only and de-identified.
+- MCP cannot return uploaded files, photos, PDFs, raw notes, or raw patient rows.
+- Every MCP call is audited.
+
+See [MCP_CONNECTOR_SETUP.md](MCP_CONNECTOR_SETUP.md).

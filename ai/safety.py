@@ -36,6 +36,8 @@ def ai_status_payload(settings, environ: Mapping[str, str], default_model: str, 
         "phi_allowed": bool(settings.ai_allow_phi),
         "max_file_mb": int(getattr(settings, "ai_max_file_mb", 8)),
         "monthly_budget_limit": getattr(settings, "ai_monthly_budget_limit", ""),
+        "ollama_enabled": bool(getattr(settings, "ai_ollama_host", "").strip()),
+        "ollama_host": getattr(settings, "ai_ollama_host", ""),
         "note": "External AI is disabled unless CDS_AI_ENABLED=true, CDS_AI_PROVIDER=openai, and OPENAI_API_KEY are configured. Uploaded evidence files are sent only when CDS_AI_MULTIMODAL=true.",
     }
 

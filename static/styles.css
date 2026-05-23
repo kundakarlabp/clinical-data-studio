@@ -669,3 +669,112 @@ th {
     padding: 6px 0;
   }
 }
+
+/* Modals & Prompt dialogs styling */
+dialog.prompt-dialog {
+  border: 0;
+  border-radius: 12px;
+  box-shadow: 0 20px 45px rgba(0, 0, 0, 0.2);
+  padding: 24px;
+  width: min(650px, 92vw);
+  background: var(--panel);
+  color: var(--ink);
+  margin: auto;
+}
+dialog.prompt-dialog::backdrop {
+  background: rgba(16, 33, 43, 0.5);
+  backdrop-filter: blur(4px);
+}
+dialog.prompt-dialog h3 {
+  margin-top: 0;
+  font-size: 1.3rem;
+  color: var(--accent);
+}
+dialog.prompt-dialog textarea {
+  font-family: monospace;
+  font-size: 12px;
+  background: #f8fafc;
+  border-color: var(--line);
+  margin-top: 8px;
+  margin-bottom: 16px;
+  width: 100%;
+}
+.dialog-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+/* Recruitment and Screening Registry styling */
+.screening-panel {
+  background: var(--panel-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 20px;
+  margin-top: 10px;
+  color: var(--ink);
+}
+.screening-panel h3 {
+  color: var(--accent);
+  margin-bottom: 12px;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+  padding-bottom: 4px;
+}
+.checklist-grid {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+  background: white;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+}
+.checklist-item {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 4px;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.05);
+}
+.checklist-item:last-child {
+  border-bottom: none;
+}
+.checklist-options {
+  display: flex;
+  gap: 10px;
+}
+.checklist-options label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  font-weight: normal;
+  color: var(--ink);
+}
+.checklist-options input {
+  min-height: auto;
+  width: auto;
+  cursor: pointer;
+}
+
+/* AI Workbench styling helper rules */
+.workbench-grid {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 16px;
+}
+@media (max-width: 900px) {
+  .workbench-grid {
+    grid-template-columns: 1fr;
+  }
+}
+.audit-list-item {
+  border-bottom: 1px solid var(--line);
+  padding: 8px 0;
+}
+.audit-list-item:last-child {
+  border-bottom: none;
+}
+

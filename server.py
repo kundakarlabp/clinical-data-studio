@@ -51,7 +51,7 @@ SESSION_TTL_SECONDS = 60 * 60 * 24 * 14
 MIN_PRODUCTION_SECRET_LENGTH = 32
 SESSION_COOKIE_NAME = "cds_session"
 CSRF_HEADER_NAME = "X-CSRF-Token"
-DEFAULT_OPENAI_MODEL = "gpt-5.2"
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 DEFAULT_TRANSCRIBE_MODEL = "gpt-4o-transcribe"
 CALC_OPERATORS = {
     ast.Add: lambda a, b: a + b,
@@ -256,7 +256,7 @@ def ai_status() -> dict:
     return ai_status_payload(SETTINGS, os.environ, DEFAULT_OPENAI_MODEL, DEFAULT_TRANSCRIBE_MODEL)
 
 
-AI_ALLOWED_PURPOSES = {"protocol_to_crf", "case_summary", "missing_fields", "inconsistency_detection", "publication_idea", "cv_item", "case_publication_review"}
+AI_ALLOWED_PURPOSES = {"protocol_to_crf", "case_summary", "missing_fields", "inconsistency_detection", "publication_idea", "cv_item", "case_publication_review", "crf_optimize", "case_eligibility", "crf_review"}
 
 
 def default_ai_policy() -> dict:
@@ -1105,6 +1105,7 @@ def migrate() -> None:
             add_column(conn, "forms", "active", "INTEGER NOT NULL DEFAULT 1")
             add_column(conn, "forms", "lifecycle_state", "TEXT NOT NULL DEFAULT 'published'")
             add_column(conn, "studies", "ai_policy_json", "TEXT NOT NULL DEFAULT '{}'")
+            add_column(conn, "studies", "eligibility_criteria_json", "TEXT NOT NULL DEFAULT '{}'")
             add_column(conn, "queries", "entry_id", "BIGINT REFERENCES entries(id) ON DELETE SET NULL")
             add_column(conn, "queries", "due_at", "BIGINT")
             add_column(conn, "queries", "closed_at", "BIGINT")
@@ -1115,6 +1116,13 @@ def migrate() -> None:
             add_column(conn, "case_files", "original_filename", "TEXT NOT NULL DEFAULT ''")
             add_column(conn, "case_files", "stored_filename", "TEXT NOT NULL DEFAULT ''")
             add_column(conn, "case_files", "sha256", "TEXT NOT NULL DEFAULT ''")
+            add_column(conn, "participants", "recruitment_source", "TEXT NOT NULL DEFAULT ''")
+            add_column(conn, "participants", "screening_date", "BIGINT")
+            add_column(conn, "participants", "consent_date", "BIGINT")
+            add_column(conn, "participants", "consent_status", "TEXT NOT NULL DEFAULT 'pending'")
+            add_column(conn, "participants", "consent_version", "TEXT NOT NULL DEFAULT ''")
+            add_column(conn, "participants", "eligibility_checklist_json", "TEXT NOT NULL DEFAULT '{}'")
+            add_column(conn, "participants", "screening_notes", "TEXT NOT NULL DEFAULT ''")
             seed_initial_data(conn)
             return
         conn.executescript(
@@ -1168,6 +1176,7 @@ def migrate() -> None:
                 description TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'draft',
                 ai_policy_json TEXT NOT NULL DEFAULT '{}',
+                eligibility_criteria_json TEXT NOT NULL DEFAULT '{}',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -1245,6 +1254,13 @@ def migrate() -> None:
                 study_uid TEXT NOT NULL,
                 initials TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'screening',
+                recruitment_source TEXT NOT NULL DEFAULT '',
+                screening_date INTEGER,
+                consent_date INTEGER,
+                consent_status TEXT NOT NULL DEFAULT 'pending',
+                consent_version TEXT NOT NULL DEFAULT '',
+                eligibility_checklist_json TEXT NOT NULL DEFAULT '{}',
+                screening_notes TEXT NOT NULL DEFAULT '',
                 metadata_json TEXT NOT NULL DEFAULT '{}',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
@@ -1496,6 +1512,32 @@ def migrate() -> None:
                 created_at INTEGER NOT NULL,
                 UNIQUE(list_id, participant_id)
             );
+
+            CREATE TABLE IF NOT EXISTS ai_drafts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+                entity_type TEXT NOT NULL,
+                entity_id INTEGER NOT NULL,
+                draft_type TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending_review',
+                draft_json TEXT NOT NULL DEFAULT '{}',
+                rule_metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_by INTEGER REFERENCES users(id),
+                updated_by INTEGER REFERENCES users(id),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS ai_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+                user_id INTEGER REFERENCES users(id),
+                action TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                entity_id INTEGER,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at INTEGER NOT NULL
+            );
             """
         )
         add_column(conn, "entries", "repeat_instance", "INTEGER NOT NULL DEFAULT 1")
@@ -1511,6 +1553,13 @@ def migrate() -> None:
         add_column(conn, "queries", "closed_at", "INTEGER")
         add_column(conn, "queries", "closed_by", "INTEGER REFERENCES users(id)")
         add_column(conn, "participants", "data_group_id", "INTEGER REFERENCES data_groups(id) ON DELETE SET NULL")
+        add_column(conn, "participants", "recruitment_source", "TEXT NOT NULL DEFAULT ''")
+        add_column(conn, "participants", "screening_date", "INTEGER")
+        add_column(conn, "participants", "consent_date", "INTEGER")
+        add_column(conn, "participants", "consent_status", "TEXT NOT NULL DEFAULT 'pending'")
+        add_column(conn, "participants", "consent_version", "TEXT NOT NULL DEFAULT ''")
+        add_column(conn, "participants", "eligibility_checklist_json", "TEXT NOT NULL DEFAULT '{}'")
+        add_column(conn, "participants", "screening_notes", "TEXT NOT NULL DEFAULT ''")
         add_column(conn, "users", "must_change_password", "INTEGER NOT NULL DEFAULT 0")
         add_column(conn, "users", "failed_login_count", "INTEGER NOT NULL DEFAULT 0")
         add_column(conn, "users", "locked_until", "INTEGER NOT NULL DEFAULT 0")
@@ -1522,6 +1571,7 @@ def migrate() -> None:
         add_column(conn, "forms", "active", "INTEGER NOT NULL DEFAULT 1")
         add_column(conn, "forms", "lifecycle_state", "TEXT NOT NULL DEFAULT 'published'")
         add_column(conn, "studies", "ai_policy_json", "TEXT NOT NULL DEFAULT '{}'")
+        add_column(conn, "studies", "eligibility_criteria_json", "TEXT NOT NULL DEFAULT '{}'")
         add_column(conn, "survey_links", "expires_at", "INTEGER")
         add_column(conn, "survey_links", "one_time", "INTEGER NOT NULL DEFAULT 0")
         add_column(conn, "academic_cv_items", "active", "INTEGER NOT NULL DEFAULT 1")
@@ -1582,6 +1632,9 @@ def add_production_indexes(conn) -> None:
         "CREATE INDEX IF NOT EXISTS idx_ai_audit_user_id ON ai_audit(user_id)",
         "CREATE INDEX IF NOT EXISTS idx_api_tokens_study_id ON api_tokens(study_id)",
         "CREATE INDEX IF NOT EXISTS idx_api_tokens_token_hash ON api_tokens(token_hash)",
+        "CREATE INDEX IF NOT EXISTS idx_ai_drafts_study_id ON ai_drafts(study_id)",
+        "CREATE INDEX IF NOT EXISTS idx_ai_drafts_entity ON ai_drafts(entity_type, entity_id)",
+        "CREATE INDEX IF NOT EXISTS idx_ai_audit_log_study_id ON ai_audit_log(study_id)",
     ]
     for statement in statements:
         conn.execute(statement)
@@ -2080,6 +2133,10 @@ def draft_crf_schema_locally(text: str) -> tuple[dict, list[str]]:
 
 
 def extract_openai_text(payload: dict) -> str:
+    if "choices" in payload and len(payload["choices"]) > 0:
+        msg = payload["choices"][0].get("message", {})
+        if "content" in msg and msg["content"] is not None:
+            return str(msg["content"])
     if payload.get("output_text"):
         return str(payload["output_text"])
     parts = []
@@ -2119,7 +2176,7 @@ def draft_crf_schema_with_openai(text: str) -> dict:
     }
     request_payload = {
         "model": model,
-        "input": [
+        "messages": [
             {
                 "role": "system",
                 "content": (
@@ -2130,10 +2187,17 @@ def draft_crf_schema_with_openai(text: str) -> dict:
             },
             {"role": "user", "content": text[:12000]},
         ],
-        "text": {"format": {"type": "json_schema", "name": "crf_schema", "strict": True, "schema": schema}},
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "crf_schema",
+                "strict": True,
+                "schema": schema
+            }
+        },
     }
     request = UrlRequest(
-        "https://api.openai.com/v1/responses",
+        "https://api.openai.com/v1/chat/completions",
         data=json.dumps(request_payload).encode("utf-8"),
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         method="POST",
@@ -2160,16 +2224,32 @@ def openai_response_json(system_prompt: str, content_parts: list[dict], schema_n
     if not api_key:
         raise ValueError("OPENAI_API_KEY is not configured")
     model = SETTINGS.ai_model or DEFAULT_OPENAI_MODEL
+    
+    messages = [{"role": "system", "content": system_prompt}]
+    user_content = []
+    for item in content_parts:
+        if item.get("type") == "input_text":
+            user_content.append({"type": "text", "text": item.get("text", "")})
+        elif item.get("type") == "input_image":
+            user_content.append({"type": "image_url", "image_url": {"url": item.get("image_url", "")}})
+        else:
+            user_content.append(item)
+    messages.append({"role": "user", "content": user_content})
+
     request_payload = {
         "model": model,
-        "input": [
-            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
-            {"role": "user", "content": content_parts},
-        ],
-        "text": {"format": {"type": "json_schema", "name": schema_name, "strict": True, "schema": schema}},
+        "messages": messages,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema_name,
+                "strict": True,
+                "schema": schema
+            }
+        },
     }
     request = UrlRequest(
-        "https://api.openai.com/v1/responses",
+        "https://api.openai.com/v1/chat/completions",
         data=json.dumps(request_payload).encode("utf-8"),
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         method="POST",
@@ -3770,6 +3850,632 @@ class App(BaseHTTPRequestHandler):
             return
         self.send_error_json("Unsupported AI operation", 405)
 
+    def entry_rule_check(self, conn, user, study_id, entry_id, membership) -> None:
+        entry = row(conn, "SELECT * FROM entries WHERE id = ? AND study_id = ?", (entry_id, study_id))
+        if not entry:
+            self.send_error_json("Entry not found", 404)
+            return
+
+        if membership.get("data_group_id"):
+            participant = row(conn, "SELECT data_group_id FROM participants WHERE id = ?", (entry["participant_id"],))
+            if not participant or participant.get("data_group_id") != membership["data_group_id"]:
+                self.send_error_json("Access denied to participant in this data group", 403)
+                return
+
+        form = row(conn, "SELECT schema_json FROM forms WHERE id = ?", (entry["form_id"],))
+        fallback_schema = load_json(form["schema_json"], {"fields": []}) if form else {"fields": []}
+        schema = schema_for_entry(entry, fallback_schema)
+        data = load_json(entry["data_json"], {})
+
+        cleaned, issues = validate_entry_data(schema, data)
+
+        timestamp = now()
+        inserted_count = 0
+
+        # Retrieve pending query drafts to prevent duplicate inserts
+        pending = rows(conn, "SELECT id, draft_json FROM ai_drafts WHERE study_id = ? AND entity_type = 'entry' AND entity_id = ? AND draft_type = 'query_draft' AND status = 'pending_review'", (study_id, entry_id))
+        
+        for issue in issues:
+            field_code = issue["field_code"]
+            message = issue["message"]
+
+            already_drafted = False
+            for p in pending:
+                d = load_json(p["draft_json"], {})
+                if d.get("field_code") == field_code:
+                    already_drafted = True
+                    break
+
+            if already_drafted:
+                continue
+
+            exists_query = row(
+                conn,
+                "SELECT id FROM queries WHERE entry_id = ? AND field_code = ? AND status = 'open'",
+                (entry_id, field_code)
+            )
+            if exists_query:
+                continue
+
+            draft_json_str = json.dumps({
+                "participant_id": entry["participant_id"],
+                "form_id": entry["form_id"],
+                "entry_id": entry_id,
+                "field_code": field_code,
+                "message": message
+            })
+            conn.execute(
+                """
+                INSERT INTO ai_drafts (study_id, entity_type, entity_id, draft_type, status, draft_json, rule_metadata_json, created_by, updated_by, created_at, updated_at)
+                VALUES (?, 'entry', ?, 'query_draft', 'pending_review', ?, '{}', ?, ?, ?, ?)
+                """,
+                (study_id, entry_id, draft_json_str, user["id"], user["id"], timestamp, timestamp)
+            )
+            inserted_count += 1
+
+        payload_str = json.dumps({
+            "entry_id": entry_id,
+            "issues_found": len(issues),
+            "drafts_created": inserted_count
+        })
+        conn.execute(
+            """
+            INSERT INTO ai_audit_log (study_id, user_id, action, entity_type, entity_id, payload_json, created_at)
+            VALUES (?, ?, 'rule_check', 'entry', ?, ?, ?)
+            """,
+            (study_id, user["id"], entry_id, payload_str, timestamp)
+        )
+        conn.commit()
+        self.send_json({"ok": True, "issues_found": len(issues), "drafts_created": inserted_count})
+
+    def participant_rule_check(self, conn, user, study_id, participant_id, membership) -> None:
+        participant = row(conn, "SELECT * FROM participants WHERE id = ? AND study_id = ?", (participant_id, study_id))
+        if not participant:
+            self.send_error_json("Participant not found", 404)
+            return
+
+        if membership.get("data_group_id") and participant.get("data_group_id") != membership["data_group_id"]:
+            self.send_error_json("Access denied", 403)
+            return
+
+        study_row = row(conn, "SELECT eligibility_criteria_json FROM studies WHERE id = ?", (study_id,))
+        study_criteria = load_json(study_row.get("eligibility_criteria_json", "{}"), {}) if study_row else {}
+        checklist = load_json(participant["eligibility_checklist_json"], {})
+
+        eligible, reasons = self.evaluate_eligibility(study_criteria, checklist)
+        current_status = participant["status"]
+        suggested_status = "enrolled" if eligible else "screen_fail"
+
+        timestamp = now()
+
+        conn.execute(
+            "DELETE FROM ai_drafts WHERE study_id = ? AND entity_type = 'participant' AND entity_id = ? AND draft_type = 'eligibility_check' AND status = 'pending_review'",
+            (study_id, participant_id)
+        )
+
+        draft_json_str = json.dumps({
+            "participant_id": participant_id,
+            "eligible": eligible,
+            "reasons": reasons,
+            "current_status": current_status,
+            "suggested_status": suggested_status
+        })
+
+        conn.execute(
+            """
+            INSERT INTO ai_drafts (study_id, entity_type, entity_id, draft_type, status, draft_json, rule_metadata_json, created_by, updated_by, created_at, updated_at)
+            VALUES (?, 'participant', ?, 'eligibility_check', 'pending_review', ?, '{}', ?, ?, ?, ?)
+            """,
+            (study_id, participant_id, draft_json_str, user["id"], user["id"], timestamp, timestamp)
+        )
+
+        payload_str = json.dumps({
+            "participant_id": participant_id,
+            "eligible": eligible,
+            "reasons_count": len(reasons),
+            "suggested_status": suggested_status
+        })
+        conn.execute(
+            """
+            INSERT INTO ai_audit_log (study_id, user_id, action, entity_type, entity_id, payload_json, created_at)
+            VALUES (?, ?, 'rule_check', 'participant', ?, ?, ?)
+            """,
+            (study_id, user["id"], participant_id, payload_str, timestamp)
+        )
+
+        conn.commit()
+        self.send_json({"ok": True, "eligible": eligible, "reasons": reasons, "suggested_status": suggested_status})
+
+    def case_intake_export_chatgpt(self, conn, user, study_id, case_id, membership) -> None:
+        case = row(conn, "SELECT * FROM case_intakes WHERE id = ? AND study_id = ?", (case_id, study_id))
+        if not case:
+            self.send_error_json("Case intake not found", 404)
+            return
+
+        study_row = row(conn, "SELECT eligibility_criteria_json FROM studies WHERE id = ?", (study_id,))
+        study_criteria = load_json(study_row.get("eligibility_criteria_json", "{}"), {}) if study_row else {}
+
+        raw_text = case["source_text"] or ""
+        deidentified_text = deidentify_text_for_ai(raw_text)
+
+        inclusion_formatted = ""
+        for inc in study_criteria.get("inclusion", []):
+            inclusion_formatted += f"- [{inc.get('id')}]: {inc.get('label') or inc.get('text')}\n"
+        exclusion_formatted = ""
+        for exc in study_criteria.get("exclusion", []):
+            exclusion_formatted += f"- [{exc.get('id')}]: {exc.get('label') or exc.get('text')}\n"
+
+        prompt = f"""You are a clinical eligibility screening assistant.
+Please analyze the following de-identified medical intake text against the study's inclusion and exclusion criteria.
+
+--- DE-IDENTIFIED CASE TEXT ---
+{deidentified_text}
+
+--- INCLUSION CRITERIA ---
+{inclusion_formatted or 'None defined'}
+
+--- EXCLUSION CRITERIA ---
+{exclusion_formatted or 'None defined'}
+
+--- INSTRUCTIONS ---
+For each criterion, evaluate based on the provided text if the patient meets it ("yes"), violates/fails it ("no"), or if it is not mentioned / cannot be determined ("unanswered").
+Provide your response strictly in the following JSON format inside a markdown JSON code block. Do not include any other text:
+
+```json
+{{
+  "checklist": {{
+    "CRITERION_ID": "yes" | "no" | "unanswered"
+  }},
+  "eligibility_reasons": "Provide a comprehensive explanation of your assessment here."
+}}
+```
+"""
+        timestamp = now()
+        conn.execute(
+            """
+            INSERT INTO ai_audit_log (study_id, user_id, action, entity_type, entity_id, payload_json, created_at)
+            VALUES (?, ?, 'export_chatgpt', 'case_intake', ?, '{}', ?)
+            """,
+            (study_id, user["id"], case_id, timestamp)
+        )
+        conn.commit()
+
+        self.send_json({"prompt": prompt, "deidentified": True})
+
+    def entry_export_chatgpt(self, conn, user, study_id, entry_id, membership) -> None:
+        entry = row(conn, "SELECT * FROM entries WHERE id = ? AND study_id = ?", (entry_id, study_id))
+        if not entry:
+            self.send_error_json("Entry not found", 404)
+            return
+
+        form = row(conn, "SELECT schema_json FROM forms WHERE id = ?", (entry["form_id"],))
+        fallback_schema = load_json(form["schema_json"], {"fields": []}) if form else {"fields": []}
+        schema = schema_for_entry(entry, fallback_schema)
+        data = load_json(entry["data_json"], {})
+
+        formatted_fields = []
+        for field in schema.get("fields", []):
+            code = field["code"]
+            val = data.get(code)
+
+            if isinstance(val, str):
+                val = deidentify_text_for_ai(val)
+            elif isinstance(val, list):
+                val = [deidentify_text_for_ai(x) if isinstance(x, str) else x for x in val]
+
+            label = field.get("label") or code
+            ftype = field.get("type", "text")
+            options = field.get("options", [])
+            opts_str = f" (Options: {', '.join(options)})" if options else ""
+
+            formatted_fields.append(f"Variable: {code}\nLabel: {label}\nType: {ftype}{opts_str}\nValue: {val}\n")
+
+        fields_text = "\n".join(formatted_fields)
+
+        prompt = f"""You are a clinical trial data quality reviewer.
+Please review the following de-identified CRF entry data for clinical inconsistency, formatting errors, or range violations.
+
+--- CRF ENTRY DATA ---
+{fields_text}
+
+--- INSTRUCTIONS ---
+Analyze the variables and values. Highlight any inconsistencies (e.g. incompatible values between related fields, values that are clinically improbable or violate known ranges).
+For any issues you identify, suggest a query message that an investigator should review.
+Provide your response strictly in the following JSON format inside a markdown JSON code block. Do not include any other text:
+
+```json
+{{
+  "queries": [
+    {{
+      "field_code": "variable_name",
+      "message": "Suggested query message explaining what is inconsistent or incorrect"
+    }}
+  ]
+}}
+```
+"""
+        timestamp = now()
+        conn.execute(
+            """
+            INSERT INTO ai_audit_log (study_id, user_id, action, entity_type, entity_id, payload_json, created_at)
+            VALUES (?, ?, 'export_chatgpt', 'entry', ?, '{}', ?)
+            """,
+            (study_id, user["id"], entry_id, timestamp)
+        )
+        conn.commit()
+
+        self.send_json({"prompt": prompt, "deidentified": True})
+
+    def form_export_chatgpt(self, conn, user, study_id, form_id, membership) -> None:
+        form = row(conn, "SELECT * FROM forms WHERE id = ? AND study_id = ?", (form_id, study_id))
+        if not form:
+            self.send_error_json("Form not found", 404)
+            return
+
+        schema = load_json(form["schema_json"], {"fields": []})
+        schema_json_str = json.dumps(schema, indent=2)
+
+        prompt = f"""You are a clinical trial CRF architect.
+Please optimize the following Case Report Form (CRF) schema. Suggest missing fields, improve validation rules (such as min/max for numbers), and correct any option formatting.
+
+--- CURRENT CRF SCHEMA ---
+{schema_json_str}
+
+--- INSTRUCTIONS ---
+Analyze the schema fields. Suggest optimizations and missing fields.
+Provide the entire optimized schema strictly in the following JSON format inside a markdown JSON code block. Do not include any other text:
+
+```json
+{{
+  "schema": {{
+    "fields": [
+      {{
+        "code": "variable_code",
+        "label": "Field label/question",
+        "type": "text" | "textarea" | "number" | "date" | "select" | "checkbox" | "file",
+        "required": true | false,
+        "options": ["optional", "list", "of", "values"]
+      }}
+    ]
+  }}
+}}
+```
+"""
+        timestamp = now()
+        conn.execute(
+            """
+            INSERT INTO ai_audit_log (study_id, user_id, action, entity_type, entity_id, payload_json, created_at)
+            VALUES (?, ?, 'export_chatgpt', 'form', ?, '{}', ?)
+            """,
+            (study_id, user["id"], form_id, timestamp)
+        )
+        conn.commit()
+
+        self.send_json({"prompt": prompt, "deidentified": True})
+
+    def extract_json_from_markdown(self, text: str) -> dict:
+        match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
+        if match:
+            candidate = match.group(1).strip()
+        else:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                candidate = text[start:end+1].strip()
+            else:
+                candidate = text.strip()
+        return json.loads(candidate)
+
+    def import_ai_draft(self, conn, user, method, study_id, parts, membership) -> None:
+        if method != "POST":
+            self.send_error_json("Method not allowed", 405)
+            return
+
+        payload = self.body()
+        entity_type = str(payload.get("entity_type", "")).strip()
+        entity_id = int(payload.get("entity_id") or 0)
+        draft_type = str(payload.get("draft_type", "")).strip()
+        text = str(payload.get("text", "")).strip()
+
+        if not entity_type or not entity_id or not draft_type or not text:
+            self.send_error_json("Missing required fields: entity_type, entity_id, draft_type, text", 400)
+            return
+
+        try:
+            parsed = self.extract_json_from_markdown(text)
+        except Exception as exc:
+            self.send_error_json(f"Failed to parse JSON from response: {exc}", 400)
+            return
+
+        timestamp = now()
+        inserted_count = 0
+
+        if draft_type == "query_draft":
+            queries = parsed.get("queries", [])
+            if isinstance(parsed, dict) and not queries and "field_code" in parsed:
+                queries = [parsed]
+            elif isinstance(parsed, list):
+                queries = parsed
+
+            for q in queries:
+                field_code = q.get("field_code", "").strip()
+                message = q.get("message", "").strip()
+                if not field_code or not message:
+                    continue
+
+                pending = rows(conn, "SELECT id, draft_json FROM ai_drafts WHERE study_id = ? AND entity_type = 'entry' AND entity_id = ? AND draft_type = 'query_draft' AND status = 'pending_review'", (study_id, entity_id))
+                already_drafted = False
+                for p in pending:
+                    d = load_json(p["draft_json"], {})
+                    if d.get("field_code") == field_code:
+                        already_drafted = True
+                        break
+                if already_drafted:
+                    continue
+
+                draft_json = json.dumps({
+                    "participant_id": None,
+                    "form_id": None,
+                    "entry_id": entity_id,
+                    "field_code": field_code,
+                    "message": message
+                })
+                conn.execute(
+                    """
+                    INSERT INTO ai_drafts (study_id, entity_type, entity_id, draft_type, status, draft_json, rule_metadata_json, created_by, updated_by, created_at, updated_at)
+                    VALUES (?, 'entry', ?, 'query_draft', 'pending_review', ?, '{}', ?, ?, ?, ?)
+                    """,
+                    (study_id, entity_id, draft_json, user["id"], user["id"], timestamp, timestamp)
+                )
+                inserted_count += 1
+
+        elif draft_type == "eligibility_check":
+            checklist = parsed.get("checklist", {})
+            reasons = parsed.get("eligibility_reasons", "")
+
+            participant = row(conn, "SELECT * FROM participants WHERE id = ? AND study_id = ?", (entity_id, study_id))
+            if not participant:
+                self.send_error_json("Participant not found", 404)
+                return
+
+            study_row = row(conn, "SELECT eligibility_criteria_json FROM studies WHERE id = ?", (study_id,))
+            study_criteria = load_json(study_row.get("eligibility_criteria_json", "{}"), {}) if study_row else {}
+
+            eligible, reasons_list = self.evaluate_eligibility(study_criteria, checklist)
+            suggested_status = "enrolled" if eligible else "screen_fail"
+
+            conn.execute(
+                "DELETE FROM ai_drafts WHERE study_id = ? AND entity_type = 'participant' AND entity_id = ? AND draft_type = 'eligibility_check' AND status = 'pending_review'",
+                (study_id, entity_id)
+            )
+
+            draft_json = json.dumps({
+                "participant_id": entity_id,
+                "checklist": checklist,
+                "eligible": eligible,
+                "reasons": reasons_list,
+                "ai_reasons_text": reasons,
+                "current_status": participant["status"],
+                "suggested_status": suggested_status
+            })
+
+            conn.execute(
+                """
+                INSERT INTO ai_drafts (study_id, entity_type, entity_id, draft_type, status, draft_json, rule_metadata_json, created_by, updated_by, created_at, updated_at)
+                VALUES (?, 'participant', ?, 'eligibility_check', 'pending_review', ?, '{}', ?, ?, ?, ?)
+                """,
+                (study_id, entity_id, draft_json, user["id"], user["id"], timestamp, timestamp)
+            )
+            inserted_count = 1
+
+        elif draft_type == "crf_optimization":
+            schema = parsed.get("schema", {})
+            if not schema or "fields" not in schema:
+                self.send_error_json("Invalid CRF schema JSON: missing fields", 400)
+                return
+
+            conn.execute(
+                "DELETE FROM ai_drafts WHERE study_id = ? AND entity_type = 'form' AND entity_id = ? AND draft_type = 'crf_optimization' AND status = 'pending_review'",
+                (study_id, entity_id)
+            )
+
+            draft_json = json.dumps({
+                "form_id": entity_id,
+                "schema": schema
+            })
+
+            conn.execute(
+                """
+                INSERT INTO ai_drafts (study_id, entity_type, entity_id, draft_type, status, draft_json, rule_metadata_json, created_by, updated_by, created_at, updated_at)
+                VALUES (?, 'form', ?, 'crf_optimization', 'pending_review', ?, '{}', ?, ?, ?, ?)
+                """,
+                (study_id, entity_id, draft_json, user["id"], user["id"], timestamp, timestamp)
+            )
+            inserted_count = 1
+        else:
+            self.send_error_json("Unsupported draft type", 400)
+            return
+
+        payload_str = json.dumps({
+            "draft_type": draft_type,
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "inserted_count": inserted_count
+        })
+        conn.execute(
+            """
+            INSERT INTO ai_audit_log (study_id, user_id, action, entity_type, entity_id, payload_json, created_at)
+            VALUES (?, ?, 'import_ai_draft', ?, ?, ?, ?)
+            """,
+            (study_id, user["id"], entity_type, entity_id, payload_str, timestamp)
+        )
+        conn.commit()
+
+        self.send_json({"ok": True, "count": inserted_count})
+
+    def ai_drafts(self, conn, user, method, study_id, parts, query, membership) -> None:
+        if len(parts) == 4:
+            if method != "GET":
+                self.send_error_json("Method not allowed", 405)
+                return
+
+            status = (query.get("status") or ["pending_review"])[0]
+            draft_rows = rows(conn, "SELECT * FROM ai_drafts WHERE study_id = ? AND status = ? ORDER BY id DESC", (study_id, status))
+            
+            drafts = []
+            for row_val in draft_rows:
+                draft = dict(row_val)
+                draft["draft_json"] = load_json(draft["draft_json"], {})
+                draft["rule_metadata_json"] = load_json(draft["rule_metadata_json"], {})
+
+                if draft["entity_type"] == "entry":
+                    entry = row(conn, "SELECT entries.participant_id, forms.name AS form_name, participants.study_uid FROM entries JOIN forms ON forms.id = entries.form_id JOIN participants ON participants.id = entries.participant_id WHERE entries.id = ?", (draft["entity_id"],))
+                    if entry:
+                        draft["form_name"] = entry["form_name"]
+                        draft["study_uid"] = entry["study_uid"]
+                        draft["participant_id"] = entry["participant_id"]
+                elif draft["entity_type"] == "participant":
+                    p = row(conn, "SELECT study_uid FROM participants WHERE id = ?", (draft["entity_id"],))
+                    if p:
+                        draft["study_uid"] = p["study_uid"]
+                elif draft["entity_type"] == "form":
+                    f = row(conn, "SELECT name FROM forms WHERE id = ?", (draft["entity_id"],))
+                    if f:
+                        draft["form_name"] = f["name"]
+                drafts.append(draft)
+
+            log_rows = rows(
+                conn,
+                """
+                SELECT ai_audit_log.*, users.display_name 
+                FROM ai_audit_log 
+                LEFT JOIN users ON users.id = ai_audit_log.user_id 
+                WHERE ai_audit_log.study_id = ? 
+                ORDER BY ai_audit_log.id DESC LIMIT 100
+                """,
+                (study_id,)
+            )
+            
+            audit_log = []
+            for l in log_rows:
+                ld = dict(l)
+                ld["payload_json"] = load_json(ld["payload_json"], {})
+                audit_log.append(ld)
+
+            self.send_json({"drafts": drafts, "audit_log": audit_log})
+            return
+
+        if len(parts) == 6 and parts[5] == "review":
+            if method != "POST":
+                self.send_error_json("Method not allowed", 405)
+                return
+
+            draft_id = int(parts[4])
+            draft = row(conn, "SELECT * FROM ai_drafts WHERE id = ? AND study_id = ?", (draft_id, study_id))
+            if not draft:
+                self.send_error_json("Draft not found", 404)
+                return
+
+            payload = self.body()
+            action = str(payload.get("action", "")).strip().lower()
+            if action not in {"approve", "reject"}:
+                self.send_error_json("Invalid review action. Must be 'approve' or 'reject'", 400)
+                return
+
+            timestamp = now()
+            if action == "reject":
+                conn.execute("UPDATE ai_drafts SET status = 'rejected', updated_by = ?, updated_at = ? WHERE id = ?", (user["id"], timestamp, draft_id))
+                conn.execute(
+                    """
+                    INSERT INTO ai_audit_log (study_id, user_id, action, entity_type, entity_id, payload_json, created_at)
+                    VALUES (?, ?, 'review_reject', ?, ?, ?, ?)
+                    """,
+                    (study_id, user["id"], draft["entity_type"], draft["entity_id"], json.dumps({"draft_id": draft_id}), timestamp)
+                )
+                conn.commit()
+                self.send_json({"ok": True})
+                return
+
+            draft_data = load_json(draft["draft_json"], {})
+
+            if draft["draft_type"] == "query_draft":
+                entry_id = draft["entity_id"]
+                entry = row(conn, "SELECT participant_id, form_id FROM entries WHERE id = ?", (entry_id,))
+                participant_id = entry["participant_id"] if entry else None
+                form_id = entry["form_id"] if entry else None
+
+                field_code = draft_data.get("field_code", "")
+                message = draft_data.get("message", "")
+
+                conn.execute(
+                    """
+                    INSERT INTO queries (study_id, participant_id, form_id, entry_id, field_code, message, status, created_by, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
+                    """,
+                    (study_id, participant_id, form_id, entry_id, field_code, message, user["id"], timestamp, timestamp)
+                )
+                if entry_id:
+                    conn.execute("UPDATE entries SET status = 'query_open', updated_by = ?, updated_at = ? WHERE id = ? AND status NOT IN ('locked', 'frozen')", (user["id"], timestamp, entry_id))
+
+            elif draft["draft_type"] == "eligibility_check":
+                participant_id = draft["entity_id"]
+                suggested_status = draft_data.get("suggested_status")
+                checklist = draft_data.get("checklist")
+
+                participant = row(conn, "SELECT eligibility_checklist_json, status FROM participants WHERE id = ?", (participant_id,))
+                if not participant:
+                    self.send_error_json("Participant not found for draft", 404)
+                    return
+
+                final_checklist = load_json(participant["eligibility_checklist_json"], {})
+                if checklist:
+                    for k, v in checklist.items():
+                        final_checklist[k] = v
+
+                conn.execute(
+                    """
+                    UPDATE participants 
+                    SET status = ?, eligibility_checklist_json = ?, updated_at = ? 
+                    WHERE id = ? AND study_id = ?
+                    """,
+                    (suggested_status or participant["status"], json.dumps(final_checklist), timestamp, participant_id, study_id)
+                )
+
+            elif draft["draft_type"] == "crf_optimization":
+                form_id = draft["entity_id"]
+                schema = draft_data.get("schema")
+                if not schema or "fields" not in schema:
+                    self.send_error_json("Draft missing valid form schema fields to approve", 400)
+                    return
+
+                before_form = row(conn, "SELECT * FROM forms WHERE id = ? AND study_id = ?", (form_id, study_id))
+                if not before_form:
+                    self.send_error_json("Form not found to apply schema update", 404)
+                    return
+
+                conn.execute(
+                    "INSERT INTO form_versions(form_id, study_id, version, name, code, schema_json, saved_by, saved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (form_id, study_id, before_form["version"], before_form["name"], before_form["code"], before_form["schema_json"], user["id"], timestamp),
+                )
+                conn.execute(
+                    "UPDATE forms SET schema_json = ?, version = version + 1, updated_at = ? WHERE id = ? AND study_id = ?",
+                    (json.dumps(schema), timestamp, form_id, study_id),
+                )
+
+            conn.execute("UPDATE ai_drafts SET status = 'approved', updated_by = ?, updated_at = ? WHERE id = ?", (user["id"], timestamp, draft_id))
+            conn.execute(
+                """
+                INSERT INTO ai_audit_log (study_id, user_id, action, entity_type, entity_id, payload_json, created_at)
+                VALUES (?, ?, 'review_approve', ?, ?, ?, ?)
+                """,
+                (study_id, user["id"], draft["entity_type"], draft["entity_id"], json.dumps({"draft_id": draft_id}), timestamp)
+            )
+            conn.commit()
+            self.send_json({"ok": True})
+            return
+
+        self.send_error_json("Unsupported AI operation", 405)
+
     def create_study(self, conn: sqlite3.Connection, user: dict) -> None:
         if not is_super_admin(user):
             self.send_error_json("System admin permission required", 403)
@@ -3949,6 +4655,14 @@ class App(BaseHTTPRequestHandler):
             return
         resource = parts[3] if len(parts) > 3 else ""
         if resource == "forms":
+            if len(parts) == 6 and parts[5] == "export-chatgpt":
+                if method != "POST":
+                    self.send_error_json("Unsupported forms operation", 405)
+                    return
+                if not membership_has(membership, "manage_forms"):
+                    self.send_error_json("Form management permission required", 403)
+                    return
+                return self.form_export_chatgpt(conn, user, study_id, int(parts[4]), membership)
             if method != "GET" and not membership_has(membership, "manage_forms"):
                 self.send_error_json("Form management permission required", 403)
                 return
@@ -3987,11 +4701,30 @@ class App(BaseHTTPRequestHandler):
                 return
             return self.invitations(conn, user, method, study_id, parts)
         if resource == "participants":
+            if len(parts) == 6 and parts[5] == "rule-check":
+                if method != "POST":
+                    self.send_error_json("Unsupported participants operation", 405)
+                    return
+                if not (membership_has(membership, "enter_data") or membership_has(membership, "review_data")):
+                    self.send_error_json("Data entry or review permission required", 403)
+                    return
+                return self.participant_rule_check(conn, user, study_id, int(parts[4]), membership)
             if method != "GET" and not membership_has(membership, "enter_data"):
                 self.send_error_json("Data entry permission required", 403)
                 return
             return self.participants(conn, user, method, study_id, parts, membership)
         if resource == "entries":
+            if len(parts) == 6 and parts[5] in ("rule-check", "export-chatgpt"):
+                if method != "POST":
+                    self.send_error_json("Unsupported entries operation", 405)
+                    return
+                if not (membership_has(membership, "enter_data") or membership_has(membership, "review_data")):
+                    self.send_error_json("Data entry or review permission required", 403)
+                    return
+                if parts[5] == "rule-check":
+                    return self.entry_rule_check(conn, user, study_id, int(parts[4]), membership)
+                else:
+                    return self.entry_export_chatgpt(conn, user, study_id, int(parts[4]), membership)
             if method == "GET":
                 return self.entries(conn, user, method, study_id, parts, query, membership)
             if method == "POST" and not membership_has(membership, "enter_data"):
@@ -4002,6 +4735,14 @@ class App(BaseHTTPRequestHandler):
                 return
             return self.entries(conn, user, method, study_id, parts, query, membership)
         if resource == "case-intake":
+            if len(parts) == 6 and parts[5] == "export-chatgpt":
+                if method != "POST":
+                    self.send_error_json("Unsupported case intake operation", 405)
+                    return
+                if not (membership_has(membership, "enter_data") or membership_has(membership, "review_data") or membership_has(membership, "view_analysis")):
+                    self.send_error_json("Case intake permission required", 403)
+                    return
+                return self.case_intake_export_chatgpt(conn, user, study_id, int(parts[4]), membership)
             if method == "GET":
                 if not (membership_has(membership, "enter_data") or membership_has(membership, "view_analysis") or membership_has(membership, "review_data")):
                     self.send_error_json("Case intake permission required", 403)
@@ -4089,6 +4830,16 @@ class App(BaseHTTPRequestHandler):
             return self.academic_workbench(conn, user, method, study_id, parts, query, membership)
         if resource == "ai":
             return self.ai_routes(conn, user, method, study_id, parts, membership)
+        if resource == "ai-drafts":
+            if not (membership_has(membership, "review_data") or membership_has(membership, "enter_data") or membership_has(membership, "manage_study")):
+                self.send_error_json("Permission denied", 403)
+                return
+            return self.ai_drafts(conn, user, method, study_id, parts, query, membership)
+        if resource == "import-ai-draft":
+            if not (membership_has(membership, "enter_data") or membership_has(membership, "review_data")):
+                self.send_error_json("Permission denied", 403)
+                return
+            return self.import_ai_draft(conn, user, method, study_id, parts, membership)
         if resource == "backups":
             if not membership_has(membership, "manage_study"):
                 self.send_error_json("Study management permission required", 403)
@@ -4162,9 +4913,210 @@ class App(BaseHTTPRequestHandler):
                 return
             audit(conn, user["id"], "export", "audit", study_id, None, {"format": "csv"}, study_id=study_id, **self.audit_context())
             return self.export_audit_csv(conn, study_id, query)
+        if resource == "":
+            if method == "GET":
+                study = row(conn, "SELECT * FROM studies WHERE id = ?", (study_id,))
+                if study:
+                    study["ai_policy"] = load_json(study.pop("ai_policy_json"), {})
+                    study["eligibility_criteria"] = load_json(study.pop("eligibility_criteria_json", "{}"), {})
+                self.send_json({"study": study})
+                return
+            if method == "PATCH":
+                if not membership_has(membership, "manage_study"):
+                    self.send_error_json("Study management permission required", 403)
+                    return
+                payload = self.body()
+                study = row(conn, "SELECT * FROM studies WHERE id = ?", (study_id,))
+                if not study:
+                    self.send_error_json("Study not found", 404)
+                    return
+                name = str(payload.get("name", study["name"])).strip() or "Untitled Study"
+                protocol_id = str(payload.get("protocol_id", study["protocol_id"])).strip()
+                description = str(payload.get("description", study["description"])).strip()
+                status = str(payload.get("status", study["status"])).strip()
+                eligibility_criteria = payload.get("eligibility_criteria", load_json(study.get("eligibility_criteria_json", "{}"), {}))
+                
+                conn.execute(
+                    """
+                    UPDATE studies 
+                    SET name = ?, protocol_id = ?, description = ?, status = ?, eligibility_criteria_json = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (name, protocol_id, description, status, json.dumps(eligibility_criteria), now(), study_id)
+                )
+                after = row(conn, "SELECT * FROM studies WHERE id = ?", (study_id,))
+                if after:
+                    after["ai_policy"] = load_json(after.pop("ai_policy_json"), {})
+                    after["eligibility_criteria"] = load_json(after.pop("eligibility_criteria_json", "{}"), {})
+                audit(conn, user["id"], "update", "study", study_id, study, after)
+                conn.commit()
+                self.send_json({"study": after})
+                return
+
+        if resource == "recruitment-metrics" and method == "GET":
+            if not (membership_has(membership, "enter_data") or membership_has(membership, "view_analysis") or membership_has(membership, "review_data")):
+                self.send_error_json("Analysis or review permission required", 403)
+                return
+            if membership.get("data_group_id"):
+                all_pts = rows(conn, "SELECT status, recruitment_source, consent_status FROM participants WHERE study_id = ? AND data_group_id = ?", (study_id, membership["data_group_id"]))
+            else:
+                all_pts = rows(conn, "SELECT status, recruitment_source, consent_status FROM participants WHERE study_id = ?", (study_id,))
+            counts = {
+                "referred": 0,
+                "screening": 0,
+                "eligible": 0,
+                "enrolled": 0,
+                "completed": 0,
+                "withdrawn": 0,
+                "screen_fail": 0
+            }
+            sources = {}
+            consent_counts = {
+                "pending": 0,
+                "obtained": 0,
+                "withdrawn": 0,
+                "not_required": 0
+            }
+            for pt in all_pts:
+                st = pt.get("status", "screening")
+                if st in counts:
+                    counts[st] += 1
+                else:
+                    counts["screening"] += 1
+                src = pt.get("recruitment_source") or "Unknown"
+                sources[src] = sources.get(src, 0) + 1
+                c_status = pt.get("consent_status", "pending")
+                if c_status in consent_counts:
+                    consent_counts[c_status] += 1
+            total = len(all_pts)
+            screen_fail = counts.get("screen_fail", 0)
+            enrolled = counts.get("enrolled", 0)
+            completed = counts.get("completed", 0)
+            withdrawn = counts.get("withdrawn", 0)
+            screening = counts.get("screening", 0)
+            evaluated = screen_fail + enrolled + completed + withdrawn
+            screen_fail_rate = (screen_fail / evaluated * 100.0) if evaluated > 0 else 0.0
+            conversion_rate = ((enrolled + completed) / total * 100.0) if total > 0 else 0.0
+            metrics = {
+                "counts": counts,
+                "sources": sources,
+                "consent_counts": consent_counts,
+                "total_participants": total,
+                "screen_fail_rate": round(screen_fail_rate, 2),
+                "conversion_rate": round(conversion_rate, 2)
+            }
+            self.send_json(metrics)
+            return
+
         self.send_error_json("Unknown study route", 404)
 
     def forms(self, conn, user, method, study_id, parts) -> None:
+        membership = user_membership(conn, user, study_id)
+        if not membership:
+            self.send_error_json("Study access denied", 403)
+            return
+        if method == "POST" and len(parts) == 6 and parts[5] == "ai-optimize":
+            if not membership_has(membership, "review_data"):
+                self.send_error_json("Review permission required to trigger AI", 403)
+                return
+            form_id = int(parts[4])
+            form = row(conn, "SELECT * FROM forms WHERE id = ? AND study_id = ?", (form_id, study_id))
+            if not form:
+                self.send_error_json("Form not found", 404)
+                return
+            payload = self.body()
+            user_prompt = str(payload.get("prompt", "")).strip()
+            current_schema = load_json(form["schema_json"], {"fields": []})
+            try:
+                assert_external_ai_safe(json.dumps(current_schema))
+                if user_prompt:
+                    assert_external_ai_safe(user_prompt)
+            except Exception as exc:
+                self.send_error_json(f"AI Safety check failed: {exc}", 400)
+                return
+            api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+            if not api_key:
+                self.send_error_json("OPENAI_API_KEY is not configured", 500)
+                return
+            model = SETTINGS.ai_model or DEFAULT_OPENAI_MODEL
+            schema_format = {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "fields": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "code": {"type": "string"},
+                                "label": {"type": "string"},
+                                "type": {"type": "string", "enum": ["text", "textarea", "number", "date", "select", "checkbox", "file"]},
+                                "required": {"type": "boolean"},
+                                "options": {"type": "array", "items": {"type": "string"}},
+                            },
+                            "required": ["code", "label", "type", "required", "options"],
+                        },
+                    }
+                },
+                "required": ["fields"],
+            }
+            prompt_content = f"Optimize this clinical CRF schema. Standardize field naming, correct validation constraints, align checkboxes/options, and suggest missing clinical fields if relevant.\n"
+            if user_prompt:
+                prompt_content += f"User feedback/instructions for optimization: {user_prompt}\n"
+            prompt_content += f"Current schema:\n{json.dumps(current_schema, indent=2)}"
+            request_payload = {
+                "model": model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are a world-class clinical research architect. Optimize the clinical CRF schema provided."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt_content
+                    }
+                ],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "optimized_schema",
+                        "strict": True,
+                        "schema": schema_format
+                    }
+                }
+            }
+            try:
+                request = UrlRequest(
+                    "https://api.openai.com/v1/chat/completions",
+                    data=json.dumps(request_payload).encode("utf-8"),
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen_request(request, timeout=30) as response:
+                    res_body = json.loads(response.read().decode("utf-8"))
+                output_text = extract_openai_text(res_body)
+                if not output_text:
+                    self.send_error_json("AI response did not contain text output", 500)
+                    return
+                optimized_schema = normalize_schema(json.loads(output_text))
+                ai_audit_id = record_ai_audit(
+                    conn,
+                    user["id"],
+                    study_id=study_id,
+                    purpose="crf_optimize",
+                    input_type="json",
+                    mode="openai",
+                    phi_detected=0,
+                    status_value="ok"
+                )
+                audit(conn, user["id"], "ai_request", "ai_audit", ai_audit_id, None, {"purpose": "crf_optimize", "form_id": form_id}, study_id=study_id, **self.audit_context())
+                conn.commit()
+                self.send_json({"optimized_schema": optimized_schema, "diff": form_schema_diff(current_schema, optimized_schema)})
+            except Exception as exc:
+                self.send_error_json(f"AI optimization failed: {exc}", 500)
+            return
+
         if method == "GET" and len(parts) == 6 and parts[5] == "versions":
             form_id = int(parts[4])
             current = row(conn, "SELECT * FROM forms WHERE id = ? AND study_id = ?", (form_id, study_id))
@@ -4701,7 +5653,31 @@ class App(BaseHTTPRequestHandler):
         status = 207 if imported["errors"] else 201
         self.send_json({"imported": imported}, status)
 
+    def evaluate_eligibility(self, study_criteria: dict, checklist: dict) -> tuple[bool, list[str]]:
+        inclusion = study_criteria.get("inclusion", [])
+        exclusion = study_criteria.get("exclusion", [])
+        reasons = []
+        eligible = True
+        for inc in inclusion:
+            cid = inc.get("id")
+            ans = checklist.get(cid)
+            if ans != "yes" and ans != "YES":
+                eligible = False
+                label = inc.get("label") or inc.get("text") or cid
+                reasons.append(f"Inclusion criterion '{label}' not met (answered '{ans or 'unanswered'}').")
+        for exc in exclusion:
+            cid = exc.get("id")
+            ans = checklist.get(cid)
+            if ans != "no" and ans != "NO":
+                eligible = False
+                label = exc.get("label") or exc.get("text") or cid
+                reasons.append(f"Exclusion criterion '{label}' violated (answered '{ans or 'unanswered'}').")
+        return eligible, reasons
+
     def participants(self, conn, user, method, study_id, parts, membership) -> None:
+        study_row = row(conn, "SELECT eligibility_criteria_json FROM studies WHERE id = ?", (study_id,))
+        study_criteria = load_json(study_row.get("eligibility_criteria_json", "{}"), {}) if study_row else {}
+
         if method == "GET":
             if membership.get("data_group_id"):
                 participants = rows(conn, "SELECT * FROM participants WHERE study_id = ? AND data_group_id = ? ORDER BY id DESC", (study_id, membership["data_group_id"]))
@@ -4709,17 +5685,56 @@ class App(BaseHTTPRequestHandler):
                 participants = rows(conn, "SELECT * FROM participants WHERE study_id = ? ORDER BY id DESC", (study_id,))
             for participant in participants:
                 participant["metadata"] = load_json(participant.pop("metadata_json"), {})
+                participant["eligibility_checklist"] = load_json(participant.pop("eligibility_checklist_json"), {})
+                eligible, reasons = self.evaluate_eligibility(study_criteria, participant["eligibility_checklist"])
+                participant["eligibility_evaluation"] = {"eligible": eligible, "reasons": reasons}
             self.send_json({"participants": participants})
             return
         if method == "POST":
             payload = self.body()
             timestamp = now()
             data_group_id = payload.get("data_group_id") or membership.get("data_group_id")
+            
+            recruitment_source = str(payload.get("recruitment_source", "")).strip()
+            screening_date = payload.get("screening_date")
+            if screening_date is not None:
+                try:
+                    screening_date = int(screening_date)
+                except (ValueError, TypeError):
+                    screening_date = None
+            consent_date = payload.get("consent_date")
+            if consent_date is not None:
+                try:
+                    consent_date = int(consent_date)
+                except (ValueError, TypeError):
+                    consent_date = None
+            consent_status = str(payload.get("consent_status", "pending")).strip()
+            if consent_status not in ("pending", "obtained", "withdrawn", "not_required"):
+                consent_status = "pending"
+            consent_version = str(payload.get("consent_version", "")).strip()
+            eligibility_checklist = payload.get("eligibility_checklist", {})
+            screening_notes = str(payload.get("screening_notes", "")).strip()
+
             cur = conn.execute(
-                "INSERT INTO participants(study_id, data_group_id, study_uid, initials, status, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (study_id, data_group_id, str(payload.get("study_uid", "")).strip(), str(payload.get("initials", "")).strip().upper(), str(payload.get("status", "screening")), json.dumps(payload.get("metadata", {})), timestamp, timestamp),
+                """
+                INSERT INTO participants(
+                    study_id, data_group_id, study_uid, initials, status,
+                    recruitment_source, screening_date, consent_date, consent_status, consent_version,
+                    eligibility_checklist_json, screening_notes, metadata_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    study_id, data_group_id, str(payload.get("study_uid", "")).strip(), str(payload.get("initials", "")).strip().upper(), str(payload.get("status", "screening")),
+                    recruitment_source, screening_date, consent_date, consent_status, consent_version,
+                    json.dumps(eligibility_checklist), screening_notes, json.dumps(payload.get("metadata", {})), timestamp, timestamp
+                ),
             )
             after = row(conn, "SELECT * FROM participants WHERE id = ?", (cur.lastrowid,))
+            if after:
+                after["metadata"] = load_json(after.pop("metadata_json"), {})
+                after["eligibility_checklist"] = load_json(after.pop("eligibility_checklist_json"), {})
+                eligible, reasons = self.evaluate_eligibility(study_criteria, after["eligibility_checklist"])
+                after["eligibility_evaluation"] = {"eligible": eligible, "reasons": reasons}
             audit(conn, user["id"], "create", "participant", cur.lastrowid, None, after)
             conn.commit()
             self.send_json({"participant": after}, 201)
@@ -4737,11 +5752,55 @@ class App(BaseHTTPRequestHandler):
             data_group_id = payload.get("data_group_id", before.get("data_group_id"))
             if membership.get("data_group_id"):
                 data_group_id = membership["data_group_id"]
+
+            recruitment_source = payload.get("recruitment_source", before.get("recruitment_source", ""))
+            screening_date = payload.get("screening_date", before.get("screening_date"))
+            if screening_date is not None:
+                try:
+                    screening_date = int(screening_date)
+                except (ValueError, TypeError):
+                    screening_date = None
+            consent_date = payload.get("consent_date", before.get("consent_date"))
+            if consent_date is not None:
+                try:
+                    consent_date = int(consent_date)
+                except (ValueError, TypeError):
+                    consent_date = None
+            consent_status = payload.get("consent_status", before.get("consent_status", "pending"))
+            consent_version = payload.get("consent_version", before.get("consent_version", ""))
+            eligibility_checklist = payload.get("eligibility_checklist", load_json(before.get("eligibility_checklist_json", "{}"), {}))
+            screening_notes = payload.get("screening_notes", before.get("screening_notes", ""))
+
             conn.execute(
-                "UPDATE participants SET data_group_id = ?, study_uid = ?, initials = ?, status = ?, metadata_json = ?, updated_at = ? WHERE id = ? AND study_id = ?",
-                (data_group_id, str(payload.get("study_uid", before["study_uid"])).strip(), str(payload.get("initials", before["initials"])).strip().upper(), str(payload.get("status", before["status"])), json.dumps(payload.get("metadata", load_json(before["metadata_json"], {}))), now(), participant_id, study_id),
+                """
+                UPDATE participants SET 
+                    data_group_id = ?, study_uid = ?, initials = ?, status = ?, 
+                    recruitment_source = ?, screening_date = ?, consent_date = ?, consent_status = ?, consent_version = ?,
+                    eligibility_checklist_json = ?, screening_notes = ?, metadata_json = ?, updated_at = ? 
+                WHERE id = ? AND study_id = ?
+                """,
+                (
+                    data_group_id, 
+                    str(payload.get("study_uid", before["study_uid"])).strip(), 
+                    str(payload.get("initials", before["initials"])).strip().upper(), 
+                    str(payload.get("status", before["status"])), 
+                    recruitment_source, screening_date, consent_date, consent_status, consent_version,
+                    json.dumps(eligibility_checklist), screening_notes,
+                    json.dumps(payload.get("metadata", load_json(before["metadata_json"], {}))), 
+                    now(), participant_id, study_id
+                ),
             )
             after = row(conn, "SELECT * FROM participants WHERE id = ?", (participant_id,))
+            if after:
+                after["metadata"] = load_json(after.pop("metadata_json"), {})
+                after["eligibility_checklist"] = load_json(after.pop("eligibility_checklist_json"), {})
+                eligible, reasons = self.evaluate_eligibility(study_criteria, after["eligibility_checklist"])
+                after["eligibility_evaluation"] = {"eligible": eligible, "reasons": reasons}
+            if before:
+                before["metadata"] = load_json(before.pop("metadata_json"), {})
+                before["eligibility_checklist"] = load_json(before.pop("eligibility_checklist_json"), {})
+                eligible_b, reasons_b = self.evaluate_eligibility(study_criteria, before["eligibility_checklist"])
+                before["eligibility_evaluation"] = {"eligible": eligible_b, "reasons": reasons_b}
             audit(conn, user["id"], "update", "participant", participant_id, before, after)
             conn.commit()
             self.send_json({"participant": after})

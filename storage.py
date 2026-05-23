@@ -34,6 +34,8 @@ INSERT_ID_TABLES = {
     "api_tokens",
     "randomization_lists",
     "randomization_allocations",
+    "ai_drafts",
+    "ai_audit_log",
 }
 
 
@@ -193,6 +195,7 @@ CREATE TABLE IF NOT EXISTS studies (
     description TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'active',
     ai_policy_json TEXT NOT NULL DEFAULT '{}',
+    eligibility_criteria_json TEXT NOT NULL DEFAULT '{}',
     created_at BIGINT NOT NULL,
     updated_at BIGINT NOT NULL
 );
@@ -283,6 +286,13 @@ CREATE TABLE IF NOT EXISTS participants (
     study_uid TEXT NOT NULL,
     initials TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'screening',
+    recruitment_source TEXT NOT NULL DEFAULT '',
+    screening_date BIGINT,
+    consent_date BIGINT,
+    consent_status TEXT NOT NULL DEFAULT 'pending',
+    consent_version TEXT NOT NULL DEFAULT '',
+    eligibility_checklist_json TEXT NOT NULL DEFAULT '{}',
+    screening_notes TEXT NOT NULL DEFAULT '',
     metadata_json TEXT NOT NULL DEFAULT '{}',
     created_at BIGINT NOT NULL,
     updated_at BIGINT NOT NULL,
@@ -512,15 +522,29 @@ CREATE TABLE IF NOT EXISTS randomization_lists (
     created_at BIGINT NOT NULL,
     updated_at BIGINT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS randomization_allocations (
+CREATE TABLE IF NOT EXISTS ai_drafts (
     id BIGSERIAL PRIMARY KEY,
     study_id BIGINT NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
-    list_id BIGINT NOT NULL REFERENCES randomization_lists(id) ON DELETE CASCADE,
-    participant_id BIGINT NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
-    arm TEXT NOT NULL,
-    allocated_by BIGINT REFERENCES users(id),
+    entity_type TEXT NOT NULL,
+    entity_id BIGINT NOT NULL,
+    draft_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending_review',
+    draft_json TEXT NOT NULL DEFAULT '{}',
+    rule_metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_by BIGINT REFERENCES users(id),
+    updated_by BIGINT REFERENCES users(id),
     created_at BIGINT NOT NULL,
-    UNIQUE(list_id, participant_id)
+    updated_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ai_audit_log (
+    id BIGSERIAL PRIMARY KEY,
+    study_id BIGINT NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+    user_id BIGINT REFERENCES users(id),
+    action TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id BIGINT,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at BIGINT NOT NULL
 );
 """
 

@@ -42,6 +42,7 @@ const state = {
   installPrompt: null,
   standalone: window.matchMedia("(display-mode: standalone)").matches || navigator.standalone === true,
   error: "",
+  activeParticipantScreeningId: null,
 };
 
 const draftTimers = new Map();
@@ -141,7 +142,7 @@ async function loadStudy() {
   const manageUsers = can("manage_users");
   const viewAnalysis = can("view_analysis") || can("review_data");
   const readinessAllowed = can("manage_study") || can("review_data") || can("view_analysis");
-  const [forms, events, formEvents, surveyLinks, invitations, reports, academic, caseIntake, backups, participants, entries, queries, quality, analysis, assistantSummary, readiness, audit, groups, studyMembers, apiTokens, randomization, users, adminStatus, adminLogs, adminBackups] = await Promise.all([
+  const [forms, events, formEvents, surveyLinks, invitations, reports, academic, caseIntake, backups, participants, entries, queries, quality, analysis, assistantSummary, readiness, audit, groups, studyMembers, apiTokens, randomization, users, adminStatus, adminLogs, adminBackups, studyDetail, aiDrafts, recruitmentMetrics] = await Promise.all([
     api(`/api/studies/${state.studyId}/forms`),
     api(`/api/studies/${state.studyId}/events`),
     api(`/api/studies/${state.studyId}/form-events`),
@@ -167,6 +168,9 @@ async function loadStudy() {
     isSuperAdmin() ? api("/api/admin/status") : Promise.resolve(null),
     isSuperAdmin() ? api("/api/admin/logs") : Promise.resolve({ lines: [] }),
     isSuperAdmin() ? api("/api/admin/backups") : Promise.resolve({ backups: [], summary: null }),
+    api(`/api/studies/${state.studyId}`),
+    (can("enter_data") || can("review_data")) ? api(`/api/studies/${state.studyId}/ai-drafts`) : Promise.resolve({ drafts: [], audit_log: [] }),
+    (can("enter_data") || can("review_data")) ? api(`/api/studies/${state.studyId}/recruitment-metrics`) : Promise.resolve({ counts: {}, sources: {}, consent_counts: {}, total_participants: 0, screen_fail_rate: 0, conversion_rate: 0 }),
   ]);
   state.forms = forms.forms;
   state.events = events.events;
@@ -196,6 +200,10 @@ async function loadStudy() {
   state.adminStatus = adminStatus;
   state.adminLogs = adminLogs.lines || [];
   state.adminBackups = adminBackups;
+  state.study = studyDetail.study;
+  state.aiDrafts = aiDrafts.drafts || [];
+  state.aiAuditLog = aiDrafts.audit_log || [];
+  state.recruitmentMetrics = recruitmentMetrics || { counts: {}, sources: {}, consent_counts: {}, total_participants: 0, screen_fail_rate: 0, conversion_rate: 0 };
 }
 
 function isSuperAdmin() {
@@ -256,6 +264,7 @@ function render() {
           ${can("manage_study") || can("review_data") ? navButton("randomization", "Randomization") : ""}
           ${navButton("queries", "Review Queries")}
           ${navButton("quality", "Data Quality")}
+          ${(can("enter_data") || can("review_data")) ? navButton("ai-workbench", "AI Workbench") : ""}
           ${(can("enter_data") || can("view_analysis") || can("review_data")) ? navButton("case-intake", "Case Intake") : ""}
           ${navButton("analysis", "Analysis")}
           ${can("view_analysis") || can("export_data") ? navButton("reports", "Reports") : ""}
@@ -331,6 +340,7 @@ function route() {
   if (state.view === "randomization") return randomizationView();
   if (state.view === "queries") return queriesView();
   if (state.view === "quality") return qualityView();
+  if (state.view === "ai-workbench") return aiWorkbenchView();
   if (state.view === "case-intake") return caseIntakeView();
   if (state.view === "analysis") return analysisView();
   if (state.view === "reports") return reportsView();
@@ -519,8 +529,19 @@ function participantsTable(participants) {
               <td>${escapeHtml(item.initials)}</td>
               <td><span class="pill">${escapeHtml(item.status)}</span></td>
               <td>${fmtTime(item.created_at)}</td>
-              <td><button class="secondary" data-enter="${item.id}">Enter Data</button></td>
+              <td>
+                <button class="secondary" data-enter="${item.id}">Enter Data</button>
+                <button class="secondary" data-toggle-screening="${item.id}">Screening & Eligibility</button>
+                <button class="secondary" data-rule-check-participant="${item.id}">Check Rules</button>
+              </td>
             </tr>
+            ${state.activeParticipantScreeningId === item.id ? `
+              <tr>
+                <td colspan="5">
+                  ${participantScreeningPanel(item)}
+                </td>
+              </tr>
+            ` : ""}
           `).join("")}
         </tbody>
       </table>
@@ -613,6 +634,10 @@ function entryCard(participant, form, selectedEvent) {
         <button>Save CRF</button>
         <button type="button" class="secondary" data-save-local-draft>Save Draft</button>
         <button type="button" class="secondary" data-query-form="${form.id}" data-query-participant="${participant.id}">Open Query</button>
+        ${existing.id ? `
+          <button type="button" class="secondary" data-entry-rule-check="${existing.id}">Run Rule Check</button>
+          <button type="button" class="secondary" data-entry-export-prompt="${existing.id}">Export Prompt</button>
+        ` : ""}
         ${existing.id && !locked ? `<button type="button" class="secondary" data-lock-entry="${existing.id}">Lock</button>` : ""}
         ${existing.id && locked ? `<button type="button" class="warning" data-unlock-entry="${existing.id}">Unlock</button>` : ""}
         ${existing.id && can("review_data") ? `<button type="button" class="secondary" data-entry-history="${existing.id}">History</button><button type="button" class="secondary" data-verify-field="${existing.id}">Verify Field</button><button type="button" class="secondary" data-freeze-field="${existing.id}">Freeze Field</button>${frozen ? `<button type="button" class="secondary" data-unfreeze-entry="${existing.id}">Unfreeze</button>` : `<button type="button" class="warning" data-freeze-entry="${existing.id}">Freeze Entry</button>`}` : ""}
@@ -720,6 +745,7 @@ function formsView() {
               <button class="secondary" data-edit-form="${form.id}">Edit</button>
               <button class="secondary" data-form-versions="${form.id}">Versions</button>
               <button class="secondary" data-form-action="validate" data-form-id="${form.id}">Validate</button>
+              <button class="secondary" data-form-export-prompt="${form.id}">Export Prompt</button>
               ${(form.lifecycle_state || "published") !== "published" ? `<button class="secondary" data-form-action="publish" data-form-id="${form.id}">Publish</button>` : ""}
               ${(form.lifecycle_state || "published") !== "retired" ? `<button class="secondary" data-form-action="retire" data-form-id="${form.id}">Retire</button>` : ""}
               ${(form.lifecycle_state || "published") !== "locked" ? `<button class="warning" data-form-action="lock" data-form-id="${form.id}">Lock</button>` : `<button class="secondary" data-form-action="unlock" data-form-id="${form.id}">Unlock</button>`}
@@ -1206,6 +1232,7 @@ function caseIntakeView() {
                   </td>
                   <td>
                     <button type="button" class="secondary" data-case-ai="${item.id}">AI Review</button>
+                    <button type="button" class="secondary" data-case-export-prompt="${item.id}">Export Prompt</button>
                     ${latestReview ? `<br><span class="small">${escapeHtml(latestReview.publication_guidance?.suggested_article_type || latestReview.publication_guidance?.case_report_potential || "reviewed")}</span>` : ""}
                   </td>
                   <td><span class="pill">${escapeHtml(item.status)}</span><br><span class="small">${fmtTime(item.updated_at)}</span></td>
@@ -1539,6 +1566,392 @@ function reportFilterText(filters) {
   if (filters.event_id) parts.push(`event id: ${filters.event_id}`);
   if (filters.form_id) parts.push(`form id: ${filters.form_id}`);
   return parts.length ? parts.join(", ") : "No filters";
+}
+
+function secondsToDateString(seconds) {
+  if (!seconds) return "";
+  const date = new Date(seconds * 1000);
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const dd = String(date.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function dateStringToSeconds(val) {
+  if (!val) return null;
+  return Math.floor(new Date(val + 'T00:00:00').getTime() / 1000);
+}
+
+function showPromptModal(title, promptText) {
+  let dialog = document.querySelector("#prompt-export-dialog");
+  if (!dialog) {
+    dialog = document.createElement("dialog");
+    dialog.id = "prompt-export-dialog";
+    dialog.className = "prompt-dialog";
+    document.body.appendChild(dialog);
+  }
+  
+  dialog.innerHTML = `
+    <h3>${escapeHtml(title)}</h3>
+    <p>Copy the prompt below and paste it into ChatGPT. Once ChatGPT responds, copy its markdown JSON response and use the "Import Draft" function in the AI Workbench.</p>
+    <textarea id="prompt-export-text" rows="12" readonly>${escapeHtml(promptText)}</textarea>
+    <div class="dialog-buttons">
+      <button type="button" class="secondary" id="prompt-export-copy">Copy to Clipboard</button>
+      <button type="button" id="prompt-export-close">Close</button>
+    </div>
+  `;
+
+  dialog.querySelector("#prompt-export-close").addEventListener("click", () => {
+    dialog.close();
+  });
+
+  dialog.querySelector("#prompt-export-copy").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(promptText);
+      const copyBtn = dialog.querySelector("#prompt-export-copy");
+      copyBtn.textContent = "Copied!";
+      setTimeout(() => {
+        copyBtn.textContent = "Copy to Clipboard";
+      }, 2000);
+    } catch (err) {
+      alert("Failed to copy text. Please select and copy manually.");
+    }
+  });
+
+  dialog.showModal();
+}
+
+function showImportModal() {
+  let dialog = document.querySelector("#import-draft-dialog");
+  if (!dialog) {
+    dialog = document.createElement("dialog");
+    dialog.id = "import-draft-dialog";
+    dialog.className = "prompt-dialog";
+    document.body.appendChild(dialog);
+  }
+
+  const entryOptions = state.entries.map(e => {
+    const p = state.participants.find(pt => pt.id === e.participant_id);
+    const pUid = p ? p.study_uid : "Unknown Pt";
+    const f = state.forms.find(form => form.id === e.form_id);
+    const fName = f ? f.name : "Unknown Form";
+    return `<option value="${e.id}">Entry #${e.id} (${escapeHtml(pUid)} - ${escapeHtml(fName)})</option>`;
+  }).join("");
+
+  const participantOptions = state.participants.map(p => 
+    `<option value="${p.id}">${escapeHtml(p.study_uid)} (${escapeHtml(p.initials)})</option>`
+  ).join("");
+
+  const formOptions = state.forms.map(f => 
+    `<option value="${f.id}">${escapeHtml(f.name)} (v${f.version})</option>`
+  ).join("");
+
+  dialog.innerHTML = `
+    <h3>Import ChatGPT Draft Response</h3>
+    <form id="import-chatgpt-form" class="stack">
+      <label>Entity Type
+        <select name="entity_type" id="import-entity-type" required>
+          <option value="entry">Entry (Query Drafts)</option>
+          <option value="participant">Participant (Eligibility Check)</option>
+          <option value="form">Form (CRF Optimization)</option>
+        </select>
+      </label>
+
+      <label id="import-entity-id-container">Select Target Entity
+        <select name="entity_id" id="import-entity-id" required>
+          ${entryOptions}
+        </select>
+      </label>
+
+      <label>ChatGPT Output
+        <p class="small text-muted">Paste the full response from ChatGPT. It must contain the JSON block within markdown tags (e.g. \`\`\`json ... \`\`\`).</p>
+        <textarea name="text" id="import-raw-text" rows="8" required placeholder="Paste ChatGPT output here..."></textarea>
+      </label>
+
+      <div class="dialog-buttons">
+        <button type="submit">Import Draft</button>
+        <button type="button" class="secondary" id="import-draft-close">Cancel</button>
+      </div>
+    </form>
+  `;
+
+  const entityTypeSelect = dialog.querySelector("#import-entity-type");
+  const entityIdSelect = dialog.querySelector("#import-entity-id");
+
+  entityTypeSelect.addEventListener("change", (e) => {
+    const type = e.target.value;
+    if (type === "entry") {
+      entityIdSelect.innerHTML = entryOptions || `<option value="">No entries available</option>`;
+    } else if (type === "participant") {
+      entityIdSelect.innerHTML = participantOptions || `<option value="">No participants available</option>`;
+    } else if (type === "form") {
+      entityIdSelect.innerHTML = formOptions || `<option value="">No forms available</option>`;
+    }
+  });
+
+  dialog.querySelector("#import-draft-close").addEventListener("click", () => {
+    dialog.close();
+  });
+
+  dialog.querySelector("#import-chatgpt-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const data = Object.fromEntries(new FormData(e.target));
+    
+    let draftType = "query_draft";
+    if (data.entity_type === "participant") {
+      draftType = "eligibility_check";
+    } else if (data.entity_type === "form") {
+      draftType = "crf_optimization";
+    }
+
+    try {
+      const res = await api(`/api/studies/${state.studyId}/import-ai-draft`, {
+        method: "POST",
+        body: JSON.stringify({
+          entity_type: data.entity_type,
+          entity_id: Number(data.entity_id),
+          draft_type: draftType,
+          text: data.text
+        })
+      });
+      dialog.close();
+      state.notice = `Successfully imported ${res.count || 0} draft(s).`;
+      await loadStudy();
+      render();
+    } catch (err) {
+      alert("Error importing draft: " + err.message);
+    }
+  });
+
+  dialog.showModal();
+}
+
+function participantScreeningPanel(pt) {
+  const criteria = state.study.eligibility_criteria || { inclusion: [], exclusion: [] };
+  const checklist = pt.eligibility_checklist || {};
+  const screeningDate = secondsToDateString(pt.screening_date);
+  const consentDate = secondsToDateString(pt.consent_date);
+  const evaluation = pt.eligibility_evaluation || { eligible: false, reasons: [] };
+
+  return `
+    <div class="screening-panel">
+      <h3>Screening & Eligibility Log: ${escapeHtml(pt.study_uid)}</h3>
+      <form class="screening-form stack" data-participant-id="${pt.id}">
+        <div class="form-grid">
+          <label>Screening Date
+            <input type="date" name="screening_date" value="${screeningDate}" />
+          </label>
+          <label>Recruitment Source
+            <input type="text" name="recruitment_source" value="${escapeHtml(pt.recruitment_source || "")}" placeholder="e.g., Clinic referral, Web" />
+          </label>
+          <label>Consent Status
+            <select name="consent_status">
+              <option value="pending" ${pt.consent_status === "pending" ? "selected" : ""}>pending</option>
+              <option value="obtained" ${pt.consent_status === "obtained" ? "selected" : ""}>obtained</option>
+              <option value="withdrawn" ${pt.consent_status === "withdrawn" ? "selected" : ""}>withdrawn</option>
+              <option value="not_required" ${pt.consent_status === "not_required" ? "selected" : ""}>not_required</option>
+            </select>
+          </label>
+          <label>Consent Date
+            <input type="date" name="consent_date" value="${consentDate}" />
+          </label>
+          <label>Consent Version
+            <input type="text" name="consent_version" value="${escapeHtml(pt.consent_version || "")}" placeholder="e.g., v1.0" />
+          </label>
+          <label>Participant Status
+            <select name="status">
+              <option value="screening" ${pt.status === "screening" ? "selected" : ""}>screening</option>
+              <option value="enrolled" ${pt.status === "enrolled" ? "selected" : ""}>enrolled</option>
+              <option value="completed" ${pt.status === "completed" ? "selected" : ""}>completed</option>
+              <option value="withdrawn" ${pt.status === "withdrawn" ? "selected" : ""}>withdrawn</option>
+              <option value="screen_fail" ${pt.status === "screen_fail" ? "selected" : ""}>screen_fail</option>
+            </select>
+          </label>
+        </div>
+
+        <h4>Eligibility Criteria Checklist</h4>
+        <p class="small">Eligibility evaluation checks inclusion criteria mapping for "yes" and exclusion criteria mapping for "no".</p>
+        
+        <div class="checklist-grid">
+          ${criteria.inclusion && criteria.inclusion.length ? `
+            <h5>Inclusion Criteria (Must all be YES)</h5>
+            ${criteria.inclusion.map((inc) => {
+              const val = checklist[inc.id] || "unanswered";
+              return `
+                <div class="checklist-item">
+                  <span><strong>${escapeHtml(inc.id)}</strong>: ${escapeHtml(inc.label || inc.text)}</span>
+                  <div class="checklist-options">
+                    <label><input type="radio" name="checklist_${pt.id}_${inc.id}" value="yes" ${val === "yes" ? "checked" : ""} /> Yes</label>
+                    <label><input type="radio" name="checklist_${pt.id}_${inc.id}" value="no" ${val === "no" ? "checked" : ""} /> No</label>
+                    <label><input type="radio" name="checklist_${pt.id}_${inc.id}" value="unanswered" ${val === "unanswered" ? "checked" : ""} /> Unanswered</label>
+                  </div>
+                </div>
+              `;
+            }).join("")}
+          ` : ""}
+
+          ${criteria.exclusion && criteria.exclusion.length ? `
+            <h5>Exclusion Criteria (Must all be NO)</h5>
+            ${criteria.exclusion.map((exc) => {
+              const val = checklist[exc.id] || "unanswered";
+              return `
+                <div class="checklist-item">
+                  <span><strong>${escapeHtml(exc.id)}</strong>: ${escapeHtml(exc.label || exc.text)}</span>
+                  <div class="checklist-options">
+                    <label><input type="radio" name="checklist_${pt.id}_${exc.id}" value="yes" ${val === "yes" ? "checked" : ""} /> Yes</label>
+                    <label><input type="radio" name="checklist_${pt.id}_${exc.id}" value="no" ${val === "no" ? "checked" : ""} /> No</label>
+                    <label><input type="radio" name="checklist_${pt.id}_${exc.id}" value="unanswered" ${val === "unanswered" ? "checked" : ""} /> Unanswered</label>
+                  </div>
+                </div>
+              `;
+            }).join("")}
+          ` : ""}
+
+          ${(!criteria.inclusion || !criteria.inclusion.length) && (!criteria.exclusion || !criteria.exclusion.length) ? `
+            <p class="small text-muted">No inclusion/exclusion criteria defined for this study. Edit them in Study Setup.</p>
+          ` : ""}
+        </div>
+
+        <div class="notice ${evaluation.eligible ? "ok" : "warn"}" style="margin-top: 12px;">
+          <strong>Eligibility Evaluation: ${evaluation.eligible ? "Eligible" : "Not Eligible / Pending"}</strong>
+          ${evaluation.reasons && evaluation.reasons.length ? `
+            <ul>
+              ${evaluation.reasons.map((r) => `<li>${escapeHtml(r)}</li>`).join("")}
+            </ul>
+          ` : ""}
+        </div>
+
+        <label>Screening Notes
+          <textarea name="screening_notes" rows="3" placeholder="Optional notes about screening process...">${escapeHtml(pt.screening_notes || "")}</textarea>
+        </label>
+
+        <div class="split-actions">
+          <button type="submit">Save Screening Registry</button>
+          <button type="button" class="secondary" data-toggle-screening="${pt.id}">Close Panel</button>
+        </div>
+      </form>
+    </div>
+  `;
+}
+
+function aiWorkbenchView() {
+  const m = state.recruitmentMetrics || { counts: {}, sources: {}, consent_counts: {}, total_participants: 0, screen_fail_rate: 0, conversion_rate: 0 };
+  const counts = m.counts || {};
+  const pendingDrafts = state.aiDrafts.filter(d => d.status === "pending_review");
+
+  return `
+    <section class="metrics-grid">
+      ${metric("Screening Registry", m.total_participants || 0, "Total screened/referred")}
+      ${metric("Enrolled", counts.enrolled || 0, "Active study participants")}
+      ${metric("Screen Fails", counts.screen_fail || 0, "Failed eligibility")}
+      ${metric("Conversion Rate", (m.conversion_rate || 0) + "%", "Screen-to-enrollment ratio")}
+    </section>
+
+    <div class="workbench-grid">
+      <section class="panel">
+        <div class="row">
+          <h2>Pending Review Queue</h2>
+          <button id="trigger-import-modal">Import ChatGPT Draft</button>
+        </div>
+        <p>Review and approve AI-generated queries, eligibility checks, or CRF optimizations before they are applied to the active study database.</p>
+
+        <div class="stack" style="margin-top: 16px;">
+          ${pendingDrafts.map((draft) => {
+            const data = draft.draft_json || {};
+            let detailsHtml = "";
+            let title = "";
+
+            if (draft.draft_type === "query_draft") {
+              title = `Query Draft for Participant: ${escapeHtml(draft.study_uid || "Unknown")} / Form: ${escapeHtml(draft.form_name || "Unknown")}`;
+              detailsHtml = `
+                <div class="small">
+                  <strong>Field Code:</strong> <code>${escapeHtml(data.field_code || "")}</code><br>
+                  <strong>Suggested Query Message:</strong> ${escapeHtml(data.message || "")}
+                </div>
+              `;
+            } else if (draft.draft_type === "eligibility_check") {
+              title = `Eligibility Assessment for Participant: ${escapeHtml(draft.study_uid || "Unknown")}`;
+              detailsHtml = `
+                <div class="small">
+                  <strong>Suggested Status:</strong> <span class="pill">${escapeHtml(data.suggested_status || "")}</span><br>
+                  <strong>Eligible:</strong> ${data.eligible ? "Yes" : "No"}<br>
+                  <strong>Assessment Reasons:</strong>
+                  <ul>
+                    ${(data.reasons || []).map(r => `<li>${escapeHtml(r)}</li>`).join("")}
+                  </ul>
+                  ${data.ai_reasons_text ? `<p><em>AI Explanation:</em> ${escapeHtml(data.ai_reasons_text)}</p>` : ""}
+                </div>
+              `;
+            } else if (draft.draft_type === "crf_optimization") {
+              title = `CRF Optimization for Form: ${escapeHtml(draft.form_name || "Unknown")}`;
+              const fields = data.schema?.fields || [];
+              detailsHtml = `
+                <div class="small">
+                  <strong>Optimized Fields Outline:</strong>
+                  <ul>
+                    ${fields.map(f => `<li><code>${escapeHtml(f.code)}</code> (${escapeHtml(f.type)}): ${escapeHtml(f.label)} ${f.required ? "(Required)" : ""}</li>`).join("")}
+                  </ul>
+                  <label>Full Schema JSON <textarea readonly rows="5">${escapeHtml(JSON.stringify(data.schema, null, 2))}</textarea></label>
+                </div>
+              `;
+            }
+
+            return `
+              <div class="notice" style="border-left: 4px solid var(--accent); padding: 16px; margin-bottom: 12px; background: white;">
+                <div class="row">
+                  <strong>${title}</strong>
+                  <span class="small">${fmtTime(draft.created_at)}</span>
+                </div>
+                <div style="margin: 10px 0;">
+                  ${detailsHtml}
+                </div>
+                <div class="row" style="justify-content: flex-end; gap: 12px; margin-top: 10px;">
+                  <button class="secondary" data-reject-draft="${draft.id}">Reject</button>
+                  <button data-approve-draft="${draft.id}">Approve</button>
+                </div>
+              </div>
+            `;
+          }).join("") || "<p>No pending drafts to review.</p>"}
+        </div>
+      </section>
+
+      <section class="panel stack">
+        <h2>AI Audit Trail</h2>
+        <p class="small text-muted">Recent AI Workbench actions logs (last 100 entries):</p>
+        <div class="stack" style="max-height: 500px; overflow-y: auto; border: 1px solid var(--line); padding: 12px; border-radius: 8px; background: white;">
+          ${state.aiAuditLog.map((log) => {
+            const payload = log.payload_json || {};
+            let details = "";
+            if (log.action === "rule_check") {
+              details = `Checked rules. Issues: ${payload.issues_found || 0}, Drafts created: ${payload.drafts_created || 0}`;
+            } else if (log.action === "export_chatgpt") {
+              details = `Exported prompt for manual ChatGPT processing.`;
+            } else if (log.action === "import_ai_draft") {
+              details = `Imported ChatGPT response. Drafts inserted: ${payload.inserted_count || 0}`;
+            } else if (log.action === "review_approve") {
+              details = `Approved draft ID: ${payload.draft_id}`;
+            } else if (log.action === "review_reject") {
+              details = `Rejected draft ID: ${payload.draft_id}`;
+            }
+
+            return `
+              <div class="audit-list-item">
+                <div class="row small">
+                  <strong>${escapeHtml(log.action.replace("_", " ").toUpperCase())}</strong>
+                  <span>${fmtTime(log.created_at)}</span>
+                </div>
+                <div class="small text-muted">
+                  By: ${escapeHtml(log.display_name || "Unknown")}<br>
+                  Entity: ${escapeHtml(log.entity_type)} (${log.entity_id})<br>
+                  ${details}
+                </div>
+              </div>
+            `;
+          }).join("") || "<p class='small'>No audit logs recorded yet.</p>"}
+        </div>
+      </section>
+    </div>
+  `;
 }
 
 function localDraftsView() {
@@ -2058,6 +2471,171 @@ function bindRoute() {
   }));
   document.querySelectorAll("[data-form-versions]").forEach((button) => button.addEventListener("click", () => showFormVersions(button.dataset.formVersions)));
   document.querySelectorAll("[data-form-action]").forEach((button) => button.addEventListener("click", () => setFormLifecycle(button.dataset.formId, button.dataset.formAction)));
+
+  // Form prompt export
+  document.querySelectorAll("[data-form-export-prompt]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const formId = button.dataset.formExportPrompt;
+      try {
+        const res = await api(`/api/studies/${state.studyId}/forms/${formId}/export-chatgpt`, { method: "POST" });
+        showPromptModal(`CRF Optimization Prompt for Form #${formId}`, res.prompt);
+      } catch (err) {
+        alert("Failed to export prompt: " + err.message);
+      }
+    });
+  });
+
+  // Entry rule check
+  document.querySelectorAll("[data-entry-rule-check]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const entryId = button.dataset.entryRuleCheck;
+      try {
+        const res = await api(`/api/studies/${state.studyId}/entries/${entryId}/rule-check`, { method: "POST" });
+        state.notice = `Rule check completed. Issues found: ${res.issues_found || 0}. Drafts created: ${res.drafts_created || 0}`;
+        await loadStudy();
+        render();
+      } catch (err) {
+        alert("Rule check failed: " + err.message);
+      }
+    });
+  });
+
+  // Entry prompt export
+  document.querySelectorAll("[data-entry-export-prompt]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const entryId = button.dataset.entryExportPrompt;
+      try {
+        const res = await api(`/api/studies/${state.studyId}/entries/${entryId}/export-chatgpt`, { method: "POST" });
+        showPromptModal(`Data Consistency Prompt for Entry #${entryId}`, res.prompt);
+      } catch (err) {
+        alert("Failed to export prompt: " + err.message);
+      }
+    });
+  });
+
+  // Case prompt export
+  document.querySelectorAll("[data-case-export-prompt]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const caseId = button.dataset.caseExportPrompt;
+      try {
+        const res = await api(`/api/studies/${state.studyId}/case-intake/${caseId}/export-chatgpt`, { method: "POST" });
+        showPromptModal(`Eligibility Screening Prompt for Case #${caseId}`, res.prompt);
+      } catch (err) {
+        alert("Failed to export prompt: " + err.message);
+      }
+    });
+  });
+
+  // Participant screening panel toggle
+  document.querySelectorAll("[data-toggle-screening]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const ptId = Number(button.dataset.toggleScreening);
+      if (state.activeParticipantScreeningId === ptId) {
+        state.activeParticipantScreeningId = null;
+      } else {
+        state.activeParticipantScreeningId = ptId;
+      }
+      render();
+    });
+  });
+
+  // Participant rule check
+  document.querySelectorAll("[data-rule-check-participant]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const ptId = button.dataset.ruleCheckParticipant;
+      try {
+        const res = await api(`/api/studies/${state.studyId}/participants/${ptId}/rule-check`, { method: "POST" });
+        state.notice = `Participant eligibility check completed. Eligible: ${res.eligible ? "Yes" : "No"}. Suggested status: ${res.suggested_status || "screening"}`;
+        await loadStudy();
+        render();
+      } catch (err) {
+        alert("Eligibility check failed: " + err.message);
+      }
+    });
+  });
+
+  // Screening log form submission
+  document.querySelectorAll(".screening-form").forEach((form) => {
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const ptId = form.dataset.participantId;
+      const formData = new FormData(form);
+      const data = Object.fromEntries(formData.entries());
+
+      const eligibility_checklist = {};
+      const prefix = `checklist_${ptId}_`;
+      for (const [key, value] of formData.entries()) {
+        if (key.startsWith(prefix)) {
+          const criterionId = key.substring(prefix.length);
+          eligibility_checklist[criterionId] = value;
+        }
+      }
+
+      const screening_date = dateStringToSeconds(data.screening_date);
+      const consent_date = dateStringToSeconds(data.consent_date);
+
+      const payload = {
+        screening_date,
+        recruitment_source: data.recruitment_source,
+        consent_status: data.consent_status,
+        consent_date,
+        consent_version: data.consent_version,
+        status: data.status,
+        eligibility_checklist,
+        screening_notes: data.screening_notes
+      };
+
+      try {
+        await api(`/api/studies/${state.studyId}/participants/${ptId}`, {
+          method: "PATCH",
+          body: JSON.stringify(payload)
+        });
+        state.notice = "Screening registry and checklist successfully updated.";
+        await loadStudy();
+        render();
+      } catch (err) {
+        alert("Failed to update participant screening registry: " + err.message);
+      }
+    });
+  });
+
+  // AI draft queue approval/rejection click
+  document.querySelectorAll("[data-approve-draft]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const draftId = button.dataset.approveDraft;
+      try {
+        await api(`/api/studies/${state.studyId}/ai-drafts/${draftId}/review`, {
+          method: "POST",
+          body: JSON.stringify({ action: "approve" })
+        });
+        state.notice = "Draft approved successfully.";
+        await loadStudy();
+        render();
+      } catch (err) {
+        alert("Failed to approve draft: " + err.message);
+      }
+    });
+  });
+
+  document.querySelectorAll("[data-reject-draft]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const draftId = button.dataset.rejectDraft;
+      try {
+        await api(`/api/studies/${state.studyId}/ai-drafts/${draftId}/review`, {
+          method: "POST",
+          body: JSON.stringify({ action: "reject" })
+        });
+        state.notice = "Draft rejected successfully.";
+        await loadStudy();
+        render();
+      } catch (err) {
+        alert("Failed to reject draft: " + err.message);
+      }
+    });
+  });
+
+  // Trigger import modal
+  document.querySelector("#trigger-import-modal")?.addEventListener("click", showImportModal);
 }
 
 function applyBranching(form) {

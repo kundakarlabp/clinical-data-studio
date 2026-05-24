@@ -16,3 +16,4 @@ exports/
 *.log
 node_modules/
 tools/
+scratch/

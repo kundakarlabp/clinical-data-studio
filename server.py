@@ -104,7 +104,29 @@ def now() -> int:
     return int(time.time())
 
 
+def sync_cds_globals():
+    import cds.db
+    import cds.services.backup_service
+    import cds.routes.backups
+    
+    cds.db.DATA = DATA
+    cds.db.BACKUPS = BACKUPS
+    cds.db.UPLOADS = UPLOADS
+    cds.db.DB_PATH = DB_PATH
+    cds.db.DATABASE_BACKEND = DATABASE_BACKEND
+    cds.db.DATABASE_URL = DATABASE_URL
+    
+    cds.services.backup_service.DATA = DATA
+    cds.services.backup_service.BACKUPS = BACKUPS
+    cds.services.backup_service.UPLOADS = UPLOADS
+    cds.services.backup_service.DB_PATH = DB_PATH
+    cds.services.backup_service.DATABASE_BACKEND = DATABASE_BACKEND
+    cds.services.backup_service.DATABASE_URL = DATABASE_URL
+    
+    cds.routes.backups.BACKUPS = BACKUPS
+
 def db() -> sqlite3.Connection:
+    sync_cds_globals()
     DATA.mkdir(parents=True, exist_ok=True)
     BACKUPS.mkdir(parents=True, exist_ok=True)
     UPLOADS.mkdir(parents=True, exist_ok=True)
@@ -1094,491 +1116,9 @@ def audit_filters(study_id: int, query: dict[str, list[str]] | None = None) -> t
 
 
 def migrate() -> None:
+    from cds.db.migrations import run_migrations
     with closing(db()) as conn, conn:
-        if getattr(conn, "backend", "sqlite") == "postgres":
-            migrate_postgres(conn)
-            add_column(conn, "api_tokens", "scopes_json", "TEXT NOT NULL DEFAULT '[]'")
-            add_column(conn, "audit_log", "study_id", "BIGINT")
-            add_column(conn, "audit_log", "ip_address", "TEXT NOT NULL DEFAULT ''")
-            add_column(conn, "audit_log", "user_agent", "TEXT NOT NULL DEFAULT ''")
-            add_column(conn, "audit_log", "request_id", "TEXT NOT NULL DEFAULT ''")
-            add_column(conn, "forms", "active", "INTEGER NOT NULL DEFAULT 1")
-            add_column(conn, "forms", "lifecycle_state", "TEXT NOT NULL DEFAULT 'published'")
-            add_column(conn, "studies", "ai_policy_json", "TEXT NOT NULL DEFAULT '{}'")
-            add_column(conn, "studies", "eligibility_criteria_json", "TEXT NOT NULL DEFAULT '{}'")
-            add_column(conn, "queries", "entry_id", "BIGINT REFERENCES entries(id) ON DELETE SET NULL")
-            add_column(conn, "queries", "due_at", "BIGINT")
-            add_column(conn, "queries", "closed_at", "BIGINT")
-            add_column(conn, "queries", "closed_by", "BIGINT REFERENCES users(id)")
-            add_column(conn, "survey_links", "expires_at", "BIGINT")
-            add_column(conn, "survey_links", "one_time", "INTEGER NOT NULL DEFAULT 0")
-            add_column(conn, "academic_cv_items", "active", "INTEGER NOT NULL DEFAULT 1")
-            add_column(conn, "case_files", "original_filename", "TEXT NOT NULL DEFAULT ''")
-            add_column(conn, "case_files", "stored_filename", "TEXT NOT NULL DEFAULT ''")
-            add_column(conn, "case_files", "sha256", "TEXT NOT NULL DEFAULT ''")
-            add_column(conn, "participants", "recruitment_source", "TEXT NOT NULL DEFAULT ''")
-            add_column(conn, "participants", "screening_date", "BIGINT")
-            add_column(conn, "participants", "consent_date", "BIGINT")
-            add_column(conn, "participants", "consent_status", "TEXT NOT NULL DEFAULT 'pending'")
-            add_column(conn, "participants", "consent_version", "TEXT NOT NULL DEFAULT ''")
-            add_column(conn, "participants", "eligibility_checklist_json", "TEXT NOT NULL DEFAULT '{}'")
-            add_column(conn, "participants", "screening_notes", "TEXT NOT NULL DEFAULT ''")
-            seed_initial_data(conn)
-            return
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                display_name TEXT NOT NULL,
-                role TEXT NOT NULL DEFAULT 'admin',
-                active INTEGER NOT NULL DEFAULT 1,
-                must_change_password INTEGER NOT NULL DEFAULT 0,
-                failed_login_count INTEGER NOT NULL DEFAULT 0,
-                locked_until INTEGER NOT NULL DEFAULT 0,
-                created_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS data_groups (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
-                name TEXT NOT NULL,
-                code TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                UNIQUE(study_id, code)
-            );
-
-            CREATE TABLE IF NOT EXISTS study_memberships (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                role TEXT NOT NULL DEFAULT 'data_entry',
-                data_group_id INTEGER REFERENCES data_groups(id) ON DELETE SET NULL,
-                active INTEGER NOT NULL DEFAULT 1,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                UNIQUE(study_id, user_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS sessions (
-                token TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL REFERENCES users(id),
-                expires_at INTEGER NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS studies (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                protocol_id TEXT NOT NULL DEFAULT '',
-                description TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'draft',
-                ai_policy_json TEXT NOT NULL DEFAULT '{}',
-                eligibility_criteria_json TEXT NOT NULL DEFAULT '{}',
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS forms (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
-                name TEXT NOT NULL,
-                code TEXT NOT NULL,
-                schema_json TEXT NOT NULL,
-                version INTEGER NOT NULL DEFAULT 1,
-                active INTEGER NOT NULL DEFAULT 1,
-                lifecycle_state TEXT NOT NULL DEFAULT 'published',
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                UNIQUE(study_id, code)
-            );
-
-            CREATE TABLE IF NOT EXISTS study_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
-                name TEXT NOT NULL,
-                code TEXT NOT NULL,
-                arm_name TEXT NOT NULL DEFAULT 'Default',
-                day_offset INTEGER NOT NULL DEFAULT 0,
-                display_order INTEGER NOT NULL DEFAULT 1,
-                active INTEGER NOT NULL DEFAULT 1,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                UNIQUE(study_id, code)
-            );
-
-            CREATE TABLE IF NOT EXISTS form_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
-                event_id INTEGER NOT NULL REFERENCES study_events(id) ON DELETE CASCADE,
-                form_id INTEGER NOT NULL REFERENCES forms(id) ON DELETE CASCADE,
-                required INTEGER NOT NULL DEFAULT 1,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                UNIQUE(event_id, form_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS survey_links (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
-                form_id INTEGER NOT NULL REFERENCES forms(id) ON DELETE CASCADE,
-                event_id INTEGER REFERENCES study_events(id) ON DELETE SET NULL,
-                token TEXT UNIQUE NOT NULL,
-                title TEXT NOT NULL,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                consent_required INTEGER NOT NULL DEFAULT 0,
-                consent_text TEXT NOT NULL DEFAULT '',
-                created_by INTEGER REFERENCES users(id),
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS form_versions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                form_id INTEGER NOT NULL REFERENCES forms(id) ON DELETE CASCADE,
-                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
-                version INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                code TEXT NOT NULL,
-                schema_json TEXT NOT NULL,
-                saved_by INTEGER REFERENCES users(id),
-                saved_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS participants (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
-                data_group_id INTEGER REFERENCES data_groups(id) ON DELETE SET NULL,
-                study_uid TEXT NOT NULL,
-                initials TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'screening',
-                recruitment_source TEXT NOT NULL DEFAULT '',
-                screening_date INTEGER,
-                consent_date INTEGER,
-                consent_status TEXT NOT NULL DEFAULT 'pending',
-                consent_version TEXT NOT NULL DEFAULT '',
-                eligibility_checklist_json TEXT NOT NULL DEFAULT '{}',
-                screening_notes TEXT NOT NULL DEFAULT '',
-                metadata_json TEXT NOT NULL DEFAULT '{}',
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                UNIQUE(study_id, study_uid)
-            );
-
-            CREATE TABLE IF NOT EXISTS entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
-                participant_id INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
-                form_id INTEGER NOT NULL REFERENCES forms(id) ON DELETE CASCADE,
-                event_id INTEGER REFERENCES study_events(id) ON DELETE SET NULL,
-                event_name TEXT NOT NULL DEFAULT 'Baseline',
-                repeat_instance INTEGER NOT NULL DEFAULT 1,
-                status TEXT NOT NULL DEFAULT 'draft',
-                data_json TEXT NOT NULL DEFAULT '{}',
-                form_version INTEGER NOT NULL DEFAULT 1,
-                schema_snapshot_json TEXT NOT NULL DEFAULT '{}',
-                entry_hash TEXT NOT NULL DEFAULT '',
-                created_by INTEGER REFERENCES users(id),
-                updated_by INTEGER REFERENCES users(id),
-                locked_at INTEGER,
-                locked_by INTEGER REFERENCES users(id),
-                lock_reason TEXT NOT NULL DEFAULT '',
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                UNIQUE(participant_id, form_id, event_name, repeat_instance)
-            );
-
-            CREATE TABLE IF NOT EXISTS queries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
-                participant_id INTEGER REFERENCES participants(id) ON DELETE CASCADE,
-                form_id INTEGER REFERENCES forms(id) ON DELETE CASCADE,
-                entry_id INTEGER REFERENCES entries(id) ON DELETE SET NULL,
-                field_code TEXT NOT NULL DEFAULT '',
-                message TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'open',
-                created_by INTEGER REFERENCES users(id),
-                assigned_to INTEGER REFERENCES users(id),
-                due_at INTEGER,
-                closed_at INTEGER,
-                closed_by INTEGER REFERENCES users(id),
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS query_responses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                query_id INTEGER NOT NULL REFERENCES queries(id) ON DELETE CASCADE,
-                user_id INTEGER REFERENCES users(id),
-                message TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS field_states (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
-                field_code TEXT NOT NULL,
-                state TEXT NOT NULL,
-                reason TEXT NOT NULL DEFAULT '',
-                user_id INTEGER REFERENCES users(id),
-                created_at INTEGER NOT NULL,
-                UNIQUE(entry_id, field_code, state)
-            );
-
-            CREATE TABLE IF NOT EXISTS consent_signatures (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
-                participant_id INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
-                entry_id INTEGER REFERENCES entries(id) ON DELETE SET NULL,
-                signer_name TEXT NOT NULL,
-                signature_text TEXT NOT NULL,
-                consent_text TEXT NOT NULL,
-                ip_address TEXT NOT NULL DEFAULT '',
-                user_agent TEXT NOT NULL DEFAULT '',
-                created_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS survey_invitations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
-                survey_link_id INTEGER NOT NULL REFERENCES survey_links(id) ON DELETE CASCADE,
-                participant_id INTEGER REFERENCES participants(id) ON DELETE SET NULL,
-                contact TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                invite_token TEXT UNIQUE NOT NULL,
-                last_sent_at INTEGER,
-                reminder_count INTEGER NOT NULL DEFAULT 0,
-                completed_at INTEGER,
-                created_by INTEGER REFERENCES users(id),
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS audit_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER REFERENCES users(id),
-                action TEXT NOT NULL,
-                entity_type TEXT NOT NULL,
-                entity_id INTEGER,
-                before_json TEXT,
-                after_json TEXT,
-                created_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS reports (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
-                name TEXT NOT NULL,
-                description TEXT NOT NULL DEFAULT '',
-                filters_json TEXT NOT NULL DEFAULT '{}',
-                created_by INTEGER REFERENCES users(id),
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS case_intakes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
-                participant_id INTEGER REFERENCES participants(id) ON DELETE SET NULL,
-                case_uid TEXT NOT NULL,
-                title TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'draft',
-                source_text TEXT NOT NULL DEFAULT '',
-                extracted_json TEXT NOT NULL DEFAULT '{}',
-                tags_json TEXT NOT NULL DEFAULT '[]',
-                created_by INTEGER REFERENCES users(id),
-                updated_by INTEGER REFERENCES users(id),
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                UNIQUE(study_id, case_uid)
-            );
-
-            CREATE TABLE IF NOT EXISTS case_files (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                case_id INTEGER NOT NULL REFERENCES case_intakes(id) ON DELETE CASCADE,
-                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
-                name TEXT NOT NULL,
-                original_filename TEXT NOT NULL DEFAULT '',
-                stored_filename TEXT NOT NULL DEFAULT '',
-                content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
-                size INTEGER NOT NULL DEFAULT 0,
-                sha256 TEXT NOT NULL DEFAULT '',
-                data_base64 TEXT NOT NULL DEFAULT '',
-                created_by INTEGER REFERENCES users(id),
-                created_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS case_ai_reviews (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                case_id INTEGER NOT NULL REFERENCES case_intakes(id) ON DELETE CASCADE,
-                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
-                user_prompt TEXT NOT NULL DEFAULT '',
-                mode TEXT NOT NULL DEFAULT 'local',
-                response_json TEXT NOT NULL DEFAULT '{}',
-                file_count INTEGER NOT NULL DEFAULT 0,
-                created_by INTEGER REFERENCES users(id),
-                created_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS ai_audit (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-                study_id INTEGER REFERENCES studies(id) ON DELETE CASCADE,
-                case_id INTEGER REFERENCES case_intakes(id) ON DELETE SET NULL,
-                provider TEXT NOT NULL DEFAULT 'local',
-                model TEXT NOT NULL DEFAULT 'local-rules',
-                mode TEXT NOT NULL DEFAULT 'local',
-                purpose TEXT NOT NULL DEFAULT '',
-                input_type TEXT NOT NULL DEFAULT 'text',
-                phi_detected INTEGER NOT NULL DEFAULT 0,
-                phi_allowed INTEGER NOT NULL DEFAULT 0,
-                deidentified INTEGER NOT NULL DEFAULT 0,
-                file_count INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'ok',
-                error TEXT NOT NULL DEFAULT '',
-                created_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS academic_cv_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
-                item_type TEXT NOT NULL DEFAULT 'publication',
-                title TEXT NOT NULL,
-                role TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'planned',
-                item_date TEXT NOT NULL DEFAULT '',
-                citation TEXT NOT NULL DEFAULT '',
-                notes TEXT NOT NULL DEFAULT '',
-                linked_case_id INTEGER REFERENCES case_intakes(id) ON DELETE SET NULL,
-                metadata_json TEXT NOT NULL DEFAULT '{}',
-                active INTEGER NOT NULL DEFAULT 1,
-                created_by INTEGER REFERENCES users(id),
-                updated_by INTEGER REFERENCES users(id),
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS academic_outputs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
-                output_type TEXT NOT NULL DEFAULT 'publication_idea',
-                title TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'idea',
-                linked_case_id INTEGER REFERENCES case_intakes(id) ON DELETE SET NULL,
-                participant_ids_json TEXT NOT NULL DEFAULT '[]',
-                evidence_file_ids_json TEXT NOT NULL DEFAULT '[]',
-                dataset_ref TEXT NOT NULL DEFAULT '',
-                notes TEXT NOT NULL DEFAULT '',
-                metadata_json TEXT NOT NULL DEFAULT '{}',
-                active INTEGER NOT NULL DEFAULT 1,
-                created_by INTEGER REFERENCES users(id),
-                updated_by INTEGER REFERENCES users(id),
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS api_tokens (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                token_hash TEXT UNIQUE NOT NULL,
-                label TEXT NOT NULL,
-                active INTEGER NOT NULL DEFAULT 1,
-                created_at INTEGER NOT NULL,
-                last_used_at INTEGER
-            );
-
-            CREATE TABLE IF NOT EXISTS randomization_lists (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
-                name TEXT NOT NULL,
-                arms_json TEXT NOT NULL,
-                next_index INTEGER NOT NULL DEFAULT 0,
-                active INTEGER NOT NULL DEFAULT 1,
-                created_by INTEGER REFERENCES users(id),
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS randomization_allocations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
-                list_id INTEGER NOT NULL REFERENCES randomization_lists(id) ON DELETE CASCADE,
-                participant_id INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
-                arm TEXT NOT NULL,
-                allocated_by INTEGER REFERENCES users(id),
-                created_at INTEGER NOT NULL,
-                UNIQUE(list_id, participant_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS ai_drafts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
-                entity_type TEXT NOT NULL,
-                entity_id INTEGER NOT NULL,
-                draft_type TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending_review',
-                draft_json TEXT NOT NULL DEFAULT '{}',
-                rule_metadata_json TEXT NOT NULL DEFAULT '{}',
-                created_by INTEGER REFERENCES users(id),
-                updated_by INTEGER REFERENCES users(id),
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS ai_audit_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                study_id INTEGER NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
-                user_id INTEGER REFERENCES users(id),
-                action TEXT NOT NULL,
-                entity_type TEXT NOT NULL,
-                entity_id INTEGER,
-                payload_json TEXT NOT NULL DEFAULT '{}',
-                created_at INTEGER NOT NULL
-            );
-            """
-        )
-        add_column(conn, "entries", "repeat_instance", "INTEGER NOT NULL DEFAULT 1")
-        add_column(conn, "entries", "locked_at", "INTEGER")
-        add_column(conn, "entries", "locked_by", "INTEGER REFERENCES users(id)")
-        add_column(conn, "entries", "lock_reason", "TEXT NOT NULL DEFAULT ''")
-        add_column(conn, "entries", "event_id", "INTEGER REFERENCES study_events(id) ON DELETE SET NULL")
-        add_column(conn, "entries", "form_version", "INTEGER NOT NULL DEFAULT 1")
-        add_column(conn, "entries", "schema_snapshot_json", "TEXT NOT NULL DEFAULT '{}'")
-        add_column(conn, "entries", "entry_hash", "TEXT NOT NULL DEFAULT ''")
-        add_column(conn, "queries", "entry_id", "INTEGER REFERENCES entries(id) ON DELETE SET NULL")
-        add_column(conn, "queries", "due_at", "INTEGER")
-        add_column(conn, "queries", "closed_at", "INTEGER")
-        add_column(conn, "queries", "closed_by", "INTEGER REFERENCES users(id)")
-        add_column(conn, "participants", "data_group_id", "INTEGER REFERENCES data_groups(id) ON DELETE SET NULL")
-        add_column(conn, "participants", "recruitment_source", "TEXT NOT NULL DEFAULT ''")
-        add_column(conn, "participants", "screening_date", "INTEGER")
-        add_column(conn, "participants", "consent_date", "INTEGER")
-        add_column(conn, "participants", "consent_status", "TEXT NOT NULL DEFAULT 'pending'")
-        add_column(conn, "participants", "consent_version", "TEXT NOT NULL DEFAULT ''")
-        add_column(conn, "participants", "eligibility_checklist_json", "TEXT NOT NULL DEFAULT '{}'")
-        add_column(conn, "participants", "screening_notes", "TEXT NOT NULL DEFAULT ''")
-        add_column(conn, "users", "must_change_password", "INTEGER NOT NULL DEFAULT 0")
-        add_column(conn, "users", "failed_login_count", "INTEGER NOT NULL DEFAULT 0")
-        add_column(conn, "users", "locked_until", "INTEGER NOT NULL DEFAULT 0")
-        add_column(conn, "api_tokens", "scopes_json", "TEXT NOT NULL DEFAULT '[]'")
-        add_column(conn, "audit_log", "study_id", "INTEGER")
-        add_column(conn, "audit_log", "ip_address", "TEXT NOT NULL DEFAULT ''")
-        add_column(conn, "audit_log", "user_agent", "TEXT NOT NULL DEFAULT ''")
-        add_column(conn, "audit_log", "request_id", "TEXT NOT NULL DEFAULT ''")
-        add_column(conn, "forms", "active", "INTEGER NOT NULL DEFAULT 1")
-        add_column(conn, "forms", "lifecycle_state", "TEXT NOT NULL DEFAULT 'published'")
-        add_column(conn, "studies", "ai_policy_json", "TEXT NOT NULL DEFAULT '{}'")
-        add_column(conn, "studies", "eligibility_criteria_json", "TEXT NOT NULL DEFAULT '{}'")
-        add_column(conn, "survey_links", "expires_at", "INTEGER")
-        add_column(conn, "survey_links", "one_time", "INTEGER NOT NULL DEFAULT 0")
-        add_column(conn, "academic_cv_items", "active", "INTEGER NOT NULL DEFAULT 1")
-        add_column(conn, "case_files", "original_filename", "TEXT NOT NULL DEFAULT ''")
-        add_column(conn, "case_files", "stored_filename", "TEXT NOT NULL DEFAULT ''")
-        add_column(conn, "case_files", "sha256", "TEXT NOT NULL DEFAULT ''")
-        add_column(conn, "academic_outputs", "active", "INTEGER NOT NULL DEFAULT 1")
+        run_migrations(conn)
         migrate_entries_unique_key(conn)
         seed_initial_data(conn)
         add_production_indexes(conn)
@@ -2855,6 +2395,14 @@ def membership_has(membership: dict | None, permission: str) -> bool:
 class App(BaseHTTPRequestHandler):
     server_version = "ClinicalDataStudio/0.1"
 
+    def send_response(self, code, message=None):
+        if hasattr(self, "conn") and self.conn:
+            try:
+                self.conn.commit()
+            except Exception:
+                pass
+        super().send_response(code, message)
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/healthz":
@@ -3040,6 +2588,7 @@ class App(BaseHTTPRequestHandler):
     def handle_api(self, method: str, path: str, query: dict[str, list[str]]) -> None:
         try:
             with closing(db()) as conn, conn:
+                self.conn = conn
                 if path == "/api/login" and method == "POST":
                     return self.login(conn)
                 if path == "/api/logout" and method == "POST":
@@ -3108,39 +2657,12 @@ class App(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             self.send_error_json("Invalid JSON body", 400)
         except Exception as exc:
+            LOGGER.exception("Internal Server Error in API handler")
             self.send_error_json(f"Server error: {exc}", 500)
 
     def login(self, conn: sqlite3.Connection) -> None:
-        payload = self.body()
-        username = str(payload.get("username", "")).strip()
-        password = str(payload.get("password", ""))
-        user = row(conn, "SELECT * FROM users WHERE username = ? AND active = 1", (username,))
-        if user and user.get("locked_until", 0) and user["locked_until"] > now():
-            self.send_error_json("Account is temporarily locked after repeated failed logins", 423)
-            return
-        if not user or not verify_password(password, user["password_hash"]):
-            if user:
-                failed = int(user.get("failed_login_count") or 0) + 1
-                locked_until = now() + 15 * 60 if failed >= 5 else 0
-                conn.execute("UPDATE users SET failed_login_count = ?, locked_until = ? WHERE id = ?", (failed, locked_until, user["id"]))
-                audit(conn, user["id"], "failed_login", "user", user["id"], None, {"failed_login_count": failed, "locked": bool(locked_until)}, **self.audit_context())
-                conn.commit()
-            self.send_error_json("Invalid username or password", 401)
-            return
-        token = secrets.token_urlsafe(32)
-        prune_expired_sessions(conn)
-        conn.execute("UPDATE users SET failed_login_count = 0, locked_until = 0 WHERE id = ?", (user["id"],))
-        conn.execute("INSERT INTO sessions(token, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)", (session_token_digest(token), user["id"], now() + SESSION_TTL_SECONDS, now()))
-        audit(conn, user["id"], "login", "session", None, None, {"username": username}, **self.audit_context())
-        conn.commit()
-        self.queue_header("Set-Cookie", self.session_cookie_header(token))
-        self.send_json(
-            {
-                "session": "cookie",
-                "csrf_required": True,
-                "user": {"id": user["id"], "username": user["username"], "display_name": user["display_name"], "role": user["role"], "must_change_password": user.get("must_change_password", 0)},
-            }
-        )
+        from cds.routes.auth import login as auth_login
+        return auth_login(self, conn)
 
     def first_run_setup(self, conn: sqlite3.Connection) -> None:
         if not setup_required(conn):
@@ -3173,18 +2695,8 @@ class App(BaseHTTPRequestHandler):
         self.send_json({"ok": True})
 
     def logout(self, conn: sqlite3.Connection) -> None:
-        header = self.headers.get("authorization", "")
-        token = header.removeprefix("Bearer ").strip() if header.startswith("Bearer ") else ""
-        if not token:
-            token = self.cookies().get(SESSION_COOKIE_NAME, "")
-        if token:
-            digest = session_token_digest(token)
-            session = row(conn, "SELECT user_id FROM sessions WHERE token = ?", (digest,))
-            conn.execute("DELETE FROM sessions WHERE token = ?", (digest,))
-            audit(conn, session["user_id"] if session else None, "logout", "session", None, None, {"logged_out": bool(session)}, **self.audit_context())
-            conn.commit()
-        self.clear_session_cookie()
-        self.send_json({"ok": True})
+        from cds.routes.auth import logout as auth_logout
+        return auth_logout(self, conn)
 
     def user_from_api_token(self, conn: sqlite3.Connection, raw_token: str) -> tuple[dict, dict] | tuple[None, None]:
         if not raw_token:
@@ -3205,106 +2717,8 @@ class App(BaseHTTPRequestHandler):
         return False
 
     def redcap_api(self, conn: sqlite3.Connection, method: str, query: dict[str, list[str]]) -> None:
-        if method not in {"GET", "POST"}:
-            self.send_error_json("Unsupported REDCap-style API method", 405)
-            return
-        values = {key: value[-1] for key, value in query.items() if value}
-        if method == "POST":
-            values.update(self.request_values())
-        raw_token = str(values.get("token") or self.headers.get("x-cds-api-token", "")).strip()
-        user, token_row = self.user_from_api_token(conn, raw_token)
-        if not user:
-            self.send_error_json("Invalid API token", 401)
-            return
-        study_id = token_row["study_id"]
-        membership = user_membership(conn, user, study_id)
-        if not membership:
-            self.send_error_json("Study access denied", 403)
-            return
-        content = str(values.get("content", "project")).strip().lower()
-        action = str(values.get("action", "export")).strip().lower()
-        output_format = str(values.get("format", "json")).strip().lower()
-        audit(conn, user["id"], "api_request", "api_token", token_row["id"], None, {"content": content, "action": action, "format": output_format})
-        if content in {"version", "api_version"}:
-            return self.send_redcap_payload({"api_version": "local-redcap-style-v1", "application": "Clinical Data Studio"}, output_format)
-        if content in {"project", "project_info"}:
-            if not self.require_token_scope(token_row, "metadata:read"):
-                return
-            payload = row(conn, "SELECT * FROM studies WHERE id = ?", (study_id,))
-            return self.send_redcap_payload(payload, output_format)
-        if content in {"metadata", "data_dictionary"}:
-            if not self.require_token_scope(token_row, "metadata:read"):
-                return
-            payload = self.metadata_payload(conn, study_id)["data_dictionary"]
-            return self.send_redcap_payload(payload, output_format)
-        if content in {"instrument", "instruments"}:
-            if not self.require_token_scope(token_row, "metadata:read"):
-                return
-            payload = self.metadata_payload(conn, study_id)["instruments"]
-            return self.send_redcap_payload(payload, output_format)
-        if content in {"event", "events"}:
-            if not self.require_token_scope(token_row, "metadata:read"):
-                return
-            payload = rows(conn, "SELECT name AS event_name, code AS unique_event_name, arm_name, day_offset FROM study_events WHERE study_id = ? ORDER BY display_order", (study_id,))
-            return self.send_redcap_payload(payload, output_format)
-        if content in {"arm", "arms"}:
-            if not self.require_token_scope(token_row, "metadata:read"):
-                return
-            payload = self.arm_payload(conn, study_id)
-            return self.send_redcap_payload(payload, output_format)
-        if content in {"dag", "dags", "data_access_group", "data_access_groups"}:
-            if not self.require_token_scope(token_row, "metadata:read"):
-                return
-            if not membership_has(membership, "manage_users"):
-                self.send_error_json("User management permission required", 403)
-                return
-            payload = rows(conn, "SELECT code AS unique_group_name, name AS data_access_group_name FROM data_groups WHERE study_id = ? ORDER BY name", (study_id,))
-            return self.send_redcap_payload(payload, output_format)
-        if content in {"user", "users", "user_rights"}:
-            if not self.require_token_scope(token_row, "metadata:read"):
-                return
-            if not membership_has(membership, "manage_users"):
-                self.send_error_json("User management permission required", 403)
-                return
-            payload = self.user_rights_payload(conn, study_id)
-            return self.send_redcap_payload(payload, output_format)
-        if content in {"record", "records"}:
-            if action == "import":
-                if not self.require_token_scope(token_row, "records:write"):
-                    return
-                if not membership_has(membership, "enter_data"):
-                    self.send_error_json("Data entry permission required", 403)
-                    return
-                csv_text = str(values.get("data", ""))
-                if not csv_text and output_format == "json":
-                    records = json.loads(str(values.get("records", "[]")))
-                    csv_text = self.records_json_to_csv(records)
-                return self.import_records_from_csv(conn, user, study_id, membership, csv_text)
-            if not self.require_token_scope(token_row, "records:read"):
-                return
-            if not membership_has(membership, "export_data") and not membership_has(membership, "view_analysis"):
-                self.send_error_json("Export permission required", 403)
-                return
-            payload = self.record_payload(conn, study_id, membership, {})
-            return self.send_redcap_payload(payload, output_format, self.record_fieldnames(conn, study_id))
-        if content == "randomization":
-            if action != "allocate":
-                if not self.require_token_scope(token_row, "metadata:read"):
-                    return
-                payload = rows(conn, "SELECT * FROM randomization_lists WHERE study_id = ? AND active = 1", (study_id,))
-                return self.send_redcap_payload(payload, output_format)
-            if not self.require_token_scope(token_row, "randomization:write"):
-                return
-            participant_uid = str(values.get("study_uid", "")).strip()
-            list_id = int(values.get("list_id") or 0)
-            participant = row(conn, "SELECT id FROM participants WHERE study_id = ? AND study_uid = ?", (study_id, participant_uid))
-            if not participant:
-                self.send_error_json("Participant not found", 404)
-                return
-            allocation = self.allocate_randomization(conn, user, study_id, list_id, participant["id"])
-            conn.commit()
-            return self.send_redcap_payload(allocation, output_format)
-        self.send_error_json("Unsupported REDCap-style content", 400)
+        from cds.routes.redcap_api import redcap_api as auth_redcap_api
+        return auth_redcap_api(self, conn, method, query)
 
     def send_redcap_payload(self, payload, output_format: str, fieldnames: list[str] | None = None) -> None:
         if output_format == "csv":
@@ -3488,67 +2902,23 @@ class App(BaseHTTPRequestHandler):
             self.send_json({"lines": [self.sanitize_log_line(item) for item in lines]})
             return
         if path == "/api/admin/backups" and method == "GET":
-            BACKUPS.mkdir(parents=True, exist_ok=True)
-            files = []
-            for item in sorted(BACKUPS.iterdir(), key=lambda path: path.stat().st_mtime, reverse=True):
-                if item.is_file() and not item.name.endswith(".verify.json") and item.suffix in {".sqlite3", ".cdsenc", ".dump", ".gz"}:
-                    backup_type = "full" if item.name.startswith("full_") or ".full." in item.name else ("postgres" if item.name.startswith("postgres_") or item.name.endswith(".dump") else "database")
-                    files.append(latest_full_backup_info(item) if backup_type == "full" else backup_file_info(item, backup_type))
-            self.send_json({"backups": files, "summary": health_payload(self.headers.get("host", ""), self.headers.get("x-forwarded-proto", "https" if self.request_is_https() else "http"))["backup"]})
-            return
+            from cds.routes.backups import list_backups_api
+            return list_backups_api(self, conn, user)
         if path == "/api/admin/backup" and method == "POST":
-            payload = self.body()
-            conn.commit()
-            backup = create_database_backup(str(payload.get("passphrase", "")) or SETTINGS.backup_passphrase)
-            audit(conn, user["id"], "create_encrypted" if backup["encrypted"] else "create", "backup", None, None, backup, **self.audit_context())
-            conn.commit()
-            self.send_json({"backup": backup}, 201)
-            return
+            from cds.routes.backups import create_database_backup_api
+            return create_database_backup_api(self, conn, user)
         if path == "/api/admin/backup/full" and method == "POST":
-            payload = self.body()
-            conn.commit()
-            backup = create_full_backup(str(payload.get("passphrase", "")) or SETTINGS.backup_passphrase)
-            audit(conn, user["id"], "create_full", "backup", None, None, backup, **self.audit_context())
-            conn.commit()
-            self.send_json({"backup": backup}, 201)
-            return
+            from cds.routes.backups import create_full_backup_api
+            return create_full_backup_api(self, conn, user)
         if path == "/api/admin/backups/verify" and method == "POST":
-            payload = self.body()
-            filename = Path(str(payload.get("filename", ""))).name
-            target = (BACKUPS / filename).resolve() if filename else (full_backup_candidates()[0] if full_backup_candidates() else None)
-            if not target or not str(target).startswith(str(BACKUPS.resolve())) or not target.exists():
-                self.send_error_json("Full backup not found", 404)
-                return
-            verification = verify_full_backup(target, str(payload.get("passphrase", "")) or SETTINGS.backup_passphrase, record=True)
-            audit(conn, user["id"], "verify", "backup", None, None, {"filename": target.name, "ok": verification["ok"]}, **self.audit_context())
-            self.send_json({"verification": verification})
-            return
+            from cds.routes.backups import verify_backup_api
+            return verify_backup_api(self, conn, user)
         if path == "/api/admin/backups/dry-run" and method == "POST":
-            payload = self.body()
-            filename = Path(str(payload.get("filename", ""))).name
-            target = (BACKUPS / filename).resolve() if filename else (full_backup_candidates()[0] if full_backup_candidates() else None)
-            if not target or not str(target).startswith(str(BACKUPS.resolve())) or not target.exists():
-                self.send_error_json("Full backup not found", 404)
-                return
-            verification = verify_full_backup(target, str(payload.get("passphrase", "")) or SETTINGS.backup_passphrase, record=False)
-            audit(conn, user["id"], "restore_dry_run", "backup", None, None, {"filename": target.name, "ok": verification["ok"]}, **self.audit_context())
-            self.send_json({"dry_run": True, "verification": verification})
-            return
+            from cds.routes.backups import dry_run_backup_api
+            return dry_run_backup_api(self, conn, user)
         if len(parts) == 4 and parts[:3] == ["api", "admin", "backups"] and method == "GET":
-            filename = Path(parts[3]).name
-            target = (BACKUPS / filename).resolve()
-            if not str(target).startswith(str(BACKUPS.resolve())) or not target.exists() or target.name.endswith(".verify.json"):
-                self.send_error_json("Backup not found", 404)
-                return
-            content = target.read_bytes()
-            audit(conn, user["id"], "download", "backup", None, None, {"filename": target.name, "size": target.stat().st_size}, **self.audit_context())
-            conn.commit()
-            self.send_response(200)
-            self.send_header("content-type", "application/octet-stream")
-            self.send_header("content-disposition", f"attachment; filename={target.name}")
-            self.send_header("content-length", str(len(content)))
-            self.end_headers()
-            self.wfile.write(content)
+            from cds.routes.backups import download_backup_api
+            return download_backup_api(self, conn, user, parts[3])
             return
         if len(parts) == 5 and parts[:3] == ["api", "admin", "users"] and parts[4] == "reset-password" and method == "POST":
             target_user_id = int(parts[3])
@@ -3593,20 +2963,8 @@ class App(BaseHTTPRequestHandler):
         return cleaned[:1000]
 
     def change_password(self, conn: sqlite3.Connection, user: dict) -> None:
-        payload = self.body()
-        current_password = str(payload.get("current_password", ""))
-        new_password = str(payload.get("new_password", ""))
-        stored = row(conn, "SELECT password_hash FROM users WHERE id = ?", (user["id"],))
-        if not stored or not verify_password(current_password, stored["password_hash"]):
-            self.send_error_json("Current password is incorrect", 403)
-            return
-        if len(new_password) < PASSWORD_MIN_LENGTH:
-            self.send_error_json(f"New password must be at least {PASSWORD_MIN_LENGTH} characters", 400)
-            return
-        conn.execute("UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?", (encode_password(new_password), user["id"]))
-        audit(conn, user["id"], "change_password", "user", user["id"], None, {"user_id": user["id"]})
-        conn.commit()
-        self.send_json({"ok": True})
+        from cds.routes.auth import change_password as auth_change_password
+        return auth_change_password(self, conn, user)
 
     def user_can_use_ai_any_project(self, conn: sqlite3.Connection, user: dict) -> bool:
         if is_super_admin(user):
@@ -4805,7 +4163,8 @@ Provide the entire optimized schema strictly in the following JSON format inside
             if not membership_has(membership, "review_data") and not membership_has(membership, "manage_study") and not membership_has(membership, "view_analysis"):
                 self.send_error_json("Readiness permission required", 403)
                 return
-            return self.send_json({"readiness": self.readiness_payload(conn, study_id, membership)})
+            from cds.routes.studies import part11_readiness_report
+            return part11_readiness_report(self, conn, study_id, membership)
         if resource == "quality" and method == "GET":
             return self.quality(conn, study_id, membership)
         if resource == "analysis" and method == "GET":
@@ -4891,22 +4250,8 @@ Provide the entire optimized schema strictly in the following JSON format inside
             if not membership_has(membership, "review_data"):
                 self.send_error_json("Review permission required", 403)
                 return
-            audit_where, audit_params = audit_filters(study_id, query)
-            audit_rows = rows(
-                conn,
-                f"""
-                SELECT audit_log.*, users.username, users.display_name
-                FROM audit_log
-                LEFT JOIN users ON users.id = audit_log.user_id
-                WHERE {audit_where}
-                ORDER BY audit_log.id DESC
-                LIMIT 250
-                """,
-                audit_params,
-            )
-            suspicious_actions = {"failed_login", "export", "download", "create_full", "create_encrypted", "ai_request", "api_request", "sync_conflict"}
-            suspicious = [item for item in audit_rows if item["action"] in suspicious_actions or item["entity_type"] in {"backup", "case_file", "case_ai_review", "ai_audit"}]
-            return self.send_json({"audit": audit_rows, "suspicious": suspicious[:50]})
+            from cds.routes.audit import get_study_audit_api
+            return get_study_audit_api(self, conn, user, study_id, query)
         if resource == "audit-export" and method == "GET":
             if not membership_has(membership, "review_data"):
                 self.send_error_json("Review permission required", 403)
@@ -5011,221 +4356,8 @@ Provide the entire optimized schema strictly in the following JSON format inside
         self.send_error_json("Unknown study route", 404)
 
     def forms(self, conn, user, method, study_id, parts) -> None:
-        membership = user_membership(conn, user, study_id)
-        if not membership:
-            self.send_error_json("Study access denied", 403)
-            return
-        if method == "POST" and len(parts) == 6 and parts[5] == "ai-optimize":
-            if not membership_has(membership, "review_data"):
-                self.send_error_json("Review permission required to trigger AI", 403)
-                return
-            form_id = int(parts[4])
-            form = row(conn, "SELECT * FROM forms WHERE id = ? AND study_id = ?", (form_id, study_id))
-            if not form:
-                self.send_error_json("Form not found", 404)
-                return
-            payload = self.body()
-            user_prompt = str(payload.get("prompt", "")).strip()
-            current_schema = load_json(form["schema_json"], {"fields": []})
-            try:
-                assert_external_ai_safe(json.dumps(current_schema))
-                if user_prompt:
-                    assert_external_ai_safe(user_prompt)
-            except Exception as exc:
-                self.send_error_json(f"AI Safety check failed: {exc}", 400)
-                return
-            api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-            if not api_key:
-                self.send_error_json("OPENAI_API_KEY is not configured", 500)
-                return
-            model = SETTINGS.ai_model or DEFAULT_OPENAI_MODEL
-            schema_format = {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "fields": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "properties": {
-                                "code": {"type": "string"},
-                                "label": {"type": "string"},
-                                "type": {"type": "string", "enum": ["text", "textarea", "number", "date", "select", "checkbox", "file"]},
-                                "required": {"type": "boolean"},
-                                "options": {"type": "array", "items": {"type": "string"}},
-                            },
-                            "required": ["code", "label", "type", "required", "options"],
-                        },
-                    }
-                },
-                "required": ["fields"],
-            }
-            prompt_content = f"Optimize this clinical CRF schema. Standardize field naming, correct validation constraints, align checkboxes/options, and suggest missing clinical fields if relevant.\n"
-            if user_prompt:
-                prompt_content += f"User feedback/instructions for optimization: {user_prompt}\n"
-            prompt_content += f"Current schema:\n{json.dumps(current_schema, indent=2)}"
-            request_payload = {
-                "model": model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are a world-class clinical research architect. Optimize the clinical CRF schema provided."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt_content
-                    }
-                ],
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "optimized_schema",
-                        "strict": True,
-                        "schema": schema_format
-                    }
-                }
-            }
-            try:
-                request = UrlRequest(
-                    "https://api.openai.com/v1/chat/completions",
-                    data=json.dumps(request_payload).encode("utf-8"),
-                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urlopen_request(request, timeout=30) as response:
-                    res_body = json.loads(response.read().decode("utf-8"))
-                output_text = extract_openai_text(res_body)
-                if not output_text:
-                    self.send_error_json("AI response did not contain text output", 500)
-                    return
-                optimized_schema = normalize_schema(json.loads(output_text))
-                ai_audit_id = record_ai_audit(
-                    conn,
-                    user["id"],
-                    study_id=study_id,
-                    purpose="crf_optimize",
-                    input_type="json",
-                    mode="openai",
-                    phi_detected=0,
-                    status_value="ok"
-                )
-                audit(conn, user["id"], "ai_request", "ai_audit", ai_audit_id, None, {"purpose": "crf_optimize", "form_id": form_id}, study_id=study_id, **self.audit_context())
-                conn.commit()
-                self.send_json({"optimized_schema": optimized_schema, "diff": form_schema_diff(current_schema, optimized_schema)})
-            except Exception as exc:
-                self.send_error_json(f"AI optimization failed: {exc}", 500)
-            return
-
-        if method == "GET" and len(parts) == 6 and parts[5] == "versions":
-            form_id = int(parts[4])
-            current = row(conn, "SELECT * FROM forms WHERE id = ? AND study_id = ?", (form_id, study_id))
-            if not current:
-                self.send_error_json("Form not found", 404)
-                return
-            versions = rows(conn, "SELECT id, form_id, study_id, version, name, code, schema_json, saved_by, saved_at FROM form_versions WHERE form_id = ? AND study_id = ? ORDER BY version DESC", (form_id, study_id))
-            current_schema = load_json(current["schema_json"], {"fields": []})
-            for version in versions:
-                prior_schema = load_json(version.pop("schema_json"), {"fields": []})
-                version["diff_to_current"] = form_schema_diff(prior_schema, current_schema)
-            current_payload = {
-                "id": current["id"],
-                "form_id": current["id"],
-                "study_id": study_id,
-                "version": current["version"],
-                "name": current["name"],
-                "code": current["code"],
-                "saved_by": None,
-                "saved_at": current["updated_at"],
-                "diff_to_current": {"fields_added": [], "fields_removed": [], "fields_changed": []},
-                "current": True,
-            }
-            versions.insert(0, current_payload)
-            self.send_json({"versions": versions})
-            return
-        if method == "GET":
-            forms = rows(conn, "SELECT * FROM forms WHERE study_id = ? ORDER BY id", (study_id,))
-            for form in forms:
-                form["schema"] = load_json(form.pop("schema_json"), {"fields": []})
-            self.send_json({"forms": forms})
-            return
-        if method == "POST" and len(parts) == 4:
-            payload = self.body()
-            timestamp = now()
-            schema = normalize_schema(payload.get("schema") or {"fields": []})
-            lifecycle_state = str(payload.get("lifecycle_state") or "published").strip().lower()
-            if lifecycle_state not in FORM_LIFECYCLE_STATES:
-                lifecycle_state = "published"
-            cur = conn.execute(
-                "INSERT INTO forms(study_id, name, code, schema_json, lifecycle_state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (study_id, str(payload.get("name", "")).strip() or "Untitled Form", normalize_code(str(payload.get("code", "")), f"form_{timestamp}"), json.dumps(schema), lifecycle_state, timestamp, timestamp),
-            )
-            event_ids = payload.get("event_ids") or []
-            if not event_ids:
-                baseline = row(conn, "SELECT id FROM study_events WHERE study_id = ? AND code = 'baseline'", (study_id,))
-                event_ids = [baseline["id"]] if baseline else []
-            for event_id in event_ids:
-                if row(conn, "SELECT id FROM study_events WHERE id = ? AND study_id = ?", (event_id, study_id)):
-                    conn.execute(
-                        """
-                        INSERT OR IGNORE INTO form_events(study_id, event_id, form_id, required, created_at, updated_at)
-                        VALUES (?, ?, ?, 1, ?, ?)
-                        """,
-                        (study_id, event_id, cur.lastrowid, timestamp, timestamp),
-                    )
-            after = row(conn, "SELECT * FROM forms WHERE id = ?", (cur.lastrowid,))
-            audit(conn, user["id"], "create", "form", cur.lastrowid, None, after)
-            conn.commit()
-            self.send_json({"form": after}, 201)
-            return
-        if method == "PATCH" and len(parts) == 5:
-            form_id = int(parts[4])
-            before = row(conn, "SELECT * FROM forms WHERE id = ? AND study_id = ?", (form_id, study_id))
-            if not before:
-                self.send_error_json("Form not found", 404)
-                return
-            payload = self.body()
-            action = str(payload.get("action", "")).strip().lower()
-            if action in {"validate", "publish", "retire", "lock", "unlock", "save_draft"}:
-                current_schema = load_json(before["schema_json"], {"fields": []})
-                errors = validate_crf_for_publish(current_schema)
-                if action == "validate":
-                    self.send_json({"valid": not errors, "errors": errors, "lifecycle_state": form_lifecycle_state(before)})
-                    return
-                if action == "publish" and errors:
-                    self.send_json({"errors": errors}, 422)
-                    return
-                next_state = {
-                    "publish": "published",
-                    "retire": "retired",
-                    "lock": "locked",
-                    "unlock": "published",
-                    "save_draft": "draft",
-                }[action]
-                conn.execute("UPDATE forms SET lifecycle_state = ?, active = ?, updated_at = ? WHERE id = ? AND study_id = ?", (next_state, 0 if next_state == "retired" else 1, now(), form_id, study_id))
-                after = row(conn, "SELECT * FROM forms WHERE id = ?", (form_id,))
-                audit(conn, user["id"], action, "form", form_id, before, after, study_id=study_id, **self.audit_context())
-                conn.commit()
-                self.send_json({"form": after})
-                return
-            schema = normalize_schema(payload.get("schema", load_json(before["schema_json"], {})))
-            lifecycle_state = str(payload.get("lifecycle_state") or before.get("lifecycle_state") or "published").strip().lower()
-            if lifecycle_state not in FORM_LIFECYCLE_STATES:
-                lifecycle_state = form_lifecycle_state(before)
-            conn.execute(
-                "INSERT INTO form_versions(form_id, study_id, version, name, code, schema_json, saved_by, saved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (form_id, study_id, before["version"], before["name"], before["code"], before["schema_json"], user["id"], now()),
-            )
-            conn.execute(
-                "UPDATE forms SET name = ?, code = ?, schema_json = ?, lifecycle_state = ?, version = version + 1, updated_at = ? WHERE id = ? AND study_id = ?",
-                (str(payload.get("name", before["name"])).strip(), normalize_code(str(payload.get("code", before["code"])), before["code"]), json.dumps(schema), lifecycle_state, now(), form_id, study_id),
-            )
-            after = row(conn, "SELECT * FROM forms WHERE id = ?", (form_id,))
-            audit(conn, user["id"], "update", "form", form_id, before, after)
-            conn.commit()
-            self.send_json({"form": after})
-            return
-        self.send_error_json("Unsupported forms operation", 405)
+        from cds.routes.forms import forms_route
+        return forms_route(self, conn, user, method, study_id, parts)
 
     def events(self, conn, user, method, study_id, parts) -> None:
         if method == "GET":
@@ -5808,212 +4940,8 @@ Provide the entire optimized schema strictly in the following JSON format inside
         self.send_error_json("Unsupported participant operation", 405)
 
     def entries(self, conn, user, method, study_id, parts, query, membership) -> None:
-        if method == "GET" and len(parts) == 6 and parts[5] == "history":
-            entry_id = int(parts[4])
-            entry = row(conn, "SELECT * FROM entries WHERE id = ? AND study_id = ?", (entry_id, study_id))
-            if not entry:
-                self.send_error_json("Entry not found", 404)
-                return
-            participant = row(conn, "SELECT * FROM participants WHERE id = ?", (entry["participant_id"],))
-            if membership.get("data_group_id") and participant and participant.get("data_group_id") != membership["data_group_id"]:
-                self.send_error_json("Entry is outside your data access group", 403)
-                return
-            history = rows(
-                conn,
-                """
-                SELECT audit_log.*, users.display_name
-                FROM audit_log
-                LEFT JOIN users ON users.id = audit_log.user_id
-                WHERE audit_log.entity_type = 'entry' AND audit_log.entity_id = ?
-                ORDER BY audit_log.created_at DESC, audit_log.id DESC
-                """,
-                (entry_id,),
-            )
-            for item in history:
-                item["before"] = load_json(item.pop("before_json"), None)
-                item["after"] = load_json(item.pop("after_json"), None)
-            states = rows(conn, "SELECT field_states.*, users.display_name FROM field_states LEFT JOIN users ON users.id = field_states.user_id WHERE entry_id = ? ORDER BY created_at DESC", (entry_id,))
-            self.send_json({"history": history, "field_states": states})
-            return
-        if method == "GET":
-            participant_id = int((query.get("participant_id") or ["0"])[0])
-            params: tuple = (study_id,)
-            sql = "SELECT entries.*, forms.name AS form_name, forms.code AS form_code, participants.study_uid, study_events.name AS mapped_event_name, study_events.code AS event_code FROM entries JOIN forms ON forms.id = entries.form_id JOIN participants ON participants.id = entries.participant_id LEFT JOIN study_events ON study_events.id = entries.event_id WHERE entries.study_id = ?"
-            if membership.get("data_group_id"):
-                sql += " AND participants.data_group_id = ?"
-                params = (study_id, membership["data_group_id"])
-            if participant_id:
-                sql += " AND participant_id = ?"
-                params = (*params, participant_id)
-            entries = rows(conn, sql + " ORDER BY entries.updated_at DESC", params)
-            for entry in entries:
-                entry["data"] = load_json(entry.pop("data_json"), {})
-                entry["schema_snapshot"] = load_json(entry.pop("schema_snapshot_json"), {})
-            self.send_json({"entries": entries})
-            return
-        if method == "POST":
-            payload = self.body()
-            timestamp = now()
-            participant_id = int(payload["participant_id"])
-            form_id = int(payload["form_id"])
-            event_id = payload.get("event_id")
-            event = None
-            if event_id:
-                event = row(conn, "SELECT * FROM study_events WHERE id = ? AND study_id = ?", (int(event_id), study_id))
-                if not event:
-                    self.send_error_json("Event not found", 404)
-                    return
-                event_id = event["id"]
-            event_name = str(payload.get("event_name", "")).strip()
-            if event:
-                event_name = event["code"]
-            if not event_name:
-                event_name = "Baseline"
-            repeat_instance = max(int(payload.get("repeat_instance", 1) or 1), 1)
-            data = payload.get("data", {})
-            status = normalize_entry_status(payload.get("status"), "draft")
-            form = row(conn, "SELECT * FROM forms WHERE id = ? AND study_id = ?", (form_id, study_id))
-            participant = row(conn, "SELECT * FROM participants WHERE id = ? AND study_id = ?", (participant_id, study_id))
-            if not form or not participant:
-                self.send_error_json("Participant or form not found", 404)
-                return
-            if event_id and not row(conn, "SELECT id FROM form_events WHERE study_id = ? AND event_id = ? AND form_id = ?", (study_id, event_id, form_id)):
-                self.send_error_json("This CRF is not assigned to the selected event", 400)
-                return
-            if membership.get("data_group_id") and participant.get("data_group_id") != membership["data_group_id"]:
-                self.send_error_json("Participant is outside your data access group", 403)
-                return
-            existing = row(conn, "SELECT * FROM entries WHERE participant_id = ? AND form_id = ? AND event_name = ? AND repeat_instance = ?", (participant_id, form_id, event_name, repeat_instance))
-            lifecycle_state = form_lifecycle_state(form)
-            if lifecycle_state not in FORM_ENTRY_ALLOWED_STATES:
-                self.send_error_json(f"CRF is {lifecycle_state}; data entry is allowed only for published CRFs.", 423 if lifecycle_state == "locked" else 409)
-                return
-            schema = load_json(form["schema_json"], {"fields": []})
-            snapshot = form_schema_snapshot(form, schema)
-            form_version = int(form.get("version") or 1)
-            if repeat_instance > 1 and not schema.get("repeatable"):
-                self.send_error_json("This CRF is not configured as repeatable", 400)
-                return
-            cleaned, issues = validate_entry_data(schema, data)
-            if issues:
-                self.send_json({"errors": issues}, 422)
-                return
-            digest = entry_hash(cleaned, form_version, snapshot)
-            snapshot_json = json.dumps(snapshot, sort_keys=True)
-            if existing:
-                if_match_updated_at = payload.get("if_match_updated_at")
-                if_match_entry_hash = str(payload.get("if_match_entry_hash") or "").strip()
-                try:
-                    client_updated_at = int(if_match_updated_at or 0)
-                except (TypeError, ValueError):
-                    client_updated_at = -1
-                stale_timestamp = if_match_updated_at not in (None, "") and client_updated_at != int(existing.get("updated_at") or 0)
-                stale_hash = bool(if_match_entry_hash) and if_match_entry_hash != str(existing.get("entry_hash") or "")
-                if stale_timestamp or stale_hash:
-                    conflict_payload = {
-                        "entry_id": existing["id"],
-                        "updated_at": existing.get("updated_at"),
-                        "entry_hash": existing.get("entry_hash", ""),
-                        "data": load_json(existing.get("data_json"), {}),
-                    }
-                    audit(conn, user["id"], "sync_conflict", "entry", existing["id"], {"if_match_updated_at": if_match_updated_at, "if_match_entry_hash": if_match_entry_hash}, conflict_payload, study_id=study_id, **self.audit_context())
-                    self.send_json({"error": "Entry was changed on the server. Review conflict before syncing.", "server_entry": conflict_payload}, 409)
-                    return
-                if existing.get("status") == "frozen":
-                    self.send_error_json("Entry is frozen for analysis. Unfreeze with a reason before editing.", 423)
-                    return
-                if existing.get("locked_at"):
-                    if not (membership_has(membership, "review_data") or membership_has(membership, "manage_study")):
-                        self.send_error_json("Entry is locked and cannot be edited by data entry users.", 423)
-                        return
-                    reason = str(payload.get("change_reason", "")).strip()
-                    if not reason:
-                        self.send_error_json("Change reason is required before editing a locked CRF", 423)
-                        return
-                before = existing
-                conn.execute(
-                    "UPDATE entries SET event_id = ?, data_json = ?, status = ?, form_version = ?, schema_snapshot_json = ?, entry_hash = ?, updated_by = ?, updated_at = ?, locked_at = NULL, locked_by = NULL, lock_reason = '' WHERE id = ?",
-                    (event_id, json.dumps(cleaned), status, form_version, snapshot_json, digest, user["id"], timestamp, existing["id"]),
-                )
-                after = row(conn, "SELECT * FROM entries WHERE id = ?", (existing["id"],))
-                audit(conn, user["id"], "update", "entry", existing["id"], before, {"entry": after, "change_reason": payload.get("change_reason", "")})
-                conn.commit()
-                self.send_json({"entry": after})
-                return
-            cur = conn.execute(
-                "INSERT INTO entries(study_id, participant_id, form_id, event_id, event_name, repeat_instance, status, data_json, form_version, schema_snapshot_json, entry_hash, created_by, updated_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (study_id, participant_id, form_id, event_id, event_name, repeat_instance, status, json.dumps(cleaned), form_version, snapshot_json, digest, user["id"], user["id"], timestamp, timestamp),
-            )
-            after = row(conn, "SELECT * FROM entries WHERE id = ?", (cur.lastrowid,))
-            audit(conn, user["id"], "create", "entry", cur.lastrowid, None, after)
-            conn.commit()
-            self.send_json({"entry": after}, 201)
-            return
-        if method == "PATCH" and len(parts) == 5:
-            entry_id = int(parts[4])
-            before = row(conn, "SELECT * FROM entries WHERE id = ? AND study_id = ?", (entry_id, study_id))
-            if not before:
-                self.send_error_json("Entry not found", 404)
-                return
-            participant = row(conn, "SELECT * FROM participants WHERE id = ?", (before["participant_id"],))
-            if membership.get("data_group_id") and participant and participant.get("data_group_id") != membership["data_group_id"]:
-                self.send_error_json("Entry is outside your data access group", 403)
-                return
-            payload = self.body()
-            action = str(payload.get("action", "")).strip()
-            if action in {"lock", "freeze"}:
-                if not (membership_has(membership, "review_data") or membership_has(membership, "manage_study")):
-                    self.send_error_json("Review permission required", 403)
-                    return
-                reason = str(payload.get("reason", "")).strip()
-                if not reason:
-                    self.send_error_json("Reason is required", 400)
-                    return
-                next_status = "frozen" if action == "freeze" else "locked"
-                conn.execute("UPDATE entries SET locked_at = ?, locked_by = ?, lock_reason = ?, status = ?, updated_by = ?, updated_at = ? WHERE id = ?", (now(), user["id"], reason, next_status, user["id"], now(), entry_id))
-                after = row(conn, "SELECT * FROM entries WHERE id = ?", (entry_id,))
-                audit(conn, user["id"], action, "entry", entry_id, before, after, study_id=study_id, **self.audit_context())
-                conn.commit()
-                self.send_json({"entry": after})
-                return
-            if action in {"unlock", "unfreeze"}:
-                if not (membership_has(membership, "review_data") or membership_has(membership, "manage_study")):
-                    self.send_error_json("Review permission required", 403)
-                    return
-                reason = str(payload.get("reason", "")).strip()
-                if not reason:
-                    self.send_error_json("Unlock reason is required", 400)
-                    return
-                next_status = "reviewed" if action in {"unlock", "unfreeze"} else before.get("status", "complete")
-                if next_status in {"locked", "frozen"}:
-                    next_status = "reviewed"
-                conn.execute("UPDATE entries SET locked_at = NULL, locked_by = NULL, lock_reason = '', status = ?, updated_by = ?, updated_at = ? WHERE id = ?", (next_status, user["id"], now(), entry_id))
-                after = row(conn, "SELECT * FROM entries WHERE id = ?", (entry_id,))
-                audit(conn, user["id"], action, "entry", entry_id, before, {"entry": after, "reason": reason}, study_id=study_id, **self.audit_context())
-                conn.commit()
-                self.send_json({"entry": after})
-                return
-            if action in {"verify_field", "freeze_field"}:
-                field_code = normalize_code(str(payload.get("field_code", "")))
-                if not field_code:
-                    self.send_error_json("Field code is required", 400)
-                    return
-                state = "verified" if action == "verify_field" else "frozen"
-                reason = str(payload.get("reason", "")).strip()
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO field_states(entry_id, field_code, state, reason, user_id, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (entry_id, field_code, state, reason, user["id"], now()),
-                )
-                audit(conn, user["id"], action, "entry", entry_id, before, {"field_code": field_code, "state": state, "reason": reason}, study_id=study_id, **self.audit_context())
-                conn.commit()
-                self.send_json({"field_state": {"entry_id": entry_id, "field_code": field_code, "state": state}})
-                return
-            self.send_error_json("Unsupported entry action", 405)
-            return
-        self.send_error_json("Unsupported entries operation", 405)
+        from cds.routes.entries import entries_route
+        return entries_route(self, conn, user, method, study_id, parts, query, membership)
 
     def case_payload(self, conn: sqlite3.Connection, case: dict) -> dict:
         payload = dict(case)
@@ -6762,42 +5690,11 @@ Provide the entire optimized schema strictly in the following JSON format inside
         return {"study": study, "generated_at": now(), "counts": counts, "data_protection": protection, "checks": checks, "recent_audit": recent_audit}
 
     def export_validation_package(self, conn, study_id: int) -> None:
-        study = row(conn, "SELECT * FROM studies WHERE id = ?", (study_id,))
-        evidence = self.validation_payload(conn, study_id)
-        metadata = self.metadata_payload(conn, study_id)
-        audit_sample = rows(conn, "SELECT audit_log.*, users.display_name FROM audit_log LEFT JOIN users ON users.id = audit_log.user_id ORDER BY audit_log.id DESC LIMIT 250")
-        manifest = {
-            "application": "Clinical Data Studio",
-            "generated_at": now(),
-            "study_id": study["id"],
-            "study_name": study["name"],
-            "python": sys.version,
-            "platform": platform.platform(),
-            "database": str(DB_PATH),
-            "data_folder": str(DATA),
-            "ai": ai_status(),
-            "commit": os.environ.get("CDS_COMMIT", "record-current-git-commit-manually"),
-        }
-        checklist = (ROOT / "docs" / "SOP_VALIDATION_CHECKLIST.md").read_text(encoding="utf-8")
-        execution_record = (ROOT / "docs" / "VALIDATION_EXECUTION_RECORD.md").read_text(encoding="utf-8")
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
-            archive_path = Path(tmp.name)
-        try:
-            with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
-                archive.writestr("validation_evidence.json", json.dumps(evidence, indent=2))
-                archive.writestr("metadata_codebook.json", json.dumps(metadata, indent=2))
-                archive.writestr("audit_sample.json", json.dumps(audit_sample, indent=2))
-                archive.writestr("system_manifest.json", json.dumps(manifest, indent=2))
-                archive.writestr("SOP_VALIDATION_CHECKLIST.md", checklist)
-                archive.writestr("VALIDATION_EXECUTION_RECORD.md", execution_record)
-                archive.writestr(
-                    "README.txt",
-                    "Clinical Data Studio validation package.\nReview every file, complete the execution record, attach screenshots, and sign off before real study use.\n",
-                )
-            content = archive_path.read_bytes()
-        finally:
-            archive_path.unlink(missing_ok=True)
-        safe_name = normalize_code(study["name"], "study")
+        from cds.services.validation_package import generate_validation_package
+        from server import normalize_code
+        study = row(conn, "SELECT name FROM studies WHERE id = ?", (study_id,))
+        safe_name = normalize_code(study["name"] if study else f"study_{study_id}", "study")
+        content = generate_validation_package(conn, study_id, DB_PATH, DATA)
         self.send_response(200)
         self.send_header("content-type", "application/zip")
         self.send_header("content-disposition", f"attachment; filename={safe_name}_validation_package.zip")
@@ -7672,50 +6569,21 @@ Provide the entire optimized schema strictly in the following JSON format inside
         self.wfile.write(content)
 
     def backups(self, conn, user, method, study_id, parts) -> None:
-        BACKUPS.mkdir(parents=True, exist_ok=True)
+        from cds.routes.backups import (
+            create_database_backup_api,
+            download_backup_api,
+            restore_backup_api
+        )
+        from cds.services.backup_service import backup_files_for_study
         if method == "GET" and len(parts) == 4:
             self.send_json({"backups": backup_files_for_study(study_id)})
             return
         if method == "POST" and len(parts) == 4:
-            payload = self.body()
-            conn.commit()
-            passphrase = str(payload.get("passphrase", "")) or SETTINGS.backup_passphrase
-            backup = create_database_backup(passphrase, study_id)
-            audit(conn, user["id"], "create_encrypted" if backup["encrypted"] else "create", "backup", study_id, None, {"filename": backup["name"], "backend": backup["backend"]}, study_id=study_id, **self.audit_context())
-            conn.commit()
-            self.send_json({"backup": backup}, 201)
-            return
+            return create_database_backup_api(self, conn, user, study_id)
         if method == "GET" and len(parts) == 5:
-            filename = Path(parts[4]).name
-            if not filename.startswith(f"study_{study_id}_") or not (filename.endswith(".sqlite3") or filename.endswith(".cdsenc") or filename.endswith(".dump")):
-                self.send_error_json("Backup not found", 404)
-                return
-            target = (BACKUPS / filename).resolve()
-            if not str(target).startswith(str(BACKUPS.resolve())) or not target.exists():
-                self.send_error_json("Backup not found", 404)
-                return
-            content = target.read_bytes()
-            self.send_response(200)
-            self.send_header("content-type", "application/octet-stream")
-            self.send_header("content-disposition", f"attachment; filename={target.name}")
-            self.send_header("content-length", str(len(content)))
-            self.end_headers()
-            self.wfile.write(content)
-            return
+            return download_backup_api(self, conn, user, parts[4], study_id)
         if method == "POST" and len(parts) == 6 and parts[5] == "restore":
-            payload = self.body()
-            filename = Path(parts[4]).name
-            if not filename.startswith(f"study_{study_id}_") or not (filename.endswith(".sqlite3") or filename.endswith(".cdsenc") or filename.endswith(".dump")):
-                self.send_error_json("Backup not found", 404)
-                return
-            target = (BACKUPS / filename).resolve()
-            if not str(target).startswith(str(BACKUPS.resolve())) or not target.exists():
-                self.send_error_json("Backup not found", 404)
-                return
-            result = restore_database_backup(target, str(payload.get("passphrase", "")) or SETTINGS.backup_passphrase)
-            audit(conn, user["id"], "restore", "backup", study_id, None, {"filename": filename, "backend": result["backend"]}, study_id=study_id, **self.audit_context())
-            self.send_json(result)
-            return
+            return restore_backup_api(self, conn, user, parts[4], study_id)
         self.send_error_json("Unsupported backup operation", 405)
 
     def export_codebook(self, conn, study_id: int) -> None:

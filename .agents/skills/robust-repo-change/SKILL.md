@@ -14,14 +14,14 @@ Prevent repeated code churn, path drift, duplicate architecture, and unverified 
 ### 1. Establish repository truth
 
 - Read all applicable `AGENTS.md` files.
-- Inspect the authoritative runtime path, architecture documents, tests, recent commits, open PRs, and CI configuration.
+- Inspect the authoritative runtime path, schema, migrations, tests, recent commits, open PRs, and CI configuration.
 - Identify the owning module and interfaces that must remain stable.
-- State the intended scope and files that should not change.
+- State the intended scope, data touched, and files that should not change.
 
 ### 2. Reproduce or define the failure
 
 - Capture the exact symptom, expected behavior, environment, inputs, and failure evidence.
-- Prefer a deterministic failing test, replay fixture, minimal harness, or focused command.
+- Prefer a deterministic failing test, synthetic/de-identified fixture, minimal harness, or focused command.
 - For intermittent failures, instrument one boundary at a time and collect evidence before editing.
 
 ### 3. Establish root cause
@@ -36,7 +36,7 @@ Prevent repeated code churn, path drift, duplicate architecture, and unverified 
 - Create a branch from current `main`.
 - Add or update a regression test first when a valid seam exists.
 - Make the smallest change in the owning module.
-- Preserve public interfaces, configuration semantics, risk controls, and state ownership unless the task explicitly requires migration.
+- Preserve public interfaces, schema compatibility, audit behavior, authorization, privacy boundaries, configuration semantics, and state ownership unless the task explicitly requires migration.
 - Keep refactoring, feature work, and bug fixes separate.
 
 ### 5. Review the diff
@@ -44,21 +44,20 @@ Prevent repeated code churn, path drift, duplicate architecture, and unverified 
 Check for:
 
 - unrelated formatting or renames
-- duplicate runtime paths or owners
-- stale-data, race, idempotency, retry, and restart failures
-- secrets or credentials
-- unsafe defaults
+- duplicate persistence, authorization, audit, export, backup, or AI paths
+- stale-data, race, idempotency, retry, conflict, and restart failures
+- secrets, credentials, identifiers, raw clinical data, or unsafe fixtures
+- unsafe defaults or silent fallbacks
 - test mocks that bypass production behavior
-- backtest/live divergence for trading systems
-- missing observability and recovery behavior
+- missing observability, provenance, rollback, restore, and recovery behavior
 
 ### 6. Validate
 
 Run the exact repository-required commands plus focused tests for the changed path. Fresh evidence must include:
 
 - compilation/build success
-- lint/type checks when configured
-- focused regression tests
+- focused regression, privacy, and migration tests
+- SQLite and PostgreSQL behavior when persistence changes
 - complete required test suite
 - CI result on the final PR head
 
@@ -66,7 +65,7 @@ For a regression test, verify that it would fail without the fix when practical.
 
 ### 7. PR and merge
 
-- Open one focused PR with root cause, fix, affected paths, safety impact, validation commands, and residual risk.
+- Open one focused PR with root cause, fix, affected paths, clinical-data/security impact, validation commands, and residual risk.
 - Inspect automated review suggestions technically; do not accept them blindly.
 - Resolve all valid review threads.
 - Re-run CI after the final change.
@@ -77,13 +76,14 @@ For a regression test, verify that it would fail without the fix when practical.
 
 Completion requires fresh command output or CI evidence for the final branch head. A previous run, partial suite, plausible diff, or agent statement is not sufficient evidence.
 
-## Trading and production safeguards
+## Clinical-data and production safeguards
 
-- Never weaken readiness, risk, capital, position, cooldown, max-loss, execution-mode, or secret-management controls to make tests pass.
-- Never place live orders during testing.
-- Preserve paper/shadow/live separation.
-- Treat broker acknowledgement, partial fills, retries, reconnects, and restart recovery as explicit state transitions.
+- Never weaken privacy, authorization, auditability, external-AI gates, record locks/freezes, export safety, backup verification, or restore behavior to make tests pass.
+- Never use real participant data, identifiers, credentials, database files, backups, or production logs in tests.
+- Preserve named-user access, least privilege, CSRF protection, data-access groups, and token revocation.
+- Preserve deterministic migrations and explicit rollback/recovery behavior across SQLite and PostgreSQL.
+- Do not claim regulatory compliance or production validation without documented evidence.
 
 ## Failure and uncertainty handling
 
-If the issue cannot be reproduced or required tests cannot run, do not claim completion. Report the evidence collected, the exact blocker, the remaining risk, and the next diagnostic action.
+If the issue cannot be reproduced or required tests cannot run, do not claim completion. Report the evidence collected, the exact blocker, the remaining clinical-data/security risk, and the next diagnostic action.

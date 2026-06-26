@@ -13,10 +13,16 @@ def now() -> int:
     return int(time.time())
 
 def add_column_if_not_exists(conn: Any, table: str, column: str, definition: str) -> None:
+    backend = getattr(conn, "backend", "sqlite")
+    if backend == "postgres":
+        if column in conn.table_columns(table):
+            return
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        return
     try:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
     except Exception as exc:
-        # Ignore column already exists errors
+        # SQLite does not support ADD COLUMN IF NOT EXISTS on all supported versions.
         LOGGER.debug(f"Could not add column {column} to table {table} (it might already exist): {exc}")
 
 def migration_1_initial(conn: Any) -> None:
@@ -436,8 +442,6 @@ def migration_1_initial(conn: Any) -> None:
 
 def migration_2_mfa(conn: Any) -> None:
     LOGGER.info("Running Migration 2: Adding MFA columns to users table...")
-    backend = getattr(conn, "backend", "sqlite")
-    # Add columns to users table
     add_column_if_not_exists(conn, "users", "mfa_secret", "TEXT")
     add_column_if_not_exists(conn, "users", "mfa_enabled", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_not_exists(conn, "sessions", "mfa_verified", "INTEGER NOT NULL DEFAULT 1")
@@ -523,32 +527,29 @@ def run_migrations(conn: Any) -> None:
         )
         """
     )
-    
-    # Ensure legacy columns are present before starting versioned migrations
-    ensure_legacy_columns(conn)
-    
+
+    # Determine whether this is a legacy/existing database before altering tables.
+    if backend == "postgres":
+        users_exists = bool(conn.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'users'").fetchone())
+    else:
+        users_exists = bool(conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'").fetchone())
+
+    # Existing databases may need columns that predate versioned migrations. A fresh
+    # database must run the baseline migration first, otherwise PostgreSQL enters an
+    # aborted transaction when ALTER TABLE targets tables that do not exist yet.
+    if users_exists:
+        ensure_legacy_columns(conn)
+
     # To support backward compatibility for existing SQLite/Postgres databases that were
-    # created by old server.py, we check if they already have baseline tables. If they do,
-    # but schema_migrations is empty, we retroactively apply Migration 1.
+    # created by old server.py, retroactively mark Migration 1 when appropriate.
     res = conn.execute("SELECT count(*) as cnt FROM schema_migrations").fetchone()
-    if res["cnt"] == 0:
-        # Check if users table exists.
-        try:
-            if backend == "postgres":
-                users_exists = bool(conn.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'users'").fetchone())
-            else:
-                users_exists = bool(conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'").fetchone())
-        except Exception:
-            users_exists = False
-            
-        if users_exists:
-            # Mark version 1 as applied retrospectively
-            LOGGER.info("Retroactively marking Migration 1 (baseline) as applied.")
-            conn.execute(
-                "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
-                (1, "Retroactive baseline setup mark", now())
-            )
-            conn.commit()
+    if res["cnt"] == 0 and users_exists:
+        LOGGER.info("Retroactively marking Migration 1 (baseline) as applied.")
+        conn.execute(
+            "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
+            (1, "Retroactive baseline setup mark", now())
+        )
+        conn.commit()
 
     # Get applied migrations
     applied = {row["version"] for row in conn.execute("SELECT version FROM schema_migrations").fetchall()}

@@ -28,7 +28,7 @@ jobs:
           node-version: "22"
 
       - name: Python syntax check
-        run: python -m py_compile server.py config.py storage.py
+        run: python -m py_compile server.py config.py storage.py cds/db/migrations.py
 
       - name: Frontend syntax check
         run: node --check static/app.js
@@ -36,8 +36,10 @@ jobs:
       - name: Unit and API tests
         run: python -W error::ResourceWarning -m unittest discover -s tests
 
-      - name: SQLite healthcheck
-        run: python server.py healthcheck
+      - name: SQLite migrate and healthcheck
+        run: |
+          python server.py migrate
+          python server.py healthcheck
 
       - name: Browser smoke test
         shell: pwsh
@@ -56,8 +58,8 @@ jobs:
         image: postgres:16
         env:
           POSTGRES_USER: clinical
-          POSTGRES_PASSWORD: clinical_test_password
           POSTGRES_DB: clinical_data_studio_test
+          POSTGRES_HOST_AUTH_METHOD: trust
         ports:
           - 5432:5432
         options: >-
@@ -67,16 +69,11 @@ jobs:
           --health-retries 10
 
     env:
-      CDS_ENV: production
       CDS_HOST: 127.0.0.1
       CDS_PORT: 8765
-      CDS_SECRET_KEY: ci_postgres_secret_key_please_replace_in_real_deployments_1234567890
       CDS_DATABASE_BACKEND: postgres
-      DATABASE_URL: postgresql://clinical:clinical_test_password@127.0.0.1:5432/clinical_data_studio_test
+      DATABASE_URL: postgresql://clinical@127.0.0.1:5432/clinical_data_studio_test
       CDS_REQUIRE_HTTPS: "false"
-      CDS_ADMIN_USERNAME: admin
-      CDS_ADMIN_PASSWORD: StrongCIAdminPassword123
-      CDS_ADMIN_DISPLAY_NAME: CI Administrator
       CDS_AI_ENABLED: "false"
 
     steps:
@@ -91,13 +88,36 @@ jobs:
       - name: Install Python dependencies
         run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
 
-      - name: Run PostgreSQL migrations
-        run: python server.py migrate
+      - name: Validate production PostgreSQL migration
+        env:
+          CDS_ENV: production
+          CDS_SECRET_KEY: ci-${{ github.sha }}
+          CDS_ADMIN_USERNAME: admin
+          CDS_ADMIN_PASSWORD: CIAdmin-${{ github.run_id }}-Strong
+          CDS_ADMIN_DISPLAY_NAME: CI Administrator
+        run: |
+          python server.py migrate
+          python server.py healthcheck
 
-      - name: PostgreSQL healthcheck
-        run: python server.py healthcheck
+      - name: Reset PostgreSQL for isolated development tests
+        run: |
+          python - <<'PY'
+          import os
+          import psycopg
+
+          with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+              conn.execute("DROP SCHEMA public CASCADE")
+              conn.execute("CREATE SCHEMA public")
+          PY
+
+      - name: Prepare development PostgreSQL fixtures
+        env:
+          CDS_ENV: development
+          CDS_ADMIN_PASSWORD: ""
+        run: python server.py migrate
 
       - name: PostgreSQL unit and API tests
         env:
           CDS_ENV: development
+          CDS_ADMIN_PASSWORD: ""
         run: python -W error::ResourceWarning -m unittest discover -s tests

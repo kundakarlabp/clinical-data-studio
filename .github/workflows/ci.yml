@@ -28,7 +28,7 @@ jobs:
           node-version: "22"
 
       - name: Python syntax check
-        run: python -m py_compile server.py config.py storage.py
+        run: python -m py_compile server.py config.py storage.py cds/db/migrations.py
 
       - name: Frontend syntax check
         run: node --check static/app.js
@@ -36,8 +36,10 @@ jobs:
       - name: Unit and API tests
         run: python -W error::ResourceWarning -m unittest discover -s tests
 
-      - name: SQLite healthcheck
-        run: python server.py healthcheck
+      - name: SQLite migrate and healthcheck
+        run: |
+          python server.py migrate
+          python server.py healthcheck
 
       - name: Browser smoke test
         shell: pwsh

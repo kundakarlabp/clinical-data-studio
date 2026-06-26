@@ -17,12 +17,12 @@ EXPECTED_SKILLS = {
 
 
 def parse_frontmatter(text: str) -> dict[str, str]:
-    if not text.startswith("---\n"):
+    normalized = text.replace("\r\n", "\n")
+    if not normalized.startswith("---\n"):
         raise AssertionError("missing opening YAML delimiter")
-    try:
-        raw, _body = text[4:].split("\n---\n", 1)
-    except ValueError as exc:
-        raise AssertionError("missing closing YAML delimiter") from exc
+    raw, separator, _body = normalized[4:].partition("\n---\n")
+    if not separator:
+        raise AssertionError("missing closing YAML delimiter")
     metadata: dict[str, str] = {}
     for line in raw.splitlines():
         if not line.strip():

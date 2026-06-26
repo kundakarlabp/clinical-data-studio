@@ -59,9 +59,10 @@ Do not create parallel persistence layers, duplicate authorization paths, hidden
 Run the repository's CI-equivalent commands for affected areas. The baseline is:
 
 ```bash
-python -m py_compile server.py config.py storage.py
+python -m py_compile server.py config.py storage.py cds/db/migrations.py
 node --check static/app.js
 python -W error::ResourceWarning -m unittest discover -s tests
+python server.py migrate
 python server.py healthcheck
 docker build -t clinical-data-studio:ci .
 docker compose -f docker-compose.local.yml config
